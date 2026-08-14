@@ -53,6 +53,17 @@ RUNS_DIR = os.environ.get(
     "CLAUDE_LOCAL_DELEGATE_RUNS_DIR",
     os.path.expanduser("~/.claude-local-delegate/runs"),
 )
+BATCHES_DIR = os.environ.get(
+    "CLAUDE_LOCAL_DELEGATE_BATCHES_DIR",
+    os.path.expanduser("~/.claude-local-delegate/batches"),
+)
+# vLLM concurrency ceiling from this stack's docker-compose (--max-num-seqs).
+# Not enforced here -- vLLM's own scheduler queues excess requests rather
+# than failing -- but fan_out_to_local warns past this because many
+# concurrent long-context runs contend for the same finite KV-cache/VRAM
+# pool: throughput doesn't scale linearly once you're past what the box can
+# actually hold resident, even though nothing errors out.
+LOCAL_SERVER_MAX_CONCURRENCY = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY", "16"))
 ASK_PARENT_TOOL_NAME = "mcp__claude-local-delegate__ask_parent"
 CHECK_MESSAGE_TOOL_NAME = "mcp__claude-local-delegate__check_message_status"
 MESSAGE_POLL_TOTAL_S = 50
@@ -191,6 +202,89 @@ PARENT_TOOLS = [
             "required": ["run_id", "message_id", "answer"],
         },
     },
+    {
+        "name": "fan_out_to_local",
+        "description": (
+            "Map-reduce over the local model: split a large body of independent "
+            "material (e.g. many doc pages, files, or search results) into "
+            "`items` and process each in its own parallel delegate_to_local run "
+            "with the same `shared_instruction`. Use this instead of stuffing "
+            "everything into one huge local context -- each item still fits in "
+            "the local model's own window (chunking also tends to beat one "
+            "giant context on accuracy; long-context recall degrades the more "
+            "you cram in, 'lost in the middle'), and this session only ever "
+            "reads the final synthesized answer, not the raw material. Returns "
+            "immediately with a batch_id; poll check_fanout_status, then "
+            "get_fanout_result once every item is done.\n\n"
+            "Real ceiling to know about: parallel runs share this box's fixed "
+            f"vLLM concurrency ({LOCAL_SERVER_MAX_CONCURRENCY} concurrent "
+            "sequences here) and, more importantly, its VRAM/KV-cache pool. "
+            "More items than that don't fail, they queue -- and if each item's "
+            "context is itself large, several of them near-simultaneously can "
+            "contend for the same KV-cache, so parallelism doesn't scale as "
+            "cleanly as spinning up more items always implies. Reasonable batch "
+            f"sizes (up to roughly {LOCAL_SERVER_MAX_CONCURRENCY}) with "
+            "moderate per-item context is the sweet spot, not 'as many as "
+            "possible.'"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Independent pieces of material, one per parallel local run. Each becomes its own delegate_to_local task: shared_instruction + this item.",
+                },
+                "shared_instruction": {
+                    "type": "string",
+                    "description": "The instruction applied to every item (e.g. 'Summarize the key API changes in this doc page').",
+                },
+                "allowed_tools": {
+                    "type": "string",
+                    "description": f"Same as delegate_to_local's allowed_tools, applied to every item. Defaults to read-only ('{DEFAULT_ALLOWED_TOOLS}').",
+                },
+                "cwd": {"type": "string", "description": "Working directory for every item's local sub-session."},
+                "bare": {"type": "boolean", "description": "Same as delegate_to_local's bare param, applied to every item."},
+            },
+            "required": ["items", "shared_instruction"],
+        },
+    },
+    {
+        "name": "check_fanout_status",
+        "description": "Check progress of a fan_out_to_local batch: how many items completed/errored/still running, plus a warning if running items look stuck on permission denials.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "batch_id": {"type": "string", "description": "batch_id returned by fan_out_to_local."},
+            },
+            "required": ["batch_id"],
+        },
+    },
+    {
+        "name": "get_fanout_result",
+        "description": (
+            "Fetch results from a fan_out_to_local batch. Errors if any item "
+            "isn't done yet -- call check_fanout_status first. Without "
+            "aggregate_instruction, returns all items' raw results concatenated "
+            "(you review and synthesize yourself). With aggregate_instruction, "
+            "starts ONE MORE local run that reads all the items' results and "
+            "synthesizes per that instruction -- an ordinary delegate_to_local "
+            "run under the hood, so poll it with the normal "
+            "check_delegate_status/get_delegate_result (same review-before-"
+            "trusting caveat applies to the synthesized answer)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "batch_id": {"type": "string", "description": "batch_id returned by fan_out_to_local."},
+                "aggregate_instruction": {
+                    "type": "string",
+                    "description": "Optional: if set, spawns a local run to synthesize all items' results per this instruction instead of returning them raw.",
+                },
+            },
+            "required": ["batch_id"],
+        },
+    },
 ]
 
 CHILD_TOOLS = [
@@ -270,8 +364,26 @@ def start_delegate(args):
     resume_id = args.get("resume_session_id")
     bare = bool(args.get("bare", False))
 
+    run_id, err = _start_run(task, allowed_tools, cwd, bare, resume_id)
+    if err:
+        return _error_result(err)
+
+    return {
+        "content": [{
+            "type": "text",
+            "text": f"Started local delegation. run_id: {run_id}\n"
+                    f"Poll with check_delegate_status, then get_delegate_result once complete.",
+        }],
+        "isError": False,
+    }
+
+
+def _start_run(task, allowed_tools, cwd, bare, resume_id=None):
+    """Core of delegate_to_local, factored out so fan_out_to_local can spawn
+    N of these (and the aggregation pass) without going through the
+    tool-call wrapping. Returns (run_id, None) on success or (None, error_message)."""
     if not os.path.isfile(DEFAULT_SETTINGS_PATH):
-        return _error_result(
+        return None, (
             f"Local settings file not found: {DEFAULT_SETTINGS_PATH}. "
             "Set CLAUDE_LOCAL_DELEGATE_SETTINGS or create the file."
         )
@@ -349,7 +461,7 @@ def start_delegate(args):
     try:
         proc = subprocess.Popen(["bash", "-c", wrapper], cwd=cwd, start_new_session=True)
     except FileNotFoundError:
-        return _error_result("`bash` or `claude` not found on PATH.")
+        return None, "`bash` or `claude` not found on PATH."
 
     with open(meta_path, "w") as f:
         json.dump({
@@ -361,14 +473,7 @@ def start_delegate(args):
             "started_at": time.time(),
         }, f)
 
-    return {
-        "content": [{
-            "type": "text",
-            "text": f"Started local delegation. run_id: {run_id}\n"
-                    f"Poll with check_delegate_status, then get_delegate_result once complete.",
-        }],
-        "isError": False,
-    }
+    return run_id, None
 
 
 def _shell_quote(s):
@@ -557,18 +662,22 @@ def check_status(args):
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
 
-def get_result(args):
-    run_id = args.get("run_id")
+def _read_run_result(run_id):
+    """Core of get_delegate_result, factored out so fan_out_to_local's
+    aggregation step can pull each sub-run's answer directly. Returns a dict
+    with result_text/session_id/cost/usage/duration_api_ms/error -- 'error'
+    is set (and everything else None) if the run isn't done, failed, or its
+    output couldn't be parsed."""
     meta = _load_meta(run_id) if run_id else None
     if meta is None:
-        return _error_result(f"Unknown run_id: {run_id}")
+        return {"error": f"Unknown run_id: {run_id}"}
 
     run_dir = _run_dir(run_id)
     exit_code_path = os.path.join(run_dir, "exit_code")
     log_path = os.path.join(run_dir, "output.log")
 
     if not os.path.isfile(exit_code_path):
-        return _error_result(f"run_id {run_id} is still running. Call check_delegate_status first.")
+        return {"error": f"run_id {run_id} is still running. Call check_delegate_status first."}
 
     with open(exit_code_path) as f:
         code = f.read().strip()
@@ -577,7 +686,7 @@ def get_result(args):
         raw = f.read()
 
     if code != "0":
-        return _error_result(f"claude -p exited {code}. Log tail:\n{raw[-2000:]}")
+        return {"error": f"claude -p exited {code}. Log tail:\n{raw[-2000:]}"}
 
     result_event = None
     for line in raw.splitlines():
@@ -592,26 +701,36 @@ def get_result(args):
             result_event = event
 
     if result_event is None:
-        return _error_result(f"Could not find a result event in the output. Log tail:\n{raw[-2000:]}")
+        return {"error": f"Could not find a result event in the output. Log tail:\n{raw[-2000:]}"}
 
-    result_text = _strip_think_blocks(result_event.get("result", ""))
-    session_id = result_event.get("session_id", "")
-    cost = result_event.get("total_cost_usd")
-    usage = result_event.get("usage", {})
-    duration_api_ms = result_event.get("duration_api_ms")
+    return {
+        "error": None,
+        "result_text": _strip_think_blocks(result_event.get("result", "")),
+        "session_id": result_event.get("session_id", ""),
+        "cost": result_event.get("total_cost_usd"),
+        "usage": result_event.get("usage", {}),
+        "duration_api_ms": result_event.get("duration_api_ms"),
+    }
 
-    footer = f"\n\n-- local session_id: {session_id}"
-    out_tok = usage.get("output_tokens")
-    if out_tok and duration_api_ms:
-        tok_s = out_tok / (duration_api_ms / 1000)
-        footer += f", {out_tok} output tokens in {duration_api_ms / 1000:.1f}s ({tok_s:.1f} tok/s)"
-    if cost is not None:
+
+def get_result(args):
+    run_id = args.get("run_id")
+    r = _read_run_result(run_id)
+    if r["error"]:
+        return _error_result(r["error"])
+
+    footer = f"\n\n-- local session_id: {r['session_id']}"
+    out_tok = r["usage"].get("output_tokens")
+    if out_tok and r["duration_api_ms"]:
+        tok_s = out_tok / (r["duration_api_ms"] / 1000)
+        footer += f", {out_tok} output tokens in {r['duration_api_ms'] / 1000:.1f}s ({tok_s:.1f} tok/s)"
+    if r["cost"] is not None:
         footer += (
-            f", est. cost: ${cost} "
+            f", est. cost: ${r['cost']} "
             "(Claude Code's own client-side estimate at Anthropic API rates -- "
             "not a real charge against a free local model)"
         )
-    return {"content": [{"type": "text", "text": result_text + footer}], "isError": False}
+    return {"content": [{"type": "text", "text": r["result_text"] + footer}], "isError": False}
 
 
 def _strip_think_blocks(text):
@@ -645,6 +764,146 @@ def reply_to_delegate(args):
         json.dump(msg, f)
 
     return {"content": [{"type": "text", "text": f"Answer recorded for message_id {message_id}."}], "isError": False}
+
+
+def _batch_path(batch_id):
+    return os.path.join(BATCHES_DIR, f"{batch_id}.json")
+
+
+def fan_out_to_local(args):
+    items = args.get("items")
+    shared_instruction = args.get("shared_instruction")
+    if not items or not isinstance(items, list) or not all(isinstance(i, str) for i in items):
+        return _error_result("`items` is required and must be a non-empty array of strings.")
+    if not shared_instruction or not isinstance(shared_instruction, str):
+        return _error_result("`shared_instruction` is required and must be a non-empty string.")
+
+    allowed_tools = args.get("allowed_tools") or DEFAULT_ALLOWED_TOOLS
+    cwd = args.get("cwd") or os.getcwd()
+    bare = bool(args.get("bare", False))
+
+    run_ids = []
+    for i, item in enumerate(items):
+        task = f"{shared_instruction}\n\n--- item {i + 1}/{len(items)} ---\n\n{item}"
+        run_id, err = _start_run(task, allowed_tools, cwd, bare)
+        if err:
+            # Best-effort: report what got started before the failure, plus the error.
+            return _error_result(
+                f"Failed to start item {i + 1}/{len(items)}: {err}\n"
+                f"{len(run_ids)} item(s) already started: {run_ids}"
+            )
+        run_ids.append(run_id)
+
+    batch_id = uuid.uuid4().hex[:12]
+    os.makedirs(BATCHES_DIR, exist_ok=True)
+    with open(_batch_path(batch_id), "w") as f:
+        json.dump({
+            "batch_id": batch_id,
+            "run_ids": run_ids,
+            "shared_instruction": shared_instruction,
+            "allowed_tools": allowed_tools,
+            "created_at": time.time(),
+        }, f)
+
+    warning = ""
+    if len(items) > LOCAL_SERVER_MAX_CONCURRENCY:
+        warning = (
+            f"\n\nNote: {len(items)} items started, but the local server's configured "
+            f"concurrency ceiling is {LOCAL_SERVER_MAX_CONCURRENCY} (vLLM --max-num-seqs). "
+            "The extras will queue behind the first batch rather than run truly in "
+            "parallel -- still correct, just not the full-parallel speedup you might expect."
+        )
+
+    return {
+        "content": [{
+            "type": "text",
+            "text": f"Started {len(run_ids)} parallel local runs. batch_id: {batch_id}\n"
+                    f"run_ids: {run_ids}\n"
+                    f"Poll with check_fanout_status, then get_fanout_result once all are done.{warning}",
+        }],
+        "isError": False,
+    }
+
+
+def check_fanout_status(args):
+    batch_id = args.get("batch_id")
+    path = _batch_path(batch_id) if batch_id else None
+    if not path or not os.path.isfile(path):
+        return _error_result(f"Unknown batch_id: {batch_id}")
+    with open(path) as f:
+        batch = json.load(f)
+
+    completed, errored, running, total_blocked = 0, 0, 0, 0
+    for run_id in batch["run_ids"]:
+        run_dir = _run_dir(run_id)
+        exit_code_path = os.path.join(run_dir, "exit_code")
+        if os.path.isfile(exit_code_path):
+            with open(exit_code_path) as f:
+                code = f.read().strip()
+            if code == "0":
+                completed += 1
+            else:
+                errored += 1
+        else:
+            running += 1
+            _, blocked = _summarize_log(os.path.join(run_dir, "output.log"))
+            total_blocked += blocked
+
+    blocked_warning = ""
+    if total_blocked >= 2:
+        blocked_warning = (
+            f"\n\n⚠ {total_blocked} denial-shaped tool call(s) across still-running items in this "
+            "batch -- some may be stuck on missing allowed_tools access, same as a single run."
+        )
+
+    text = (
+        f"batch_id {batch_id}: {completed} completed, {errored} errored, {running} still running "
+        f"(of {len(batch['run_ids'])} total).{blocked_warning}\n"
+        f"run_ids: {batch['run_ids']}"
+    )
+    return {"content": [{"type": "text", "text": text}], "isError": False}
+
+
+def get_fanout_result(args):
+    batch_id = args.get("batch_id")
+    aggregate_instruction = args.get("aggregate_instruction")
+    path = _batch_path(batch_id) if batch_id else None
+    if not path or not os.path.isfile(path):
+        return _error_result(f"Unknown batch_id: {batch_id}")
+    with open(path) as f:
+        batch = json.load(f)
+
+    results = []
+    for run_id in batch["run_ids"]:
+        r = _read_run_result(run_id)
+        if r["error"]:
+            return _error_result(
+                f"run_id {run_id} isn't ready or failed: {r['error']}\n"
+                "Call check_fanout_status first -- all items must finish before fetching the batch result."
+            )
+        results.append(r["result_text"])
+
+    if not aggregate_instruction:
+        parts = [f"--- item {i + 1}/{len(results)} ---\n{text}" for i, text in enumerate(results)]
+        return {"content": [{"type": "text", "text": "\n\n".join(parts)}], "isError": False}
+
+    # Aggregation is just one more ordinary delegated run over the collected
+    # results -- reuses every existing mechanism (async, ask_parent, review
+    # reminder) instead of inventing a separate synthesis code path.
+    combined = "\n\n".join(f"--- item {i + 1}/{len(results)} ---\n{text}" for i, text in enumerate(results))
+    agg_task = f"{aggregate_instruction}\n\n{combined}"
+    agg_run_id, err = _start_run(agg_task, DEFAULT_ALLOWED_TOOLS, os.getcwd(), False)
+    if err:
+        return _error_result(f"Failed to start aggregation run: {err}")
+
+    return {
+        "content": [{
+            "type": "text",
+            "text": f"All {len(results)} items done; started aggregation run. run_id: {agg_run_id}\n"
+                    f"Poll with check_delegate_status, then get_delegate_result for the synthesized answer.",
+        }],
+        "isError": False,
+    }
 
 
 # ---- child-mode tools (only exposed when CLAUDE_LOCAL_DELEGATE_ROLE=child) ----
@@ -711,6 +970,9 @@ PARENT_HANDLERS = {
     "check_delegate_status": check_status,
     "get_delegate_result": get_result,
     "reply_to_delegate": reply_to_delegate,
+    "fan_out_to_local": fan_out_to_local,
+    "check_fanout_status": check_fanout_status,
+    "get_fanout_result": get_fanout_result,
 }
 CHILD_HANDLERS = {
     "ask_parent": ask_parent,

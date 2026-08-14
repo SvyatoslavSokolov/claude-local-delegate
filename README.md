@@ -3,8 +3,9 @@
 An MCP server for Claude Code with tools to hand a task to a locally-hosted
 model (e.g. served by vLLM) while keeping your main session on your regular
 subscription/model. Parent-side: `delegate_to_local`, `check_delegate_status`,
-`get_delegate_result`, `reply_to_delegate`. Given to the delegated run itself:
-`ask_parent`, `check_message_status`.
+`get_delegate_result`, `reply_to_delegate`, `fan_out_to_local`,
+`check_fanout_status`, `get_fanout_result`. Given to the delegated run
+itself: `ask_parent`, `check_message_status`.
 
 ## Why this instead of a prompt-wrapper MCP tool
 
@@ -189,6 +190,41 @@ question surfaced by `check_delegate_status`.
 The delegated run itself gets two more tools automatically (you never call
 these from the parent session): **`ask_parent`** (`{question}` → `message_id`)
 and **`check_message_status`** (`{message_id}` → the answer, once given).
+
+**`fan_out_to_local`** — `{items[], shared_instruction, allowed_tools?, cwd?, bare?}`
+→ map-reduce over the local model. Splits `items` (independent chunks --
+doc pages, files, search results, whatever) into one parallel
+`delegate_to_local` run each, all sharing `shared_instruction`. Returns a
+`batch_id` immediately (same async pattern as everything else here). Why
+this beats stuffing everything into one giant local context: each item
+still fits comfortably in the local model's own window, chunking tends to
+beat one huge context on accuracy anyway (long-context recall degrades the
+more you cram in -- "lost in the middle"), and the *parent* session never
+has to read the raw material, only the final synthesized answer.
+
+Real ceiling to know about: parallel items share this box's fixed vLLM
+concurrency (`--max-num-seqs`, default assumed 16 here -- override via
+`CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY`) and, more importantly, its
+VRAM/KV-cache pool. More items than that don't fail, they queue behind the
+first batch -- and if each item's context is itself large, several running
+near-simultaneously can contend for the same KV-cache, so parallelism
+doesn't scale as cleanly as "more items = more parallel" implies. The tool
+warns when a batch exceeds the configured ceiling; it does not cap batch
+size itself.
+
+**`check_fanout_status`** — `{batch_id}` → completed/errored/running counts
+across the batch, plus a denial-warning aggregated across still-running
+items (same signal as `check_delegate_status`'s, batch-wide).
+
+**`get_fanout_result`** — `{batch_id, aggregate_instruction?}` → errors if
+any item isn't done yet (check status first). Without
+`aggregate_instruction`, returns every item's raw result concatenated, for
+you to read and synthesize yourself. With it, starts **one more ordinary
+`delegate_to_local` run** that reads all the items' results and synthesizes
+per that instruction -- aggregation isn't a separate code path, it's just
+another delegated run, so it gets `ask_parent`, the blocked-call detector,
+and the same "review before trusting" caveat as any other result. Poll it
+with the normal `check_delegate_status`/`get_delegate_result`.
 
 ### Run artifacts
 
