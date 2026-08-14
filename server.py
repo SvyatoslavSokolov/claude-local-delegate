@@ -30,6 +30,7 @@ Implements the MCP stdio transport directly (newline-delimited JSON-RPC 2.0).
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -52,7 +53,6 @@ RUNS_DIR = os.environ.get(
     "CLAUDE_LOCAL_DELEGATE_RUNS_DIR",
     os.path.expanduser("~/.claude-local-delegate/runs"),
 )
-LOG_TAIL_CHARS = 4000
 ASK_PARENT_TOOL_NAME = "mcp__claude-local-delegate__ask_parent"
 CHECK_MESSAGE_TOOL_NAME = "mcp__claude-local-delegate__check_message_status"
 MESSAGE_POLL_TOTAL_S = 50
@@ -116,6 +116,21 @@ PARENT_TOOLS = [
                 "resume_session_id": {
                     "type": "string",
                     "description": "Optional session_id from a prior delegate_to_local run (see get_delegate_result), to continue that local sub-session instead of starting fresh.",
+                },
+                "bare": {
+                    "type": "boolean",
+                    "description": (
+                        "Default false: full context (skills, plugins, hooks, CLAUDE.md -- "
+                        "same as an interactive session). Set true to run with --bare "
+                        "instead, which cuts a large fixed per-call overhead (tens of "
+                        "thousands of input tokens on this project's skill/plugin catalog "
+                        "in testing) at the cost of dropping project-specific skills, "
+                        "hooks, and plugins the task might actually need. CLAUDE.md is "
+                        "always re-added even in bare mode, since project conventions "
+                        "matter for quality. Only set true for tasks you're confident "
+                        "don't depend on anything bare mode strips -- when unsure, leave "
+                        "the default."
+                    ),
                 },
             },
             "required": ["task"],
@@ -208,6 +223,24 @@ CHILD_TOOLS = [
 ]
 
 
+def _find_claude_md(start_dir):
+    """Walk upward from start_dir looking for CLAUDE.md, stopping at the
+    nearest one found or at the filesystem/git root -- mirrors Claude Code's
+    own project-root discovery closely enough for our purposes without
+    needing to shell out to `git`."""
+    d = os.path.abspath(start_dir)
+    while True:
+        candidate = os.path.join(d, "CLAUDE.md")
+        if os.path.isfile(candidate):
+            return candidate
+        if os.path.isdir(os.path.join(d, ".git")):
+            return None  # repo root reached, no CLAUDE.md in it
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None  # filesystem root reached
+        d = parent
+
+
 def _run_dir(run_id):
     return os.path.join(RUNS_DIR, run_id)
 
@@ -228,6 +261,7 @@ def start_delegate(args):
     allowed_tools = args.get("allowed_tools") or DEFAULT_ALLOWED_TOOLS
     cwd = args.get("cwd") or os.getcwd()
     resume_id = args.get("resume_session_id")
+    bare = bool(args.get("bare", False))
 
     if not os.path.isfile(DEFAULT_SETTINGS_PATH):
         return _error_result(
@@ -260,15 +294,38 @@ def start_delegate(args):
 
     child_allowed_tools = f"{allowed_tools},{ASK_PARENT_TOOL_NAME},{CHECK_MESSAGE_TOOL_NAME}"
 
+    # claude -p rejects --append-system-prompt and --append-system-prompt-file
+    # together, so everything we want appended (the ask_parent note, and in
+    # bare mode CLAUDE.md) goes into one file and one flag.
+    system_prompt_addition = ASK_PARENT_SYSTEM_NOTE
+    if bare:
+        # --bare drops CLAUDE.md along with the (much larger) skills/plugins
+        # catalog that's the actual point of --bare. Re-add just CLAUDE.md so
+        # the delegated run still has project conventions -- looked up from
+        # cwd upward, same order Claude Code's own discovery uses. Full
+        # (non-bare) mode already gets CLAUDE.md the normal way.
+        claude_md_path = _find_claude_md(cwd)
+        if claude_md_path:
+            with open(claude_md_path) as f:
+                system_prompt_addition += "\n\n" + f.read()
+
+    system_prompt_path = os.path.join(run_dir, "system-prompt-addition.md")
+    with open(system_prompt_path, "w") as f:
+        f.write(system_prompt_addition)
+
     cmd = [
         "claude", "-p", task,
         "--settings", DEFAULT_SETTINGS_PATH,
         "--allowedTools", child_allowed_tools,
         "--mcp-config", mcp_config_path,
-        "--append-system-prompt", ASK_PARENT_SYSTEM_NOTE,
+        "--append-system-prompt-file", system_prompt_path,
         "--output-format", "stream-json",
         "--verbose",
     ]
+
+    if bare:
+        cmd.insert(1, "--bare")
+
     if resume_id:
         cmd += ["--resume", resume_id]
 
@@ -337,6 +394,55 @@ def _pending_messages(run_id):
     return pending
 
 
+def _summarize_log(log_path, max_events=8):
+    """Compact, human-readable progress summary from the run's stream-json
+    log -- deliberately NOT a raw tail. A raw tail of this log is mostly
+    system/init noise (the full skill/tool catalog dump, hundreds of tokens
+    on its own) that costs the PARENT session real paid tokens for zero
+    signal every time it polls. This extracts only what actually happened:
+    assistant text, tool calls, tool results, each truncated."""
+    if not os.path.isfile(log_path):
+        return "(no output yet)"
+
+    events = []
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            etype = event.get("type")
+            if etype == "system":
+                continue  # init dump -- pure noise for a progress summary
+            if etype == "assistant":
+                for item in event.get("message", {}).get("content", []):
+                    if item.get("type") == "text" and item.get("text", "").strip():
+                        events.append(f"[assistant] {item['text'].strip()[:200]}")
+                    elif item.get("type") == "tool_use":
+                        events.append(f"[tool_use] {item.get('name')}")
+            elif etype == "user":
+                for item in event.get("message", {}).get("content", []):
+                    if item.get("type") == "tool_result":
+                        content = item.get("content")
+                        if isinstance(content, list):
+                            text = " ".join(
+                                c.get("text", "") for c in content if isinstance(c, dict)
+                            )
+                        else:
+                            text = str(content)
+                        events.append(f"[tool_result] {text.strip()[:150]}")
+            elif etype == "result":
+                events.append(f"[done] {event.get('result', '')[:200]}")
+
+    if not events:
+        return "(no output yet)"
+    return "\n".join(events[-max_events:])
+
+
 def check_status(args):
     run_id = args.get("run_id")
     meta = _load_meta(run_id) if run_id else None
@@ -369,18 +475,12 @@ def check_status(args):
     except (ProcessLookupError, PermissionError):
         running = False
 
-    tail = ""
-    if os.path.isfile(log_path):
-        with open(log_path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - LOG_TAIL_CHARS))
-            tail = f.read().decode("utf-8", errors="replace")
+    summary = _summarize_log(log_path)
 
     elapsed = time.time() - meta.get("started_at", time.time())
     status = "running" if running else "unknown (process gone, no exit code written -- check log)"
 
-    text = f"run_id {run_id}: {status}, {elapsed:.0f}s elapsed.{pending_block}\n\n--- log tail ---\n{tail}"
+    text = f"run_id {run_id}: {status}, {elapsed:.0f}s elapsed.{pending_block}\n\n--- progress ---\n{summary}"
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
 
@@ -421,11 +521,17 @@ def get_result(args):
     if result_event is None:
         return _error_result(f"Could not find a result event in the output. Log tail:\n{raw[-2000:]}")
 
-    result_text = result_event.get("result", "")
+    result_text = _strip_think_blocks(result_event.get("result", ""))
     session_id = result_event.get("session_id", "")
     cost = result_event.get("total_cost_usd")
+    usage = result_event.get("usage", {})
+    duration_api_ms = result_event.get("duration_api_ms")
 
     footer = f"\n\n-- local session_id: {session_id}"
+    out_tok = usage.get("output_tokens")
+    if out_tok and duration_api_ms:
+        tok_s = out_tok / (duration_api_ms / 1000)
+        footer += f", {out_tok} output tokens in {duration_api_ms / 1000:.1f}s ({tok_s:.1f} tok/s)"
     if cost is not None:
         footer += (
             f", est. cost: ${cost} "
@@ -433,6 +539,17 @@ def get_result(args):
             "not a real charge against a free local model)"
         )
     return {"content": [{"type": "text", "text": result_text + footer}], "isError": False}
+
+
+def _strip_think_blocks(text):
+    """Defensive cleanup: some reasoning models leak <think>...</think> into
+    their visible output if thinking isn't fully suppressed upstream (e.g. a
+    --settings file pointed at a different local model than the one this was
+    tuned against). Our own vllm.settings.json stack disables thinking at
+    the chat-template level already, so this should normally be a no-op."""
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    text = re.sub(r"^<think>.*", "", text, flags=re.DOTALL)  # orphaned opening tag
+    return text
 
 
 def reply_to_delegate(args):

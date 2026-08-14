@@ -58,6 +58,27 @@ This is genuinely load-bearing, not decorative: without it, a delegated run
 that hits something it can't decide either guesses (silently, possibly
 wrong) or fails outright. With it, it can stop and ask instead.
 
+## Two different token budgets, two different defaults
+
+The local model's tokens are free (self-hosted); the parent session's tokens
+are the paid ones. The defaults reflect that asymmetry rather than treating
+"fewer tokens" as universally good:
+
+- **Local side, `bare` (default `false`):** loading full context (skills,
+  plugins, hooks, CLAUDE.md) costs the local model tens of thousands of extra
+  input tokens per call in testing — irrelevant, since those tokens are
+  free, and full context can only help accuracy on tasks that touch anything
+  project-specific. Set `bare: true` only when you're confident a task is
+  generic enough not to need any of that (e.g. "summarize this text") and
+  you want the latency win; CLAUDE.md is still re-added even in bare mode,
+  since project conventions are worth keeping regardless.
+- **Parent side, `check_delegate_status`:** this *is* paid-token territory,
+  so it returns a compact progress summary (parsed from the run's
+  stream-json log: assistant text, tool calls, tool results) instead of a
+  raw log tail. A raw tail is mostly `system/init` noise — the full
+  skill/tool catalog dump, easily thousands of tokens — for zero signal
+  about what the delegated run is actually doing.
+
 ## Requirements
 
 - `claude` CLI on `PATH` (Claude Code)
@@ -116,15 +137,19 @@ sensitive in this session.
 | `allowed_tools` | no | `Read,Grep,Glob` (read-only) | Comma-separated tools the local sub-session may use without prompting. Widen to `Read,Edit,Write,Bash,Grep,Glob` for tasks that need to write files or run commands. |
 | `cwd` | no | server's cwd | Working directory for the local sub-session. |
 | `resume_session_id` | no | — | Continue a prior run's local sub-session (its `session_id`, from `get_delegate_result`) instead of starting fresh. |
+| `bare` | no | `false` | Run with `claude --bare` to cut a large fixed per-call token overhead, at the cost of dropping project skills/plugins/hooks. See "Two different token budgets" above. CLAUDE.md is always re-added even when `true`. |
 
 Returns a `run_id`.
 
 **`check_delegate_status`** — `{run_id}` → status (`running` / `completed` /
-`error`) plus a tail of the run's log while it's still going, plus any
+`error`) plus a compact progress summary while it's still going, plus any
 pending questions the run has asked via `ask_parent`.
 
-**`get_delegate_result`** — `{run_id}` → the final answer, local
-`session_id`, and cost estimate. Errors if the run hasn't finished yet.
+**`get_delegate_result`** — `{run_id}` → the final answer (with any
+`<think>...</think>` block stripped defensively, in case a local model
+leaks reasoning despite the settings that are supposed to suppress it),
+local `session_id`, output tokens + tok/s, and cost estimate. Errors if the
+run hasn't finished yet.
 
 **`reply_to_delegate`** — `{run_id, message_id, answer}` → answers a pending
 question surfaced by `check_delegate_status`.
@@ -185,9 +210,31 @@ echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"check_dele
 - **Notice pending questions proactively** — right now the parent only
   learns about a pending `ask_parent` question by calling
   `check_delegate_status`; there's no push/interrupt.
+- **Multi-model routing** (à la [Sakana Fugu](https://arxiv.org/html/2606.21228v1),
+  a model orchestrator that picks the right model per query): not
+  implemented, and not really applicable here yet -- this tool talks to
+  exactly one local model (whatever `--settings` points at). It'd become
+  relevant if you ran more than one local model side by side (e.g. a small
+  fast one and a bigger one) and wanted `delegate_to_local` to pick between
+  them by task shape, the way [houtini-ai/lm](https://github.com/houtini-ai/lm)
+  does with a scored `bestTaskTypes` match against `/v1/models`.
+
+## Ideas looked at and deliberately not taken
+
+- **Algorithmic tool-output compression** (BM25/FTS indexing of raw tool
+  output instead of dumping it into context, as in the "Context Mode" MCP
+  server) — solves a different problem (built-in tool output bloat, e.g.
+  `curl`/`kubectl`) than what this tool does; `check_delegate_status`
+  already avoids the equivalent problem here by summarizing structured
+  stream-json events rather than indexing free text.
+- **Per-model prompt tuning / SQLite model-metadata cache** (from
+  houtini-ai/lm) — real technique for juggling many differently-behaved
+  local models; not relevant with a single fixed local backend.
 
 Design for `ask_parent` borrowed from
 [dvcrn/mcp-server-subagent](https://github.com/dvcrn/mcp-server-subagent).
+Think-block stripping and the "measure real token/tok-s numbers" instinct
+borrowed from [houtini-ai/lm](https://github.com/houtini-ai/lm).
 
 ## License
 
