@@ -157,7 +157,14 @@ PARENT_TOOLS = [
         "description": (
             "Fetch the final result of a completed delegate_to_local run. "
             "Returns an error if the run is still in progress -- call "
-            "check_delegate_status first."
+            "check_delegate_status first. IMPORTANT: review this output before "
+            "treating it as final, especially anything that will be committed "
+            "or run unattended (config values, weights/signs, file edits). A "
+            "delegated run can produce plausible-looking but subtly wrong "
+            "output -- e.g. correct-looking code with an inverted sign on a "
+            "config parameter -- that only a read-through catches. Reviewing "
+            "already-generated output is cheap relative to what delegation "
+            "saved; don't skip it just because the local model reported success."
         ),
         "inputSchema": {
             "type": "object",
@@ -394,17 +401,29 @@ def _pending_messages(run_id):
     return pending
 
 
+_BLOCKED_PATTERNS = (
+    "haven't granted", "requires approval", "was blocked", "permission denied",
+    "requires permission", "not been granted", "denied by the",
+)
+
+
 def _summarize_log(log_path, max_events=8):
     """Compact, human-readable progress summary from the run's stream-json
     log -- deliberately NOT a raw tail. A raw tail of this log is mostly
     system/init noise (the full skill/tool catalog dump, hundreds of tokens
     on its own) that costs the PARENT session real paid tokens for zero
     signal every time it polls. This extracts only what actually happened:
-    assistant text, tool calls, tool results, each truncated."""
+    assistant text, tool calls, tool results, each truncated.
+
+    Also counts tool_results that look like permission/hook denials across
+    the WHOLE log (not just the tail) -- a run repeatedly hitting the same
+    wall is a distinct, actionable signal (probably needs wider
+    allowed_tools) that's easy to miss buried in a long event list."""
     if not os.path.isfile(log_path):
-        return "(no output yet)"
+        return "(no output yet)", 0
 
     events = []
+    blocked_count = 0
     with open(log_path) as f:
         for line in f:
             line = line.strip()
@@ -434,13 +453,50 @@ def _summarize_log(log_path, max_events=8):
                             )
                         else:
                             text = str(content)
-                        events.append(f"[tool_result] {text.strip()[:150]}")
+                        text = text.strip()
+                        lowered = text.lower()
+                        if any(p in lowered for p in _BLOCKED_PATTERNS):
+                            blocked_count += 1
+                            events.append(f"[BLOCKED] {text[:150]}")
+                        else:
+                            events.append(f"[tool_result] {text[:150]}")
             elif etype == "result":
                 events.append(f"[done] {event.get('result', '')[:200]}")
 
     if not events:
-        return "(no output yet)"
-    return "\n".join(events[-max_events:])
+        return "(no output yet)", blocked_count
+    return "\n".join(events[-max_events:]), blocked_count
+
+
+def _estimate_running_tokens(log_path):
+    """Best-effort running token/turn count while a run is still in progress
+    -- summed from each assistant event's own usage field. Not authoritative
+    (usage isn't always populated on every intermediate event the same way
+    the final `result` event's totals are), but enough to catch a run that's
+    quietly racked up an unexpectedly large number of turns/tokens before it
+    finishes, since get_delegate_result only has numbers AFTER completion."""
+    if not os.path.isfile(log_path):
+        return 0, 0, 0
+
+    turns = 0
+    input_tokens = 0
+    output_tokens = 0
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "assistant":
+                continue
+            turns += 1
+            usage = event.get("message", {}).get("usage", {})
+            input_tokens += usage.get("input_tokens", 0) or 0
+            output_tokens += usage.get("output_tokens", 0) or 0
+    return turns, input_tokens, output_tokens
 
 
 def check_status(args):
@@ -475,12 +531,29 @@ def check_status(args):
     except (ProcessLookupError, PermissionError):
         running = False
 
-    summary = _summarize_log(log_path)
+    summary, blocked_count = _summarize_log(log_path)
+    turns, input_tok, output_tok = _estimate_running_tokens(log_path)
 
     elapsed = time.time() - meta.get("started_at", time.time())
     status = "running" if running else "unknown (process gone, no exit code written -- check log)"
 
-    text = f"run_id {run_id}: {status}, {elapsed:.0f}s elapsed.{pending_block}\n\n--- progress ---\n{summary}"
+    blocked_warning = ""
+    if blocked_count >= 2:
+        blocked_warning = (
+            f"\n\n⚠ {blocked_count} tool calls in this run look like permission/hook "
+            "denials -- it may be stuck retrying around something it doesn't have "
+            "access to. Consider whether allowed_tools needs to be wider, or check "
+            "the log tail below for what it's blocked on."
+        )
+
+    token_line = ""
+    if turns:
+        token_line = f" ~{turns} turns so far (best-effort estimate: {input_tok} input / {output_tok} output tokens)."
+
+    text = (
+        f"run_id {run_id}: {status}, {elapsed:.0f}s elapsed.{token_line}"
+        f"{blocked_warning}{pending_block}\n\n--- progress ---\n{summary}"
+    )
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
 

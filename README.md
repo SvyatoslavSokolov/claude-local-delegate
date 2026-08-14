@@ -124,8 +124,35 @@ summaries, simple refactors), use delegate_to_local instead of doing it
 yourself. Poll with check_delegate_status and read the answer with
 get_delegate_result. You can start several delegations back-to-back to run
 them in parallel. Keep architecture decisions and anything security-
-sensitive in this session.
+sensitive in this session. Always review a delegated result before treating
+it as final -- a delegated run can produce plausible-looking but subtly
+wrong output (e.g. a correct-looking config with an inverted sign) that only
+a read-through catches; reviewing already-generated output is cheap
+relative to what delegation saved.
 ```
+
+### A/B test: same task, online vs delegated
+
+Ran the same well-specified, self-contained coding task (a new IsaacLab
+reward-term function, given identical reference examples) through Sonnet 5
+directly and through `delegate_to_local`. Core logic came out equally
+correct both times. The gap was elsewhere:
+
+- **Config correctness**: the delegated run's registration example used the
+  wrong sign on a weight parameter (`weight=1.0` instead of `-1e-3` for a
+  penalty term) -- semantically inverted, would silently reward the thing
+  it was supposed to penalize. Caught only by reading the output.
+- **Instruction-following**: told to output only code, no prose, the
+  delegated run added preamble and trailing commentary anyway.
+- **Turn/token blowup from permission mismatches**: given `allowed_tools`
+  too narrow for what it wanted to verify (it tried, reasonably, to check
+  its answer against the real upstream source via Bash/WebSearch/WebFetch),
+  the run burned 7 turns hitting denials before finishing -- ~197k
+  cumulative input tokens vs. a ~31k single-turn baseline, because retries
+  aren't cache-discounted the way they would be against the Anthropic API.
+  This is what `check_delegate_status`'s blocked-call detector (below) is
+  for -- it's a config/tooling mismatch, not evidence the local model can't
+  do the task.
 
 ### Tools
 
@@ -142,14 +169,19 @@ sensitive in this session.
 Returns a `run_id`.
 
 **`check_delegate_status`** — `{run_id}` → status (`running` / `completed` /
-`error`) plus a compact progress summary while it's still going, plus any
+`error`) plus a compact progress summary while it's still going, a
+best-effort running turn/token count (real numbers only land in
+`get_delegate_result` after completion; this is a during-the-run estimate),
+a ⚠ warning if 2+ tool calls look like permission/hook denials (the run is
+probably stuck wanting access `allowed_tools` didn't grant it), and any
 pending questions the run has asked via `ask_parent`.
 
 **`get_delegate_result`** — `{run_id}` → the final answer (with any
 `<think>...</think>` block stripped defensively, in case a local model
 leaks reasoning despite the settings that are supposed to suppress it),
 local `session_id`, output tokens + tok/s, and cost estimate. Errors if the
-run hasn't finished yet.
+run hasn't finished yet. **Review the output before trusting it** -- see the
+A/B test above for why.
 
 **`reply_to_delegate`** — `{run_id, message_id, answer}` → answers a pending
 question surfaced by `check_delegate_status`.
@@ -186,6 +218,18 @@ secrets, production systems, or anything you wouldn't want an unattended
 process doing on your machine. Nothing currently kills a run that hangs or
 runs long — check `check_delegate_status`/the log if one seems stuck, and
 kill the `bash -c` wrapper PID (in `meta.json`) manually if needed.
+
+Hooks and permission gates configured for your account/project (e.g. from
+`~/.claude/settings.json` or managed/policy settings) still apply inside a
+delegated run in non-`bare` mode, same as an interactive session — this
+tool deliberately does **not** give the delegated run any way to get a hook
+or permission denial approved on its own (an earlier design that routed
+denials through `ask_parent` for the parent session to approve was dropped:
+it would have let one AI session grant another AI session's blocked action
+with no human in the loop). A denied run either finds another way to make
+progress or gets stuck; `check_delegate_status` flags 2+ denials so you
+notice and can decide -- widen `allowed_tools` and restart, or intervene by
+hand -- rather than the run quietly burning turns against the same wall.
 
 ## Testing manually
 
