@@ -1,9 +1,10 @@
 # claude-local-delegate
 
-An MCP server for Claude Code with three tools — `delegate_to_local`,
-`check_delegate_status`, `get_delegate_result` — that hand a task to a
-locally-hosted model (e.g. served by vLLM) while keeping your main session on
-your regular subscription/model.
+An MCP server for Claude Code with tools to hand a task to a locally-hosted
+model (e.g. served by vLLM) while keeping your main session on your regular
+subscription/model. Parent-side: `delegate_to_local`, `check_delegate_status`,
+`get_delegate_result`, `reply_to_delegate`. Given to the delegated run itself:
+`ask_parent`, `check_message_status`.
 
 ## Why this instead of a prompt-wrapper MCP tool
 
@@ -34,6 +35,28 @@ the local server's own concurrency (e.g. vLLM's `--max-num-seqs`), not
 anything in this tool. Each run gets its own working directory copy of
 nothing shared except the filesystem, so parallel runs touching the same
 files can still race each other — scope `allowed_tools`/`cwd` accordingly.
+
+## Bi-directional: the delegated run can ask back
+
+Each `delegate_to_local` run is launched with its own `--mcp-config` that
+points back at this same `server.py`, spawned a second time as a **separate
+process** with `CLAUDE_LOCAL_DELEGATE_ROLE=child` in its environment. In that
+mode the script exposes only `ask_parent`/`check_message_status` — not
+`delegate_to_local` itself, so a delegated run can't spawn further
+delegations unboundedly.
+
+When the local model calls `ask_parent`, it writes a question to a JSON file
+under the run's `messages/` directory and blocks (server-side, inside
+`check_message_status`, up to ~50s per call) waiting for an answer. The
+parent session sees pending questions surfaced in `check_delegate_status`'s
+output and answers with `reply_to_delegate`; the waiting child picks up the
+answer on its next poll and continues. Parent and child are always different
+OS processes — coordination is entirely through files in the run directory,
+not shared memory.
+
+This is genuinely load-bearing, not decorative: without it, a delegated run
+that hits something it can't decide either guesses (silently, possibly
+wrong) or fails outright. With it, it can stop and ask instead.
 
 ## Requirements
 
@@ -97,17 +120,27 @@ sensitive in this session.
 Returns a `run_id`.
 
 **`check_delegate_status`** — `{run_id}` → status (`running` / `completed` /
-`error`) plus a tail of the run's log while it's still going.
+`error`) plus a tail of the run's log while it's still going, plus any
+pending questions the run has asked via `ask_parent`.
 
 **`get_delegate_result`** — `{run_id}` → the final answer, local
 `session_id`, and cost estimate. Errors if the run hasn't finished yet.
+
+**`reply_to_delegate`** — `{run_id, message_id, answer}` → answers a pending
+question surfaced by `check_delegate_status`.
+
+The delegated run itself gets two more tools automatically (you never call
+these from the parent session): **`ask_parent`** (`{question}` → `message_id`)
+and **`check_message_status`** (`{message_id}` → the answer, once given).
 
 ### Run artifacts
 
 Each run gets `~/.claude-local-delegate/runs/<run_id>/` containing
 `prompt.md` (the task text), `output.log` (raw `claude -p` stream-json
-output), `meta.json`, and `exit_code` once finished — useful for debugging a
-run that didn't do what you expected. Override the location with
+output), `meta.json`, `exit_code` once finished, `mcp-config.json` (the
+generated config that wires up `ask_parent` for this run), and a `messages/`
+subdirectory with one JSON file per `ask_parent` question — useful for
+debugging a run that didn't do what you expected. Override the location with
 `CLAUDE_LOCAL_DELEGATE_RUNS_DIR`. Nothing prunes this directory automatically
 yet; clean it out periodically if you delegate a lot.
 
@@ -146,16 +179,15 @@ echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"check_dele
 
 ## Possible future work
 
-- **Bi-directional communication**: let a delegated run ask the parent
-  session a clarifying question mid-task instead of guessing or failing,
-  the way [dvcrn/mcp-server-subagent](https://github.com/dvcrn/mcp-server-subagent)
-  does with `ask_parent`/`reply_subagent`. Would need the child `claude -p`
-  process to have its own way to reach back to the parent (e.g. via
-  `--mcp-config` pointed at a small IPC channel) — meaningfully more complex
-  than the polling model here, not implemented.
 - **Auto-expiring runs directory** — nothing prunes `~/.claude-local-delegate/runs/`
   yet.
 - **Configurable timeout / auto-kill** for runs that hang.
+- **Notice pending questions proactively** — right now the parent only
+  learns about a pending `ask_parent` question by calling
+  `check_delegate_status`; there's no push/interrupt.
+
+Design for `ask_parent` borrowed from
+[dvcrn/mcp-server-subagent](https://github.com/dvcrn/mcp-server-subagent).
 
 ## License
 
