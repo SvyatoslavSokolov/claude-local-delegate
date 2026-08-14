@@ -282,6 +282,33 @@ echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"check_dele
   | python3 server.py
 ```
 
+### Cold-start validation
+
+The tool descriptions are meant to be sufficient on their own -- a fresh
+Claude Code session, with no memory of how this server was built and no
+`CLAUDE.md` guidance, should be able to use it correctly just from
+`tools/list`. Verified this directly: ran two independent `claude -p`
+sessions with only this server's `--mcp-config` and no other context.
+
+- Task 1 (single delegation): correctly called `delegate_to_local` →
+  `check_delegate_status` (polling) → `get_delegate_result`, noticed a
+  blocked tool call mid-run and restarted with narrower scope on its own,
+  and correctly distinguished `check_delegate_status` (status + log) from
+  `get_delegate_result` (final answer) -- exactly matching each tool's
+  description, not something it could have inferred from a hidden default.
+- Task 2 (three independent facts to combine): correctly chose
+  `fan_out_to_local` over three manual `delegate_to_local` calls, correctly
+  sequenced `fan_out_to_local` → `check_fanout_status` →
+  `get_fanout_result(aggregate_instruction=...)`, correctly identified that
+  the resulting aggregation run needed the *ordinary*
+  `check_delegate_status`/`get_delegate_result` tools rather than the
+  fan-out ones, and cited the "review before trusting" line from
+  `get_delegate_result`'s description verbatim as its next step.
+
+No description gaps found in either run -- both sessions reasoned about the
+right sequence, including the aggregation-becomes-a-normal-run detail,
+purely from `tools/list` output.
+
 ## Possible future work
 
 - **Auto-expiring runs directory** — nothing prunes `~/.claude-local-delegate/runs/`
