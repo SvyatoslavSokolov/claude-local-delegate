@@ -68,6 +68,14 @@ ASK_PARENT_TOOL_NAME = "mcp__claude-local-delegate__ask_parent"
 CHECK_MESSAGE_TOOL_NAME = "mcp__claude-local-delegate__check_message_status"
 MESSAGE_POLL_TOTAL_S = 50
 MESSAGE_POLL_INTERVAL_S = 2
+# check_delegate_status/check_fanout_status long-poll for this long before
+# returning a "still running" snapshot -- there is no push channel back to
+# the calling session (this server only ever speaks when spoken to over
+# stdio), so a status call that returns instantly forces the caller to guess
+# when to check again. Blocking here means a single call has a real chance
+# of landing on completion instead of a stale snapshot.
+STATUS_POLL_TOTAL_S = 50
+STATUS_POLL_INTERVAL_S = 2
 
 ASK_PARENT_SYSTEM_NOTE = (
     "You have an ask_parent tool. If you are genuinely blocked -- something "
@@ -151,9 +159,15 @@ PARENT_TOOLS = [
         "name": "check_delegate_status",
         "description": (
             "Check whether a delegate_to_local run (by run_id) is still running, "
-            "completed, or failed. Returns a tail of its log while running, plus "
-            "any pending question the run has asked via ask_parent -- answer "
-            "those with reply_to_delegate so the run can continue."
+            "completed, or failed. Blocks server-side for up to "
+            f"{STATUS_POLL_TOTAL_S}s waiting for the run to finish (or ask a "
+            "question) before returning a snapshot -- there is no separate "
+            "completion notification, so call this again (it's fine to call it "
+            "repeatedly back-to-back) until it reports completed/error rather "
+            "than assuming a background push will tell you. Returns a tail of "
+            "its log while running, plus any pending question the run has asked "
+            "via ask_parent -- answer those with reply_to_delegate so the run "
+            "can continue."
         ),
         "inputSchema": {
             "type": "object",
@@ -251,7 +265,14 @@ PARENT_TOOLS = [
     },
     {
         "name": "check_fanout_status",
-        "description": "Check progress of a fan_out_to_local batch: how many items completed/errored/still running, plus a warning if running items look stuck on permission denials.",
+        "description": (
+            "Check progress of a fan_out_to_local batch: how many items "
+            f"completed/errored/still running. Blocks server-side for up to "
+            f"{STATUS_POLL_TOTAL_S}s waiting for all items to finish before "
+            "returning -- there is no separate completion notification, so "
+            "call again if items are still running. Also warns if running "
+            "items look stuck on permission denials."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -614,6 +635,20 @@ def check_status(args):
     exit_code_path = os.path.join(run_dir, "exit_code")
     log_path = os.path.join(run_dir, "output.log")
 
+    # Long-poll: block here (instead of returning an instant snapshot) so a
+    # single call has a real chance to land on completion or a fresh
+    # question. There's no way for this server to push a notification to
+    # the calling session later -- it only runs while handling a request --
+    # so this is the only way a status check can be more useful than a
+    # coin-flip snapshot of a background run that takes minutes.
+    deadline = time.time() + STATUS_POLL_TOTAL_S
+    while True:
+        if os.path.isfile(exit_code_path) or _pending_messages(run_id):
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(STATUS_POLL_INTERVAL_S)
+
     pending = _pending_messages(run_id)
     pending_block = ""
     if pending:
@@ -832,6 +867,16 @@ def check_fanout_status(args):
         return _error_result(f"Unknown batch_id: {batch_id}")
     with open(path) as f:
         batch = json.load(f)
+
+    def _still_running(run_id):
+        return not os.path.isfile(os.path.join(_run_dir(run_id), "exit_code"))
+
+    # Long-poll like check_delegate_status: block until every item is done
+    # or the deadline passes, rather than returning an instant "still
+    # running" snapshot the caller has no reliable way to know to recheck.
+    deadline = time.time() + STATUS_POLL_TOTAL_S
+    while any(_still_running(run_id) for run_id in batch["run_ids"]) and time.time() < deadline:
+        time.sleep(STATUS_POLL_INTERVAL_S)
 
     completed, errored, running, total_blocked = 0, 0, 0, 0
     for run_id in batch["run_ids"]:
