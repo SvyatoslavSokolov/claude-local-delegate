@@ -323,6 +323,80 @@ def _last_assistant_text(transcript_path):
     return last
 
 
+def _tail_transcript(transcript_path, max_events=24):
+    """The last few assistant texts / tool names / tool_result snippets, as a flat
+    list of strings. Used to classify WHY an agent is blocked (the tail holds the
+    gate message or the missing-tool report). Cheap: it never touches the model."""
+    tail = []
+    for e in _iter_events(transcript_path):
+        t = e.get("type")
+        if t == "assistant":
+            content = e.get("message", {}).get("content", [])
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text" and item.get("text", "").strip():
+                    tail.append(("text", item["text"].strip()))
+                elif item.get("type") == "tool_use":
+                    tail.append(("tool", f"{item.get('name')} {json.dumps(item.get('input', {}))[:200]}"))
+        elif t == "user":
+            content = e.get("message", {}).get("content", [])
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "tool_result":
+                    raw = item.get("content")
+                    if isinstance(raw, list):
+                        raw = " ".join(c.get("text", "") for c in raw if isinstance(c, dict))
+                    tail.append(("result", str(raw).strip()))
+    return tail[-max_events:]
+
+
+# Category heuristics for WHY an agent is blocked. Order matters: the most
+# specific / actionable signals are checked first. Each returns a short label +
+# a one-line "what to do" so the parent (main model) can act without re-reading
+# the whole transcript.
+_BLOCK_SIGNATURES = (
+    ("hook-gate", ("Fact-Forcing Gate", "present these facts", "GateGuard",
+                   "Before creating", "Before editing", "destructive command")),
+    ("mcp-tool-missing", ("NO_MCP", "not available to you", "not present in your toolset",
+                          "No such tool available", "mcp__.* not")),
+    ("websearch-broken", ("tool_choice", "tools must be set", "VLLMValidation", "litellm.BadRequest")),
+    ("permission-prompt", ("permission prompt", "requires approval", "needs permission",
+                           "waiting for permission", "Permission for this action")),
+    ("needs-input", ("what would you like", "should i", "do you want", "how would you like",
+                     "which option", "let me know")),
+)
+
+
+def _classify_blocked(agent, transcript_path):
+    """Return (category, last_words) describing why a `blocked` agent is parked.
+    Preference: the native roster `waitingFor` field (Claude Code's own call) is
+    the anchor; the transcript tail refines it to an actionable category."""
+    waiting_for = (agent.get("waitingFor") or "").strip()
+    wf = "permission-prompt" if "permission" in waiting_for.lower() else (
+        "input-needed" if waiting_for else "unknown")
+
+    category = wf
+    last_words = ""
+    if transcript_path:
+        tail = _tail_transcript(transcript_path)
+        for kind, val in tail:
+            if kind == "text":
+                last_words = val
+        tail_text = " ".join(v for k, v in tail).lower()
+        for label, pats in _BLOCK_SIGNATURES:
+            for p in pats:
+                if re.search(p, tail_text, flags=re.IGNORECASE):
+                    category = label
+                    break
+            if category != wf:
+                break
+    return category, waiting_for, last_words
+
+
 # ---- tool handlers ------------------------------------------------------------
 
 def start_delegate(args):
@@ -383,17 +457,25 @@ def check_status(args):
         f"  session: {session_id}"
     )
 
-    # If the agent is `blocked` (the native "needs input" state), surface the
-    # question it is waiting on so the parent knows what to SendMessage back.
+    # If the agent is `blocked` (the native "needs input" state), classify WHY and
+    # surface its last words so the parent (main model) can act without re-reading
+    # the whole transcript. waitingFor is Claude Code's own signal; the transcript
+    # tail refines it (gateguard / missing MCP / broken WebSearch / permission / ...).
     if state == "blocked":
         tr = _find_transcript(session_id) if session_id else None
-        if tr:
-            q = _last_assistant_text(tr)
-            if q:
-                text += (
-                    f"\n\nBLOCKED -- it is waiting on (its last words):\n{q[:600]}\n"
-                    "Reply with the native SendMessage tool addressed to this agent to unblock it."
-                )
+        category, waiting_for, last_words = _classify_blocked(agent, tr)
+        detail = f"  reason: {category}"
+        if waiting_for:
+            detail += f" (native waitingFor: {waiting_for!r})"
+        text += "\n" + detail
+        if last_words:
+            text += f"\n\nIts last words:\n{last_words[:600]}"
+        text += (
+            "\n\nTo unblock: use the native SendMessage tool addressed to this agent "
+            "(or `claude attach <id>`). Categories that usually need a settings fix "
+            "instead of a message: mcp-tool-missing (check ~/.claude.json), "
+            "websearch-broken (use the curl fallback), hook-gate (use the slim profile)."
+        )
 
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
