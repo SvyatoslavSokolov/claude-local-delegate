@@ -1,35 +1,44 @@
 #!/usr/bin/env python3
 """
-MCP server for delegating tasks to a local model, by spawning a real
-headless `claude -p` subprocess pointed at a local backend (via --settings).
-The delegated call gets the actual Claude Code agent loop (tools, context
-management, CLAUDE.md) -- not a hand-rolled prompt wrapper -- just running
-against a local model instead of Anthropic's.
+MCP server for delegating tasks to a local model, but WITHOUT inventing its own
+agent abstraction. Every delegated task becomes a real NATIVE Claude Code
+background agent (`claude --bg`) pointed at the local backend via --settings
+(vLLM/LiteLLM). The delegated agent is therefore a genuine, first-class Claude
+Code session that:
 
-Delegation is asynchronous: delegate_to_local spawns the subprocess in the
-background and returns a run_id immediately, so the calling session isn't
-blocked for the minutes a local generation can take. check_delegate_status
-and get_delegate_result poll for progress/output. Because each call returns
-immediately, firing off several delegate_to_local calls back-to-back runs
-them genuinely in parallel -- bounded by the local server's own concurrency
-limit (e.g. vLLM's --max-num-seqs), not by this tool.
+  * shows up in `claude agents` (the native agent-view panel),
+  * can be inspected with `claude logs <id>` / `claude attach <id>`,
+  * is reachable by the parent session through the NATIVE cross-session
+    messaging tools (ListAgents / SendMessage) -- the agent's own `blocked`
+    state is the native "I need input" signal, so this server no longer ships
+    a bespoke ask_parent/check_message_status protocol.
 
-Bi-directional communication: each delegated run is launched with its own
---mcp-config pointing back at THIS SAME SCRIPT, spawned as a second,
-separate process with CLAUDE_LOCAL_DELEGATE_ROLE=child in its environment.
-That child-mode process exposes only ask_parent/check_message_status (not
-delegate_to_local -- no unbounded recursive delegation) and exchanges
-messages with the parent-mode process via JSON files under the run's
-messages/ directory. Parent and child are always different OS processes
-(each `claude` session spawns its own stdio server) -- there is no shared
-memory, only the filesystem.
+This server is deliberately thin: it is the *spawner and observer* of native
+agents, not a replacement for them. The heavy lifting (the agent loop, tools,
+context management, the parent<->agent conversation) is all done by Claude
+Code itself. That is the whole point -- the local model rides on the SAME
+native machinery your main session already uses, so there is no divergent
+"delegation entity" to maintain.
 
-Stdlib-only: no `mcp` SDK dependency, so no venv/pip install is needed.
-Implements the MCP stdio transport directly (newline-delimited JSON-RPC 2.0).
+Parent-side tools:
+  delegate_to_local      spawn one native `claude --bg` agent on the local model
+  check_delegate_status  read its NATIVE state (+ surface its `blocked` question)
+  get_delegate_result    read its NATIVE transcript (last assistant answer)
+  fan_out_to_local       spawn N parallel native agents (map)
+  check_fanout_status    aggregate their native states (reduce)
+  get_fanout_result      aggregate their native transcripts (reduce)
+
+Replying to a delegated agent is the NATIVE `SendMessage(<agent>)` tool on the
+parent side (the agent's own ListAgents sees it), not an MCP call -- that is
+what "working on the agents and their requests, natively" means here.
+
+Stdlib-only. Implements the MCP stdio transport directly (newline-delimited
+JSON-RPC 2.0), same as before.
 """
 
 import json
 import os
+import glob
 import re
 import subprocess
 import sys
@@ -38,342 +47,283 @@ import uuid
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "claude-local-delegate"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0"
 
-SELF_PATH = os.path.abspath(__file__)
-ROLE = os.environ.get("CLAUDE_LOCAL_DELEGATE_ROLE", "parent")
-CHILD_RUN_ID = os.environ.get("CLAUDE_LOCAL_DELEGATE_RUN_ID")
+# Where the local backend profile lives (ANTHROPIC_BASE_URL -> vLLM/LiteLLM,
+# model env, etc). This is what the spawned `claude --bg` agents use, so they
+# run on the local model while the parent session keeps its own provider.
+#
+# Default is the SLIM delegate profile (vllm.delegate.settings.json), not the
+# full vllm.settings.json: the full one enables the interactive plugins
+# (everything-claude-code, context7), whose gateguard Fact-Forcing PreToolUse
+# hook is built for a human-in-the-loop session (deny first Write/Bash, demand
+# "present facts then retry"). An unattended local-model agent runs that loop
+# poorly and parks. The slim profile keeps the same vLLM routing but drops the
+# plugins, which also removes the large fixed skill/plugin-token overhead and
+# the "MCP server needs authentication" friction. Fall back to the full profile
+# if the slim one isn't present.
+SLIM_SETTINGS_PATH = os.path.expanduser("~/.claude/vllm.delegate.settings.json")
+FALLBACK_SETTINGS_PATH = os.path.expanduser("~/.claude/vllm.settings.json")
 
-DEFAULT_SETTINGS_PATH = os.environ.get(
-    "CLAUDE_LOCAL_DELEGATE_SETTINGS",
-    os.path.expanduser("~/.claude/vllm.settings.json"),
-)
+
+def _default_settings_path():
+    """Resolve the settings profile lazily (at spawn time, not import time):
+    this server is a long-lived process, so a slim profile created mid-session
+    should be picked up without a restart."""
+    override = os.environ.get("CLAUDE_LOCAL_DELEGATE_SETTINGS")
+    if override:
+        return override
+    return SLIM_SETTINGS_PATH if os.path.isfile(SLIM_SETTINGS_PATH) else FALLBACK_SETTINGS_PATH
 DEFAULT_ALLOWED_TOOLS = "Read,Grep,Glob"
-RUNS_DIR = os.environ.get(
-    "CLAUDE_LOCAL_DELEGATE_RUNS_DIR",
-    os.path.expanduser("~/.claude-local-delegate/runs"),
-)
+
+# Bookkeeping for fan_out batches ONLY -- a map of batch_id -> [agent ids].
+# This is not an "agent entity": the agents themselves are 100% native
+# `claude --bg` sessions; this file just remembers which ones belong to a
+# batch so check_fanout_status/get_fanout_result can aggregate them.
 BATCHES_DIR = os.environ.get(
     "CLAUDE_LOCAL_DELEGATE_BATCHES_DIR",
     os.path.expanduser("~/.claude-local-delegate/batches"),
 )
-# vLLM concurrency ceiling from this stack's docker-compose (--max-num-seqs).
-# Not enforced here -- vLLM's own scheduler queues excess requests rather
-# than failing -- but fan_out_to_local warns past this because many
-# concurrent long-context runs contend for the same finite KV-cache/VRAM
-# pool: throughput doesn't scale linearly once you're past what the box can
-# actually hold resident, even though nothing errors out.
+# vLLM concurrency ceiling from this stack (--max-num-seqs). Not enforced here;
+# fan_out_to_local only warns past it (see README).
 LOCAL_SERVER_MAX_CONCURRENCY = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY", "16"))
-ASK_PARENT_TOOL_NAME = "mcp__claude-local-delegate__ask_parent"
-CHECK_MESSAGE_TOOL_NAME = "mcp__claude-local-delegate__check_message_status"
-MESSAGE_POLL_TOTAL_S = 50
-MESSAGE_POLL_INTERVAL_S = 2
-# check_delegate_status/check_fanout_status long-poll for this long before
-# returning a "still running" snapshot -- there is no push channel back to
-# the calling session (this server only ever speaks when spoken to over
-# stdio), so a status call that returns instantly forces the caller to guess
-# when to check again. Blocking here means a single call has a real chance
-# of landing on completion instead of a stale snapshot.
-STATUS_POLL_TOTAL_S = 50
-STATUS_POLL_INTERVAL_S = 2
 
-ASK_PARENT_SYSTEM_NOTE = (
-    "You have an ask_parent tool. If you are genuinely blocked -- something "
-    "only the session that delegated this task to you can decide or clarify "
-    "-- call ask_parent with a specific question, then poll "
-    "check_message_status until it's answered. Don't use it for things you "
-    "can reasonably decide yourself; try to make progress with your own "
-    "judgment first."
+CLAUDE_BIN = os.environ.get("CLAUDE_LOCAL_DELEGATE_BIN", "claude")
+CLAUDE_CONFIG_DIR = os.environ.get(
+    "CLAUDE_LOCAL_DELEGATE_CONFIG_DIR", os.path.expanduser("~/.claude")
+)
+# MCP servers are NOT passed per-spawn: a fresh `claude --bg "task"` dispatch
+# ignores --mcp-config/--strict-mcp-config (verified by probe). Instead the
+# web-capability MCPs live at USER SCOPE (~/.claude.json: ParallelSearch,
+# context7) and every delegated agent loads them automatically. The spawner
+# itself (claude-local-delegate) is also user-scope, so a recursion guard
+# (--disallowedTools mcp__claude-local-delegate) is added at spawn time -- see
+# _spawn_native_agent. That is the native analogue of the old ROLE=child switch.
+# Native `claude --bg` starts in manual mode, where --allowedTools does NOT
+# auto-approve (unlike headless `claude -p`): the agent blocks on its first
+# gated tool with no human present. So the spawner must set a --permission-mode
+# for the granted tools to actually run unattended.
+#
+# Default is bypassPermissions: a delegated agent is UNATTENDED by design, so
+# any mode that still prompts (acceptEdits leaves Bash gated; default prompts
+# on everything) will park the agent forever on its first Bash call. With
+# bypassPermissions the agent runs its full granted toolset (Bash included)
+# without approval gates -- the same contract the old `claude -p` +
+# --allowedTools had, just expressed with the native flag. This is the user's
+# own local model on their own machine; narrow per-delegation with the
+# permission_mode/disallowed_tools params or the env override when a task
+# should not have shell.
+DEFAULT_PERMISSION_MODE = os.environ.get(
+    "CLAUDE_LOCAL_DELEGATE_PERMISSION_MODE", "bypassPermissions"
 )
 
-PARENT_TOOLS = [
-    {
-        "name": "delegate_to_local",
-        "description": (
-            "Start a self-contained task on the local model (served by vLLM) "
-            "by spawning a real headless `claude -p` subprocess with --settings "
-            "pointed at the local backend. The local model gets the full Claude "
-            "Code agent loop (its own tool calls, its own context management) "
-            "for this task, not a summarized prompt. Returns immediately with a "
-            "run_id -- this does NOT block waiting for the local model, so you "
-            "can call this multiple times back-to-back to run several local "
-            "delegations in parallel (limited by the local server's own "
-            "concurrency, e.g. vLLM --max-num-seqs). Poll with "
-            "check_delegate_status, then read the answer with get_delegate_result. "
-            "check_delegate_status also surfaces any pending question the "
-            "delegated run has asked you via its own ask_parent tool -- answer "
-            "those with reply_to_delegate. Use for mechanical / high-volume work "
-            "(drafts, boilerplate, straightforward refactors, summarization) "
-            "where local-model latency is worth saving tokens on the main "
-            "session. Do not use for tasks needing careful judgment, "
-            "architecture decisions, or security-sensitive changes -- keep "
-            "those in the main session."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "The task/prompt to hand to the local model. Be specific and self-contained -- the local sub-session starts with no memory of this conversation.",
-                },
-                "allowed_tools": {
-                    "type": "string",
-                    "description": (
-                        "Comma-separated tools the local sub-session may use without "
-                        "prompting, e.g. 'Read,Edit,Write,Bash,Grep,Glob'. Defaults to "
-                        f"read-only ('{DEFAULT_ALLOWED_TOOLS}'). Widen only when the task "
-                        "genuinely needs to write files or run commands -- the local "
-                        "model runs unsupervised with whatever access you grant here. "
-                        "ask_parent/check_message_status are always available to the "
-                        "delegated run regardless of this setting."
-                    ),
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Working directory for the local sub-session. Defaults to this MCP server's own working directory.",
-                },
-                "resume_session_id": {
-                    "type": "string",
-                    "description": "Optional session_id from a prior delegate_to_local run (see get_delegate_result), to continue that local sub-session instead of starting fresh.",
-                },
-                "bare": {
-                    "type": "boolean",
-                    "description": (
-                        "Default false: full context (skills, plugins, hooks, CLAUDE.md -- "
-                        "same as an interactive session). Set true to run with --bare "
-                        "instead, which cuts a large fixed per-call overhead (tens of "
-                        "thousands of input tokens on this project's skill/plugin catalog "
-                        "in testing) at the cost of dropping project-specific skills, "
-                        "hooks, and plugins the task might actually need. CLAUDE.md is "
-                        "always re-added even in bare mode, since project conventions "
-                        "matter for quality. Only set true for tasks you're confident "
-                        "don't depend on anything bare mode strips -- when unsure, leave "
-                        "the default."
-                    ),
-                },
-            },
-            "required": ["task"],
-        },
-    },
-    {
-        "name": "check_delegate_status",
-        "description": (
-            "Check whether a delegate_to_local run (by run_id) is still running, "
-            "completed, or failed. Blocks server-side for up to "
-            f"{STATUS_POLL_TOTAL_S}s waiting for the run to finish (or ask a "
-            "question) before returning a snapshot -- there is no separate "
-            "completion notification, so call this again (it's fine to call it "
-            "repeatedly back-to-back) until it reports completed/error rather "
-            "than assuming a background push will tell you. Returns a tail of "
-            "its log while running, plus any pending question the run has asked "
-            "via ask_parent -- answer those with reply_to_delegate so the run "
-            "can continue."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "run_id": {"type": "string", "description": "run_id returned by delegate_to_local."},
-            },
-            "required": ["run_id"],
-        },
-    },
-    {
-        "name": "get_delegate_result",
-        "description": (
-            "Fetch the final result of a completed delegate_to_local run. "
-            "Returns an error if the run is still in progress -- call "
-            "check_delegate_status first. IMPORTANT: review this output before "
-            "treating it as final, especially anything that will be committed "
-            "or run unattended (config values, weights/signs, file edits). A "
-            "delegated run can produce plausible-looking but subtly wrong "
-            "output -- e.g. correct-looking code with an inverted sign on a "
-            "config parameter -- that only a read-through catches. Reviewing "
-            "already-generated output is cheap relative to what delegation "
-            "saved; don't skip it just because the local model reported success."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "run_id": {"type": "string", "description": "run_id returned by delegate_to_local."},
-            },
-            "required": ["run_id"],
-        },
-    },
-    {
-        "name": "reply_to_delegate",
-        "description": (
-            "Answer a pending question a delegated run asked via its own "
-            "ask_parent tool (surfaced by check_delegate_status). The run's "
-            "own check_message_status call picks up the answer and continues."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "run_id": {"type": "string", "description": "run_id the question came from."},
-                "message_id": {"type": "string", "description": "message_id from check_delegate_status's pending-question listing."},
-                "answer": {"type": "string", "description": "Your answer to the delegated run's question."},
-            },
-            "required": ["run_id", "message_id", "answer"],
-        },
-    },
-    {
-        "name": "fan_out_to_local",
-        "description": (
-            "Map-reduce over the local model: split a large body of independent "
-            "material (e.g. many doc pages, files, or search results) into "
-            "`items` and process each in its own parallel delegate_to_local run "
-            "with the same `shared_instruction`. Use this instead of stuffing "
-            "everything into one huge local context -- each item still fits in "
-            "the local model's own window (chunking also tends to beat one "
-            "giant context on accuracy; long-context recall degrades the more "
-            "you cram in, 'lost in the middle'), and this session only ever "
-            "reads the final synthesized answer, not the raw material. Returns "
-            "immediately with a batch_id; poll check_fanout_status, then "
-            "get_fanout_result once every item is done.\n\n"
-            "Real ceiling to know about: parallel runs share this box's fixed "
-            f"vLLM concurrency ({LOCAL_SERVER_MAX_CONCURRENCY} concurrent "
-            "sequences here) and, more importantly, its VRAM/KV-cache pool. "
-            "More items than that don't fail, they queue -- and if each item's "
-            "context is itself large, several of them near-simultaneously can "
-            "contend for the same KV-cache, so parallelism doesn't scale as "
-            "cleanly as spinning up more items always implies. Reasonable batch "
-            f"sizes (up to roughly {LOCAL_SERVER_MAX_CONCURRENCY}) with "
-            "moderate per-item context is the sweet spot, not 'as many as "
-            "possible.'"
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Independent pieces of material, one per parallel local run. Each becomes its own delegate_to_local task: shared_instruction + this item.",
-                },
-                "shared_instruction": {
-                    "type": "string",
-                    "description": "The instruction applied to every item (e.g. 'Summarize the key API changes in this doc page').",
-                },
-                "allowed_tools": {
-                    "type": "string",
-                    "description": f"Same as delegate_to_local's allowed_tools, applied to every item. Defaults to read-only ('{DEFAULT_ALLOWED_TOOLS}').",
-                },
-                "cwd": {"type": "string", "description": "Working directory for every item's local sub-session."},
-                "bare": {"type": "boolean", "description": "Same as delegate_to_local's bare param, applied to every item."},
-            },
-            "required": ["items", "shared_instruction"],
-        },
-    },
-    {
-        "name": "check_fanout_status",
-        "description": (
-            "Check progress of a fan_out_to_local batch: how many items "
-            f"completed/errored/still running. Blocks server-side for up to "
-            f"{STATUS_POLL_TOTAL_S}s waiting for all items to finish before "
-            "returning -- there is no separate completion notification, so "
-            "call again if items are still running. Also warns if running "
-            "items look stuck on permission denials."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "batch_id": {"type": "string", "description": "batch_id returned by fan_out_to_local."},
-            },
-            "required": ["batch_id"],
-        },
-    },
-    {
-        "name": "get_fanout_result",
-        "description": (
-            "Fetch results from a fan_out_to_local batch. Errors if any item "
-            "isn't done yet -- call check_fanout_status first. Without "
-            "aggregate_instruction, returns all items' raw results concatenated "
-            "(you review and synthesize yourself). With aggregate_instruction, "
-            "starts ONE MORE local run that reads all the items' results and "
-            "synthesizes per that instruction -- an ordinary delegate_to_local "
-            "run under the hood, so poll it with the normal "
-            "check_delegate_status/get_delegate_result (same review-before-"
-            "trusting caveat applies to the synthesized answer)."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "batch_id": {"type": "string", "description": "batch_id returned by fan_out_to_local."},
-                "aggregate_instruction": {
-                    "type": "string",
-                    "description": "Optional: if set, spawns a local run to synthesize all items' results per this instruction instead of returning them raw.",
-                },
-            },
-            "required": ["batch_id"],
-        },
-    },
-]
 
-CHILD_TOOLS = [
-    {
-        "name": "ask_parent",
-        "description": (
-            "Ask the session that delegated this task to you a question, when "
-            "you're genuinely blocked on something only it can decide or "
-            "clarify. Returns a message_id -- poll check_message_status with it "
-            "until you get an answer. Don't use this for things you can "
-            "reasonably decide with your own judgment."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "question": {"type": "string", "description": "Your specific question for the parent session."},
-            },
-            "required": ["question"],
-        },
-    },
-    {
-        "name": "check_message_status",
-        "description": (
-            "Poll for the answer to a question you asked via ask_parent. Blocks "
-            f"server-side for up to {MESSAGE_POLL_TOTAL_S}s waiting for an "
-            "answer before returning 'still pending' -- call again if you get "
-            "that back and the question still matters."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "message_id": {"type": "string", "description": "message_id returned by ask_parent."},
-            },
-            "required": ["message_id"],
-        },
-    },
-]
+# ---- native agent spawning ---------------------------------------------------
+
+def _slug_from_task(task, max_words=6):
+    """A short, safe display name for the background agent (so `claude agents`
+    shows a label, not the whole prompt)."""
+    words = [w for w in task.replace("\n", " ").split() if w.strip()]
+    slug = " ".join(words[:max_words]).strip()
+    return (slug or "delegate").replace("'", "")
 
 
-def _find_claude_md(start_dir):
-    """Walk upward from start_dir looking for CLAUDE.md, stopping at the
-    nearest one found or at the filesystem/git root -- mirrors Claude Code's
-    own project-root discovery closely enough for our purposes without
-    needing to shell out to `git`."""
-    d = os.path.abspath(start_dir)
-    while True:
-        candidate = os.path.join(d, "CLAUDE.md")
-        if os.path.isfile(candidate):
-            return candidate
-        if os.path.isdir(os.path.join(d, ".git")):
-            return None  # repo root reached, no CLAUDE.md in it
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None  # filesystem root reached
-        d = parent
+def _default_agent():
+    """The worker persona applied to every delegated agent (its body is the
+    agent's system prompt). local-worker disciplines a weaker local model:
+    verify by running a check, return evidence not 'done', state assumptions.
+    Resolution: explicit CLAUDE_LOCAL_DELEGATE_AGENT override, else the
+    default persona if its file exists, else None (spawn with no --agent, so
+    deleting the persona file degrades gracefully instead of breaking)."""
+    override = os.environ.get("CLAUDE_LOCAL_DELEGATE_AGENT")
+    if override:
+        return override
+    default = os.path.expanduser("~/.claude/agents/local-worker.md")
+    return "local-worker" if os.path.isfile(default) else None
 
 
-def _run_dir(run_id):
-    return os.path.join(RUNS_DIR, run_id)
+def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
+                        disallowed_tools=None, agent=None):
+    """Spawn ONE native `claude --bg` agent on the local model.
+
+    Returns (short_id, None) on success or (None, error_message).
+    The agent's working directory is `cwd` (the --bg session runs in the
+    shell's cwd, exactly as `claude agents --json` reports it). --settings
+    carries the vLLM profile through to the backgrounded session, which is the
+    documented way to point dispatched sessions at a different gateway.
+
+    permission_mode defaults to DEFAULT_PERMISSION_MODE (bypassPermissions)
+    so the granted tools (Bash included) actually run unattended (see the note
+    above the constant).
+
+    disallowed_tools (comma-separated, e.g. "Bash") is passed as --disallowedTools
+    to strip tools from the agent. Useful against user-level hooks/gates: a
+    delegated agent that would reach for Bash can be forced to a Write-only
+    path by disallowing Bash, sidestepping any Bash PreToolUse gate it can't
+    satisfy on its own.
+
+    agent (a subagent-definition name) is passed as --agent, applying that
+    persona's system prompt/body to the delegated session. None -> no --agent.
+
+    MCP servers (web capability) come from user scope, not per-spawn flags --
+    see the note above DEFAULT_PERMISSION_MODE and the recursion guard below.
+    """
+    settings_path = _default_settings_path()
+    if not os.path.isfile(settings_path):
+        return None, (
+            f"Local settings file not found: {settings_path}. "
+            "Set CLAUDE_LOCAL_DELEGATE_SETTINGS or create the file."
+        )
+
+    tools = [t.strip() for t in (allowed_tools or DEFAULT_ALLOWED_TOOLS).split(",") if t.strip()]
+    disallowed = [t.strip() for t in (disallowed_tools or "").split(",") if t.strip()]
+    # Recursion guard (native analogue of the old ROLE=child): a delegated agent
+    # is unattended, so strip the spawner MCP itself. It is registered at
+    # USER SCOPE (so every fresh `claude --bg` loads it), which means without
+    # this guard a delegated agent could call delegate_to_local and spawn further
+    # delegations unboundedly. Disallow the whole claude-local-delegate server.
+    if "mcp__claude-local-delegate" not in disallowed:
+        disallowed.append("mcp__claude-local-delegate")
+    pmode = permission_mode or DEFAULT_PERMISSION_MODE
+    # agent=None means "use the default persona"; agent="" means "no persona".
+    pagent = _default_agent() if agent is None else agent
+
+    cmd = [
+        CLAUDE_BIN, "--bg",
+        "--name", name,
+        "--settings", settings_path,
+        "--permission-mode", pmode,
+    ]
+    if pagent:
+        cmd += ["--agent", pagent]
+    # MCP servers (ParallelSearch, context7, ...) come from USER SCOPE
+    # (~/.claude.json) -- that is the scope a fresh `claude --bg "task"` dispatch
+    # actually loads. Verified: --mcp-config/--strict-mcp-config are IGNORED on a
+    # fresh --bg (a probe with them got zero MCP tools; one without them, relying
+    # on user scope, called mcp__ParallelSearch__web_search successfully). So no
+    # --mcp-config is passed here.
+    # The task is the positional prompt. It MUST come BEFORE the variadic
+    # --allowedTools/--disallowedTools flags, which greedily consume all trailing
+    # arguments: `--allowedTools Read Write <task>` would swallow the task into
+    # the tool list and the agent would start with no prompt (observed: blocked,
+    # empty transcript). Put the task first, then the variadic flags.
+    cmd.append(task)
+    if tools:
+        cmd += ["--allowedTools", *tools]
+    if disallowed:
+        cmd += ["--disallowedTools", *disallowed]
+
+    try:
+        proc = subprocess.run(
+            cmd, cwd=cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+        )
+    except FileNotFoundError:
+        return None, f"`{CLAUDE_BIN}` not found on PATH."
+    except subprocess.TimeoutExpired:
+        return None, "Timed out spawning the background agent (claude --bg hung)."
+
+    out = proc.stdout.decode("utf-8", "replace") if proc.stdout else ""
+    if proc.returncode != 0 and "backgrounded" not in out:
+        return None, f"claude --bg exited {proc.returncode}.\n{out.strip()[-1500:]}"
+
+    short_id = _parse_bg_id(out)
+    if not short_id:
+        return None, (
+            "Spawned but could not parse the agent id from "
+            f"claude --bg output. Raw output:\n{out.strip()[-800:]}"
+        )
+    return short_id, None
 
 
-def _messages_dir(run_id):
-    return os.path.join(_run_dir(run_id), "messages")
+def _parse_bg_id(bg_output):
+    """`claude --bg` prints e.g. `backgrounded · aa46976f`. Extract the 8-hex id."""
+    for line in bg_output.splitlines():
+        low = line.lower()
+        if "backgrounded" in low or "started" in low:
+            for tok in line.replace("·", " ").split():
+                t = tok.strip()
+                if len(t) >= 6 and all(c in "0123456789abcdef" for c in t):
+                    return t
+    # Fallback: any bare 6-8 hex token.
+    m = re.search(r"\b[0-9a-f]{6,8}\b", bg_output)
+    return m.group(0) if m else None
 
 
-def _message_path(run_id, message_id):
-    return os.path.join(_messages_dir(run_id), f"{message_id}.json")
+# ---- native agent introspection (state + transcript) -------------------------
 
+def _agents_json(include_completed=True):
+    """Run `claude agents [--all] --json` and return the list of agent dicts.
+    Cheap: it does not touch the model -- it reads the supervisor's roster."""
+    cmd = [CLAUDE_BIN, "agents", "--json"] + (["--all"] if include_completed else [])
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    out = proc.stdout.decode("utf-8", "replace")
+    start = out.find("[")
+    if start < 0:
+        return None
+    try:
+        return json.loads(out[start:])
+    except json.JSONDecodeError:
+        return None
+
+
+def _resolve_agent(handle, include_completed=True):
+    """Find an agent by short id OR full session id. Returns (dict|None, err|None).
+    `handle` is whatever delegate_to_local handed back."""
+    agents = _agents_json(include_completed)
+    if agents is None:
+        return None, "Could not run `claude agents --json` (is the supervisor up?)"
+    for a in agents:
+        if a.get("id") == handle or str(a.get("sessionId", "")) == handle:
+            return a, None
+        # short-id prefix match against the full sessionId
+        if a.get("sessionId", "").startswith(handle):
+            return a, None
+    return None, None
+
+
+def _find_transcript(session_id):
+    """Locate the native JSONL transcript for a session across all project dirs.
+    Path is normally ~/.claude/projects/<sanitized-cwd>/<sessionId>.jsonl; we
+    glob because the sanitized-cwd prefix depends on the agent's working dir."""
+    pattern = os.path.join(glob.escape(CLAUDE_CONFIG_DIR), "projects", "*", f"{session_id}.jsonl")
+    hits = glob.glob(pattern)
+    if hits:
+        return sorted(hits, key=os.path.getmtime, reverse=True)[0]
+    return None
+
+
+def _iter_events(transcript_path):
+    with open(transcript_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def _last_assistant_text(transcript_path):
+    """The delegated agent's final answer = its last non-empty assistant text.
+    This is the native result; no separate result file to maintain."""
+    last = None
+    for e in _iter_events(transcript_path):
+        if e.get("type") == "assistant":
+            content = e.get("message", {}).get("content", [])
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text" and item.get("text", "").strip():
+                    last = item["text"].strip()
+    return last
+
+
+# ---- tool handlers ------------------------------------------------------------
 
 def start_delegate(args):
     task = args.get("task")
@@ -382,423 +332,116 @@ def start_delegate(args):
 
     allowed_tools = args.get("allowed_tools") or DEFAULT_ALLOWED_TOOLS
     cwd = args.get("cwd") or os.getcwd()
-    resume_id = args.get("resume_session_id")
-    bare = bool(args.get("bare", False))
+    name = args.get("name") or _slug_from_task(task)
+    permission_mode = args.get("permission_mode")
+    disallowed_tools = args.get("disallowed_tools")
+    agent = args.get("agent")  # None -> default persona; "" -> no persona; name -> that persona
 
-    run_id, err = _start_run(task, allowed_tools, cwd, bare, resume_id)
+    short_id, err = _spawn_native_agent(
+        task, allowed_tools, cwd, name, permission_mode, disallowed_tools, agent
+    )
     if err:
         return _error_result(err)
 
     return {
         "content": [{
             "type": "text",
-            "text": f"Started local delegation. run_id: {run_id}\n"
-                    f"Poll with check_delegate_status, then get_delegate_result once complete.",
+            "text": (
+                f"Spawned a native background agent on the local model. "
+                f"agent id: {short_id}\n"
+                f"It appears in `claude agents`; follow it with check_delegate_status({short_id!r}) "
+                f"and read it with get_delegate_result({short_id!r}).\n"
+                f"To send it a follow-up request, use the native SendMessage tool addressed to it "
+                f"(it shows up in ListAgents while running)."
+            ),
         }],
         "isError": False,
     }
 
 
-def _start_run(task, allowed_tools, cwd, bare, resume_id=None):
-    """Core of delegate_to_local, factored out so fan_out_to_local can spawn
-    N of these (and the aggregation pass) without going through the
-    tool-call wrapping. Returns (run_id, None) on success or (None, error_message)."""
-    if not os.path.isfile(DEFAULT_SETTINGS_PATH):
-        return None, (
-            f"Local settings file not found: {DEFAULT_SETTINGS_PATH}. "
-            "Set CLAUDE_LOCAL_DELEGATE_SETTINGS or create the file."
-        )
-
-    run_id = uuid.uuid4().hex[:12]
-    run_dir = _run_dir(run_id)
-    os.makedirs(_messages_dir(run_id), exist_ok=True)
-
-    with open(os.path.join(run_dir, "prompt.md"), "w") as f:
-        f.write(task)
-
-    mcp_config_path = os.path.join(run_dir, "mcp-config.json")
-    with open(mcp_config_path, "w") as f:
-        json.dump({
-            "mcpServers": {
-                "claude-local-delegate": {
-                    "command": sys.executable,
-                    "args": [SELF_PATH],
-                    "env": {
-                        "CLAUDE_LOCAL_DELEGATE_ROLE": "child",
-                        "CLAUDE_LOCAL_DELEGATE_RUN_ID": run_id,
-                        "CLAUDE_LOCAL_DELEGATE_RUNS_DIR": RUNS_DIR,
-                    },
-                }
-            }
-        }, f)
-
-    child_allowed_tools = f"{allowed_tools},{ASK_PARENT_TOOL_NAME},{CHECK_MESSAGE_TOOL_NAME}"
-
-    # claude -p rejects --append-system-prompt and --append-system-prompt-file
-    # together, so everything we want appended (the ask_parent note, and in
-    # bare mode CLAUDE.md) goes into one file and one flag.
-    system_prompt_addition = ASK_PARENT_SYSTEM_NOTE
-    if bare:
-        # --bare drops CLAUDE.md along with the (much larger) skills/plugins
-        # catalog that's the actual point of --bare. Re-add just CLAUDE.md so
-        # the delegated run still has project conventions -- looked up from
-        # cwd upward, same order Claude Code's own discovery uses. Full
-        # (non-bare) mode already gets CLAUDE.md the normal way.
-        claude_md_path = _find_claude_md(cwd)
-        if claude_md_path:
-            with open(claude_md_path) as f:
-                system_prompt_addition += "\n\n" + f.read()
-
-    system_prompt_path = os.path.join(run_dir, "system-prompt-addition.md")
-    with open(system_prompt_path, "w") as f:
-        f.write(system_prompt_addition)
-
-    cmd = [
-        "claude", "-p", task,
-        "--settings", DEFAULT_SETTINGS_PATH,
-        "--allowedTools", child_allowed_tools,
-        "--mcp-config", mcp_config_path,
-        "--append-system-prompt-file", system_prompt_path,
-        "--output-format", "stream-json",
-        "--verbose",
-    ]
-
-    if bare:
-        cmd.insert(1, "--bare")
-
-    if resume_id:
-        cmd += ["--resume", resume_id]
-
-    log_path = os.path.join(run_dir, "output.log")
-    exit_code_path = os.path.join(run_dir, "exit_code")
-    meta_path = os.path.join(run_dir, "meta.json")
-
-    # Run through a shell wrapper so the exit code lands on disk even if this
-    # MCP server process restarts before the child finishes -- status/result
-    # lookups never depend on an in-memory subprocess.Popen handle.
-    quoted_cmd = " ".join(_shell_quote(c) for c in cmd)
-    wrapper = f"{quoted_cmd} > {_shell_quote(log_path)} 2>&1; echo $? > {_shell_quote(exit_code_path)}"
-
-    try:
-        proc = subprocess.Popen(["bash", "-c", wrapper], cwd=cwd, start_new_session=True)
-    except FileNotFoundError:
-        return None, "`bash` or `claude` not found on PATH."
-
-    with open(meta_path, "w") as f:
-        json.dump({
-            "run_id": run_id,
-            "task": task,
-            "allowed_tools": allowed_tools,
-            "cwd": cwd,
-            "wrapper_pid": proc.pid,
-            "started_at": time.time(),
-        }, f)
-
-    return run_id, None
-
-
-def _shell_quote(s):
-    return "'" + s.replace("'", "'\\''") + "'"
-
-
-def _load_meta(run_id):
-    meta_path = os.path.join(_run_dir(run_id), "meta.json")
-    if not os.path.isfile(meta_path):
-        return None
-    with open(meta_path) as f:
-        return json.load(f)
-
-
-def _pending_messages(run_id):
-    mdir = _messages_dir(run_id)
-    if not os.path.isdir(mdir):
-        return []
-    pending = []
-    for fname in os.listdir(mdir):
-        if not fname.endswith(".json"):
-            continue
-        with open(os.path.join(mdir, fname)) as f:
-            try:
-                msg = json.load(f)
-            except json.JSONDecodeError:
-                continue
-        if msg.get("status") == "pending":
-            pending.append(msg)
-    return pending
-
-
-_BLOCKED_PATTERNS = (
-    "haven't granted", "requires approval", "was blocked", "permission denied",
-    "requires permission", "not been granted", "denied by the",
-)
-
-
-def _summarize_log(log_path, max_events=8):
-    """Compact, human-readable progress summary from the run's stream-json
-    log -- deliberately NOT a raw tail. A raw tail of this log is mostly
-    system/init noise (the full skill/tool catalog dump, hundreds of tokens
-    on its own) that costs the PARENT session real paid tokens for zero
-    signal every time it polls. This extracts only what actually happened:
-    assistant text, tool calls, tool results, each truncated.
-
-    Also counts tool_results that look like permission/hook denials across
-    the WHOLE log (not just the tail) -- a run repeatedly hitting the same
-    wall is a distinct, actionable signal (probably needs wider
-    allowed_tools) that's easy to miss buried in a long event list."""
-    if not os.path.isfile(log_path):
-        return "(no output yet)", 0
-
-    events = []
-    blocked_count = 0
-    with open(log_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            etype = event.get("type")
-            if etype == "system":
-                continue  # init dump -- pure noise for a progress summary
-            if etype == "assistant":
-                for item in event.get("message", {}).get("content", []):
-                    if item.get("type") == "text" and item.get("text", "").strip():
-                        events.append(f"[assistant] {item['text'].strip()[:200]}")
-                    elif item.get("type") == "tool_use":
-                        events.append(f"[tool_use] {item.get('name')}")
-            elif etype == "user":
-                for item in event.get("message", {}).get("content", []):
-                    if item.get("type") == "tool_result":
-                        content = item.get("content")
-                        if isinstance(content, list):
-                            text = " ".join(
-                                c.get("text", "") for c in content if isinstance(c, dict)
-                            )
-                        else:
-                            text = str(content)
-                        text = text.strip()
-                        lowered = text.lower()
-                        if any(p in lowered for p in _BLOCKED_PATTERNS):
-                            blocked_count += 1
-                            events.append(f"[BLOCKED] {text[:150]}")
-                        else:
-                            events.append(f"[tool_result] {text[:150]}")
-            elif etype == "result":
-                events.append(f"[done] {event.get('result', '')[:200]}")
-
-    if not events:
-        return "(no output yet)", blocked_count
-    return "\n".join(events[-max_events:]), blocked_count
-
-
-def _estimate_running_tokens(log_path):
-    """Best-effort running token/turn count while a run is still in progress
-    -- summed from each assistant event's own usage field. Not authoritative
-    (usage isn't always populated on every intermediate event the same way
-    the final `result` event's totals are), but enough to catch a run that's
-    quietly racked up an unexpectedly large number of turns/tokens before it
-    finishes, since get_delegate_result only has numbers AFTER completion."""
-    if not os.path.isfile(log_path):
-        return 0, 0, 0
-
-    turns = 0
-    input_tokens = 0
-    output_tokens = 0
-    with open(log_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") != "assistant":
-                continue
-            turns += 1
-            usage = event.get("message", {}).get("usage", {})
-            input_tokens += usage.get("input_tokens", 0) or 0
-            output_tokens += usage.get("output_tokens", 0) or 0
-    return turns, input_tokens, output_tokens
-
-
 def check_status(args):
-    run_id = args.get("run_id")
-    meta = _load_meta(run_id) if run_id else None
-    if meta is None:
-        return _error_result(f"Unknown run_id: {run_id}")
+    handle = args.get("run_id") or args.get("agent_id")
+    if not handle:
+        return _error_result("`run_id` (the agent id) is required.")
 
-    run_dir = _run_dir(run_id)
-    exit_code_path = os.path.join(run_dir, "exit_code")
-    log_path = os.path.join(run_dir, "output.log")
-
-    # Long-poll: block here (instead of returning an instant snapshot) so a
-    # single call has a real chance to land on completion or a fresh
-    # question. There's no way for this server to push a notification to
-    # the calling session later -- it only runs while handling a request --
-    # so this is the only way a status check can be more useful than a
-    # coin-flip snapshot of a background run that takes minutes.
-    deadline = time.time() + STATUS_POLL_TOTAL_S
-    while True:
-        if os.path.isfile(exit_code_path) or _pending_messages(run_id):
-            break
-        if time.time() >= deadline:
-            break
-        time.sleep(STATUS_POLL_INTERVAL_S)
-
-    pending = _pending_messages(run_id)
-    pending_block = ""
-    if pending:
-        lines = "\n".join(f"  - message_id {m['message_id']}: {m['question']}" for m in pending)
-        pending_block = f"\n\nPENDING QUESTIONS from this run -- answer with reply_to_delegate:\n{lines}"
-
-    if os.path.isfile(exit_code_path):
-        with open(exit_code_path) as f:
-            code = f.read().strip()
-        status = "completed" if code == "0" else "error"
-        text = (
-            f"run_id {run_id}: {status} (exit code {code}). "
-            f"Call get_delegate_result for the answer.{pending_block}"
-        )
-        return {"content": [{"type": "text", "text": text}], "isError": False}
-
-    running = True
-    try:
-        os.kill(meta["wrapper_pid"], 0)
-    except (ProcessLookupError, PermissionError):
-        running = False
-
-    summary, blocked_count = _summarize_log(log_path)
-    turns, input_tok, output_tok = _estimate_running_tokens(log_path)
-
-    elapsed = time.time() - meta.get("started_at", time.time())
-    status = "running" if running else "unknown (process gone, no exit code written -- check log)"
-
-    blocked_warning = ""
-    if blocked_count >= 2:
-        blocked_warning = (
-            f"\n\n⚠ {blocked_count} tool calls in this run look like permission/hook "
-            "denials -- it may be stuck retrying around something it doesn't have "
-            "access to. Consider whether allowed_tools needs to be wider, or check "
-            "the log tail below for what it's blocked on."
+    agent, err = _resolve_agent(handle)
+    if err:
+        return _error_result(err)
+    if agent is None:
+        return _error_result(
+            f"No background agent with id {handle} in `claude agents --json`. "
+            "It may have been removed, or the supervisor restarted. Run "
+            "`claude agents --all --json` yourself to check."
         )
 
-    token_line = ""
-    if turns:
-        token_line = f" ~{turns} turns so far (best-effort estimate: {input_tok} input / {output_tok} output tokens)."
+    state = agent.get("state") or agent.get("status") or "unknown"
+    session_id = agent.get("sessionId") or ""
 
     text = (
-        f"run_id {run_id}: {status}, {elapsed:.0f}s elapsed.{token_line}"
-        f"{blocked_warning}{pending_block}\n\n--- progress ---\n{summary}"
+        f"agent {agent.get('id')}: native state = {state}\n"
+        f"  cwd: {agent.get('cwd')}\n"
+        f"  session: {session_id}"
     )
+
+    # If the agent is `blocked` (the native "needs input" state), surface the
+    # question it is waiting on so the parent knows what to SendMessage back.
+    if state == "blocked":
+        tr = _find_transcript(session_id) if session_id else None
+        if tr:
+            q = _last_assistant_text(tr)
+            if q:
+                text += (
+                    f"\n\nBLOCKED -- it is waiting on (its last words):\n{q[:600]}\n"
+                    "Reply with the native SendMessage tool addressed to this agent to unblock it."
+                )
+
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
 
-def _read_run_result(run_id):
-    """Core of get_delegate_result, factored out so fan_out_to_local's
-    aggregation step can pull each sub-run's answer directly. Returns a dict
-    with result_text/session_id/cost/usage/duration_api_ms/error -- 'error'
-    is set (and everything else None) if the run isn't done, failed, or its
-    output couldn't be parsed."""
-    meta = _load_meta(run_id) if run_id else None
-    if meta is None:
-        return {"error": f"Unknown run_id: {run_id}"}
-
-    run_dir = _run_dir(run_id)
-    exit_code_path = os.path.join(run_dir, "exit_code")
-    log_path = os.path.join(run_dir, "output.log")
-
-    if not os.path.isfile(exit_code_path):
-        return {"error": f"run_id {run_id} is still running. Call check_delegate_status first."}
-
-    with open(exit_code_path) as f:
-        code = f.read().strip()
-
-    with open(log_path) as f:
-        raw = f.read()
-
-    if code != "0":
-        return {"error": f"claude -p exited {code}. Log tail:\n{raw[-2000:]}"}
-
-    result_event = None
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") == "result":
-            result_event = event
-
-    if result_event is None:
-        return {"error": f"Could not find a result event in the output. Log tail:\n{raw[-2000:]}"}
-
-    return {
-        "error": None,
-        "result_text": _strip_think_blocks(result_event.get("result", "")),
-        "session_id": result_event.get("session_id", ""),
-        "cost": result_event.get("total_cost_usd"),
-        "usage": result_event.get("usage", {}),
-        "duration_api_ms": result_event.get("duration_api_ms"),
-    }
-
-
 def get_result(args):
-    run_id = args.get("run_id")
-    r = _read_run_result(run_id)
-    if r["error"]:
-        return _error_result(r["error"])
+    handle = args.get("run_id") or args.get("agent_id")
+    if not handle:
+        return _error_result("`run_id` (the agent id) is required.")
 
-    footer = f"\n\n-- local session_id: {r['session_id']}"
-    out_tok = r["usage"].get("output_tokens")
-    if out_tok and r["duration_api_ms"]:
-        tok_s = out_tok / (r["duration_api_ms"] / 1000)
-        footer += f", {out_tok} output tokens in {r['duration_api_ms'] / 1000:.1f}s ({tok_s:.1f} tok/s)"
-    if r["cost"] is not None:
-        footer += (
-            f", est. cost: ${r['cost']} "
-            "(Claude Code's own client-side estimate at Anthropic API rates -- "
-            "not a real charge against a free local model)"
+    agent, err = _resolve_agent(handle)
+    if err:
+        return _error_result(err)
+    if agent is None:
+        return _error_result(f"No background agent with id {handle} found in the roster.")
+
+    state = agent.get("state") or agent.get("status") or "unknown"
+    session_id = agent.get("sessionId") or ""
+
+    # Still working? Don't hand back a partial answer.
+    if state in ("working", "busy", "unknown"):
+        return _error_result(
+            f"agent {handle} is still {state} -- call check_delegate_status first. "
+            f"get_delegate_result returns its final answer only once it has settled "
+            f"(completed/idle/stopped)."
         )
-    return {"content": [{"type": "text", "text": r["result_text"] + footer}], "isError": False}
 
+    tr = _find_transcript(session_id) if session_id else None
+    if not tr:
+        return _error_result(
+            f"Could not find a native transcript for session {session_id}. "
+            f"Its state is {state}. The agent may have been cleaned up."
+        )
 
-def _strip_think_blocks(text):
-    """Defensive cleanup: some reasoning models leak <think>...</think> into
-    their visible output if thinking isn't fully suppressed upstream (e.g. a
-    --settings file pointed at a different local model than the one this was
-    tuned against). Our own vllm.settings.json stack disables thinking at
-    the chat-template level already, so this should normally be a no-op."""
-    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
-    text = re.sub(r"^<think>.*", "", text, flags=re.DOTALL)  # orphaned opening tag
-    return text
+    result_text = _last_assistant_text(tr)
+    if result_text is None:
+        return _error_result(
+            f"agent {handle} has no assistant text in its transcript (state {state}). "
+            "It may have errored before producing output -- check `claude logs "
+            f"{agent.get('id')}`."
+        )
 
-
-def reply_to_delegate(args):
-    run_id = args.get("run_id")
-    message_id = args.get("message_id")
-    answer = args.get("answer")
-    if not run_id or not message_id or answer is None:
-        return _error_result("`run_id`, `message_id`, and `answer` are all required.")
-
-    path = _message_path(run_id, message_id)
-    if not os.path.isfile(path):
-        return _error_result(f"No such message_id {message_id} for run_id {run_id}.")
-
-    with open(path) as f:
-        msg = json.load(f)
-    msg["answer"] = answer
-    msg["status"] = "answered"
-    msg["answered_at"] = time.time()
-    with open(path, "w") as f:
-        json.dump(msg, f)
-
-    return {"content": [{"type": "text", "text": f"Answer recorded for message_id {message_id}."}], "isError": False}
+    footer = (
+        f"\n\n-- native agent id {agent.get('id')}, session {session_id}, "
+        f"state {state}. This is the agent's own final answer from its transcript; "
+        "review it before treating it as final (a local-model agent can look "
+        "plausible while being subtly wrong)."
+    )
+    return {"content": [{"type": "text", "text": result_text + footer}], "isError": False}
 
 
 def _batch_path(batch_id):
@@ -815,46 +458,45 @@ def fan_out_to_local(args):
 
     allowed_tools = args.get("allowed_tools") or DEFAULT_ALLOWED_TOOLS
     cwd = args.get("cwd") or os.getcwd()
-    bare = bool(args.get("bare", False))
+    permission_mode = args.get("permission_mode")
+    disallowed_tools = args.get("disallowed_tools")
+    agent = args.get("agent")  # None -> default persona; "" -> no persona; name -> that persona
+    batch_tag = uuid.uuid4().hex[:4]
 
-    run_ids = []
+    agent_ids = []
     for i, item in enumerate(items):
         task = f"{shared_instruction}\n\n--- item {i + 1}/{len(items)} ---\n\n{item}"
-        run_id, err = _start_run(task, allowed_tools, cwd, bare)
+        name = _slug_from_task(f"fanout {batch_tag} item {i + 1} " + item.splitlines()[0])
+        short_id, err = _spawn_native_agent(
+            task, allowed_tools, cwd, name, permission_mode, disallowed_tools, agent
+        )
         if err:
-            # Best-effort: report what got started before the failure, plus the error.
             return _error_result(
-                f"Failed to start item {i + 1}/{len(items)}: {err}\n"
-                f"{len(run_ids)} item(s) already started: {run_ids}"
+                f"Failed to spawn item {i + 1}/{len(items)}: {err}\n"
+                f"{len(agent_ids)} item(s) already spawned: {agent_ids}"
             )
-        run_ids.append(run_id)
+        agent_ids.append(short_id)
 
     batch_id = uuid.uuid4().hex[:12]
     os.makedirs(BATCHES_DIR, exist_ok=True)
     with open(_batch_path(batch_id), "w") as f:
-        json.dump({
-            "batch_id": batch_id,
-            "run_ids": run_ids,
-            "shared_instruction": shared_instruction,
-            "allowed_tools": allowed_tools,
-            "created_at": time.time(),
-        }, f)
+        json.dump({"batch_id": batch_id, "agent_ids": agent_ids,
+                   "shared_instruction": shared_instruction, "created_at": time.time()}, f)
 
     warning = ""
     if len(items) > LOCAL_SERVER_MAX_CONCURRENCY:
         warning = (
-            f"\n\nNote: {len(items)} items started, but the local server's configured "
-            f"concurrency ceiling is {LOCAL_SERVER_MAX_CONCURRENCY} (vLLM --max-num-seqs). "
-            "The extras will queue behind the first batch rather than run truly in "
-            "parallel -- still correct, just not the full-parallel speedup you might expect."
+            f"\n\nNote: {len(items)} agents spawned, but the local server's concurrency "
+            f"ceiling is {LOCAL_SERVER_MAX_CONCURRENCY} (vLLM --max-num-seqs) and, more "
+            "importantly, its shared KV-cache pool. The extras queue rather than running "
+            "truly in parallel -- correctness is fine, just not full-parallel speed."
         )
-
     return {
         "content": [{
             "type": "text",
-            "text": f"Started {len(run_ids)} parallel local runs. batch_id: {batch_id}\n"
-                    f"run_ids: {run_ids}\n"
-                    f"Poll with check_fanout_status, then get_fanout_result once all are done.{warning}",
+            "text": (f"Spawned {len(agent_ids)} parallel native agents. batch_id: {batch_id}\n"
+                     f"agent ids: {agent_ids}\n"
+                     f"Poll check_fanout_status({batch_id!r}), then get_fanout_result({batch_id!r}).{warning}"),
         }],
         "isError": False,
     }
@@ -868,164 +510,179 @@ def check_fanout_status(args):
     with open(path) as f:
         batch = json.load(f)
 
-    def _still_running(run_id):
-        return not os.path.isfile(os.path.join(_run_dir(run_id), "exit_code"))
-
-    # Long-poll like check_delegate_status: block until every item is done
-    # or the deadline passes, rather than returning an instant "still
-    # running" snapshot the caller has no reliable way to know to recheck.
-    deadline = time.time() + STATUS_POLL_TOTAL_S
-    while any(_still_running(run_id) for run_id in batch["run_ids"]) and time.time() < deadline:
-        time.sleep(STATUS_POLL_INTERVAL_S)
-
-    completed, errored, running, total_blocked = 0, 0, 0, 0
-    for run_id in batch["run_ids"]:
-        run_dir = _run_dir(run_id)
-        exit_code_path = os.path.join(run_dir, "exit_code")
-        if os.path.isfile(exit_code_path):
-            with open(exit_code_path) as f:
-                code = f.read().strip()
-            if code == "0":
-                completed += 1
-            else:
-                errored += 1
-        else:
-            running += 1
-            _, blocked = _summarize_log(os.path.join(run_dir, "output.log"))
-            total_blocked += blocked
-
-    blocked_warning = ""
-    if total_blocked >= 2:
-        blocked_warning = (
-            f"\n\n⚠ {total_blocked} denial-shaped tool call(s) across still-running items in this "
-            "batch -- some may be stuck on missing allowed_tools access, same as a single run."
-        )
+    agents = _agents_json(include_completed=True) or []
+    by_id = {a.get("id"): a for a in agents}
+    counts = {"working": 0, "blocked": 0, "completed": 0, "failed": 0, "stopped": 0, "unknown": 0}
+    lines = []
+    for aid in batch["agent_ids"]:
+        a = by_id.get(aid)
+        st = (a or {}).get("state") or (a or {}).get("status") or "unknown"
+        counts[st] = counts.get(st, 0) + 1
+        lines.append(f"  - {aid}: {st}")
 
     text = (
-        f"batch_id {batch_id}: {completed} completed, {errored} errored, {running} still running "
-        f"(of {len(batch['run_ids'])} total).{blocked_warning}\n"
-        f"run_ids: {batch['run_ids']}"
+        f"batch_id {batch_id}: "
+        f"{counts.get('working', 0)} working, {counts.get('blocked', 0)} blocked(needs input), "
+        f"{counts.get('completed', 0)} completed, {counts.get('failed', 0)} failed, "
+        f"{counts.get('stopped', 0)} stopped, {counts.get('unknown', 0)} unknown "
+        f"(of {len(batch['agent_ids'])} total).\n"
+        + "\n".join(lines)
+        + "\nWhen none are working/blocked, call get_fanout_result."
     )
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
 
 def get_fanout_result(args):
     batch_id = args.get("batch_id")
-    aggregate_instruction = args.get("aggregate_instruction")
     path = _batch_path(batch_id) if batch_id else None
     if not path or not os.path.isfile(path):
         return _error_result(f"Unknown batch_id: {batch_id}")
     with open(path) as f:
         batch = json.load(f)
 
-    results = []
-    for run_id in batch["run_ids"]:
-        r = _read_run_result(run_id)
-        if r["error"]:
-            return _error_result(
-                f"run_id {run_id} isn't ready or failed: {r['error']}\n"
-                "Call check_fanout_status first -- all items must finish before fetching the batch result."
-            )
-        results.append(r["result_text"])
+    agents = _agents_json(include_completed=True) or []
+    by_id = {a.get("id"): a for a in agents}
 
-    if not aggregate_instruction:
-        parts = [f"--- item {i + 1}/{len(results)} ---\n{text}" for i, text in enumerate(results)]
-        return {"content": [{"type": "text", "text": "\n\n".join(parts)}], "isError": False}
+    parts = []
+    incomplete = []
+    for i, aid in enumerate(batch["agent_ids"]):
+        a = by_id.get(aid)
+        st = (a or {}).get("state") or (a or {}).get("status") or "unknown"
+        sid = (a or {}).get("sessionId") or ""
+        if st in ("working", "busy", "blocked", "unknown") or not sid:
+            incomplete.append(f"{aid} ({st})")
+            continue
+        tr = _find_transcript(sid)
+        txt = _last_assistant_text(tr) if tr else "(no transcript found)"
+        parts.append(f"--- item {i + 1}/{len(batch['agent_ids'])} [{aid}] ---\n{txt}")
 
-    # Aggregation is just one more ordinary delegated run over the collected
-    # results -- reuses every existing mechanism (async, ask_parent, review
-    # reminder) instead of inventing a separate synthesis code path.
-    combined = "\n\n".join(f"--- item {i + 1}/{len(results)} ---\n{text}" for i, text in enumerate(results))
-    agg_task = f"{aggregate_instruction}\n\n{combined}"
-    agg_run_id, err = _start_run(agg_task, DEFAULT_ALLOWED_TOOLS, os.getcwd(), False)
-    if err:
-        return _error_result(f"Failed to start aggregation run: {err}")
-
-    return {
-        "content": [{
-            "type": "text",
-            "text": f"All {len(results)} items done; started aggregation run. run_id: {agg_run_id}\n"
-                    f"Poll with check_delegate_status, then get_delegate_result for the synthesized answer.",
-        }],
-        "isError": False,
-    }
+    if incomplete:
+        return _error_result(
+            f"These agents in batch {batch_id} are not settled yet: {incomplete}. "
+            "Call check_fanout_status first; fetch results only once all are done."
+        )
+    return {"content": [{"type": "text", "text": "\n\n".join(parts)}], "isError": False}
 
 
-# ---- child-mode tools (only exposed when CLAUDE_LOCAL_DELEGATE_ROLE=child) ----
+# ---- tool schema (parent side only) ------------------------------------------
 
-def ask_parent(args):
-    if not CHILD_RUN_ID:
-        return _error_result("ask_parent is only available inside a delegate_to_local run.")
-    question = args.get("question")
-    if not question or not isinstance(question, str):
-        return _error_result("`question` is required and must be a non-empty string.")
-
-    message_id = uuid.uuid4().hex[:12]
-    os.makedirs(_messages_dir(CHILD_RUN_ID), exist_ok=True)
-    with open(_message_path(CHILD_RUN_ID, message_id), "w") as f:
-        json.dump({
-            "message_id": message_id,
-            "question": question,
-            "answer": None,
-            "status": "pending",
-            "asked_at": time.time(),
-        }, f)
-
-    return {
-        "content": [{
-            "type": "text",
-            "text": f"Question sent to parent session. message_id: {message_id}\n"
-                    f"Poll check_message_status with this message_id for the answer.",
-        }],
-        "isError": False,
-    }
-
-
-def check_message_status(args):
-    if not CHILD_RUN_ID:
-        return _error_result("check_message_status is only available inside a delegate_to_local run.")
-    message_id = args.get("message_id")
-    if not message_id:
-        return _error_result("`message_id` is required.")
-
-    path = _message_path(CHILD_RUN_ID, message_id)
-    if not os.path.isfile(path):
-        return _error_result(f"No such message_id: {message_id}")
-
-    deadline = time.time() + MESSAGE_POLL_TOTAL_S
-    while time.time() < deadline:
-        with open(path) as f:
-            msg = json.load(f)
-        if msg.get("status") == "answered":
-            return {"content": [{"type": "text", "text": msg["answer"]}], "isError": False}
-        time.sleep(MESSAGE_POLL_INTERVAL_S)
-
-    return {
-        "content": [{"type": "text", "text": "Still pending -- no answer yet. Call check_message_status again if this still matters."}],
-        "isError": False,
-    }
+PARENT_TOOLS = [
+    {
+        "name": "delegate_to_local",
+        "description": (
+            "Delegate a self-contained task to a NATIVE Claude Code background agent "
+            "(`claude --bg`) running on the local model (vLLM/LiteLLM via --settings). "
+            "Unlike an in-session subagent, this agent is a real top-level Claude Code "
+            "session: it shows up in `claude agents`, can be inspected with "
+            "`claude logs <id>` / `claude attach <id>`, and the parent can send it "
+            "follow-up requests through the native SendMessage tool (it appears in "
+            "ListAgents while running). Returns immediately with the agent's native id "
+            "-- this does NOT block, so call it several times back-to-back to run "
+            "delegations in parallel (bounded by the local server's concurrency). "
+            "Poll with check_delegate_status, then read the answer with "
+            "get_delegate_result. Use for mechanical/high-volume work where local-model "
+            "latency is worth saving paid tokens; keep architecture decisions and "
+            "security-sensitive work in the main session."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "The self-contained task. The agent starts with no memory of this conversation."},
+                "allowed_tools": {"type": "string", "description": f"Comma-separated tools the agent may use without prompting. Defaults to read-only ('{DEFAULT_ALLOWED_TOOLS}'). Widen only when it must write files or run commands -- it runs unsupervised."},
+                "cwd": {"type": "string", "description": "Working directory for the agent. Defaults to this server's cwd."},
+                "name": {"type": "string", "description": "Optional display name for the agent (shown in `claude agents`). Defaults to a short slug of the task."},
+                "permission_mode": {"type": "string", "description": f"Native --permission-mode for the background agent. Defaults to '{DEFAULT_PERMISSION_MODE}' so the unattended agent runs its full granted toolset (Bash included) without approval gates -- a delegated agent that prompts on Bash would park forever with no one to approve. Set to 'acceptEdits' (Bash gated) or 'default' (everything prompts) to narrow a specific delegation, or 'auto' for the classifier-gated middle ground."},
+                "disallowed_tools": {"type": "string", "description": "Comma-separated tools to strip from the agent (e.g. 'Bash'). Useful when a user-level hook/gate blocks a tool the agent would reach for on its own -- disallowing that tool forces the agent onto a path it can complete. Default: none."},
+                "agent": {"type": "string", "description": f"Subagent-definition persona to run the delegation as (its system prompt). Defaults to 'local-worker' (~/.claude/agents/local-worker.md: verifies by running a check, returns evidence, states assumptions). Pass another installed agent name to override, or empty string to run with no persona."},
+            },
+            "required": ["task"],
+        },
+    },
+    {
+        "name": "check_delegate_status",
+        "description": (
+            "Read the NATIVE state of a delegated background agent by its id (from "
+            "delegate_to_local): working / blocked / completed / failed / stopped. "
+            "'blocked' is the agent's native 'I need input' signal -- when that is "
+            "returned, the agent's last words (its question) are surfaced so you can "
+            "answer them with the native SendMessage tool. Cheap: does not touch the model."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "The agent id returned by delegate_to_local (a.k.a. the `claude agents` short id)."},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "get_delegate_result",
+        "description": (
+            "Read the delegated agent's final answer from its NATIVE transcript. "
+            "Errors if the agent is still working/blocked -- call check_delegate_status "
+            "first. IMPORTANT: review this before treating it as final; a local-model "
+            "agent can produce plausible-looking but subtly wrong output that only a "
+            "read-through catches."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "The agent id returned by delegate_to_local."},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "fan_out_to_local",
+        "description": (
+            "Map-reduce over the local model using NATIVE background agents: spawn one "
+            "`claude --bg` agent per item, all sharing `shared_instruction`. Use this "
+            "instead of stuffing everything into one giant local context (each item fits "
+            "its own window; chunking also tends to beat one huge context on accuracy). "
+            "Returns immediately with a batch_id; poll check_fanout_status, then "
+            "get_fanout_result once all settle. The real ceiling is the local server's "
+            "concurrency/KV-cache pool, not the number of items."
+        ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "items": {"type": "array", "items": {"type": "string"}, "description": "Independent pieces of material, one per parallel agent."},
+                    "shared_instruction": {"type": "string", "description": "The instruction applied to every item."},
+                    "allowed_tools": {"type": "string", "description": f"Same as delegate_to_local, applied to every item. Defaults to read-only ('{DEFAULT_ALLOWED_TOOLS}')."},
+                    "cwd": {"type": "string", "description": "Working directory for every agent."},
+                    "permission_mode": {"type": "string", "description": f"Same as delegate_to_local's permission_mode, applied to every agent. Defaults to '{DEFAULT_PERMISSION_MODE}'."},
+                    "disallowed_tools": {"type": "string", "description": "Same as delegate_to_local's disallowed_tools, applied to every agent."},
+                    "agent": {"type": "string", "description": "Same as delegate_to_local's agent persona, applied to every agent. Defaults to 'local-worker'."},
+                },
+                "required": ["items", "shared_instruction"],
+            },
+    },
+    {
+        "name": "check_fanout_status",
+        "description": "Aggregate the native states (working/blocked/completed/failed/stopped) of a fan_out_to_local batch.",
+        "inputSchema": {"type": "object", "properties": {"batch_id": {"type": "string"}}, "required": ["batch_id"]},
+    },
+    {
+        "name": "get_fanout_result",
+        "description": "Read every agent's final answer from its native transcript for a fan_out_to_local batch. Errors until all agents are settled.",
+        "inputSchema": {"type": "object", "properties": {"batch_id": {"type": "string"}}, "required": ["batch_id"]},
+    },
+]
 
 
 def _error_result(message):
     return {"content": [{"type": "text", "text": message}], "isError": True}
 
 
-PARENT_HANDLERS = {
+TOOL_HANDLERS = {
     "delegate_to_local": start_delegate,
     "check_delegate_status": check_status,
     "get_delegate_result": get_result,
-    "reply_to_delegate": reply_to_delegate,
     "fan_out_to_local": fan_out_to_local,
     "check_fanout_status": check_fanout_status,
     "get_fanout_result": get_fanout_result,
 }
-CHILD_HANDLERS = {
-    "ask_parent": ask_parent,
-    "check_message_status": check_message_status,
-}
-
-TOOLS = CHILD_TOOLS if ROLE == "child" else PARENT_TOOLS
-TOOL_HANDLERS = CHILD_HANDLERS if ROLE == "child" else PARENT_HANDLERS
+TOOLS = PARENT_TOOLS
 
 
 def handle_request(msg):
@@ -1052,7 +709,7 @@ def handle_request(msg):
         return _response(msg_id, handler(args))
 
     if method in ("notifications/initialized", "notifications/cancelled"):
-        return None  # notifications get no response
+        return None
 
     if msg_id is not None:
         return _response(msg_id, None, error={"code": -32601, "message": f"Unknown method: {method}"})
@@ -1069,7 +726,6 @@ def _response(msg_id, result, error=None):
 
 
 def main():
-    os.makedirs(RUNS_DIR, exist_ok=True)
     for line in sys.stdin:
         line = line.strip()
         if not line:

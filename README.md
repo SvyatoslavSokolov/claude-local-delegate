@@ -2,19 +2,66 @@
 
 An MCP server for Claude Code with tools to hand a task to a locally-hosted
 model (e.g. served by vLLM) while keeping your main session on your regular
-subscription/model. Parent-side: `delegate_to_local`, `check_delegate_status`,
-`get_delegate_result`, `reply_to_delegate`, `fan_out_to_local`,
-`check_fanout_status`, `get_fanout_result`. Given to the delegated run
-itself: `ask_parent`, `check_message_status`.
+subscription/model. Every delegation is a **native Claude Code background
+agent** (`claude --bg` in the agent-view system) pointed at your local
+backend via `--settings` — so the delegated work is a real, first-class,
+inspectable Claude Code session, not a bespoke "delegation entity" this
+server invented on its own.
+
+Parent-side tools: `delegate_to_local`, `check_delegate_status`,
+`get_delegate_result`, `fan_out_to_local`, `check_fanout_status`,
+`get_fanout_result`.
+
+## Why a native `claude --bg` agent instead of a `claude -p` black box
+
+The v0.3 design spawned a headless `claude -p` subprocess with its own
+`run_id`, its own file-based `ask_parent`/`check_message_status` protocol, and
+a second `server.py` process in "child" mode. That worked, but the delegated
+unit was opaque: invisible in `claude agents`, un-attachable, and coordinated
+through this server's own machinery.
+
+v0.4 keeps the same public tool surface but makes each delegation a **native
+background agent**. Concretely, `delegate_to_local` runs
+`claude --bg --name <slug> --settings <vllm profile> --permission-mode
+<mode> --allowedTools <tools> <task>` and hands back the agent's **native id**.
+That id is the id you see in `claude agents`:
+
+- **Visible & inspectable**: `claude logs <id>`, `claude attach <id>` work on
+  it directly, no MCP in the loop.
+- **Status** (`check_delegate_status`) reads the agent's **native** state
+  (`working` / `blocked` / `completed` / `failed` / `stopped`) from
+  `claude agents --json` — no home-grown `exit_code` bookkeeping.
+- **Result** (`get_delegate_result`) reads the agent's **native transcript**
+  (`~/.claude/projects/<dir>/<sessionId>.jsonl`) and returns its final answer.
+- **Talking to it** is the **native** cross-session machinery: the parent
+  session reaches the agent with `SendMessage` (it shows up in `ListAgents`),
+  and the agent's own `blocked` state is the native "I need input" signal.
+  There is no more `ask_parent`/`check_message_status`/child-process protocol.
+
+This is the point of the rework: the local model rides on the SAME native
+agent machinery your main session already uses. One mechanism, one set of
+ids, one place to look. The MCP is just the spawner and the reader.
+
+### `--permission-mode` (required for unattended delegation)
+
+A native `claude --bg` session starts in **manual mode**, where `--allowedTools`
+does *not* auto-approve (unlike headless `claude -p`): the agent would block
+on its first gated tool with no human present. So the spawner always passes a
+`--permission-mode`. The default is `acceptEdits` — read/edit/write run
+unattended, Bash stays gated — which is the safe analogue of the old
+read-only/write-only delegations. Pass `permission_mode: "bypassPermissions"`
+to a delegation only when it genuinely needs unattended shell access and you
+accept an autonomous loop with no approval gates (the auto-mode safety
+classifier may itself object to that flag, which is the correct behavior).
 
 ## Why this instead of a prompt-wrapper MCP tool
 
 `delegate_to_local` doesn't summarize context into a single completion
-request. It spawns a real headless `claude -p` subprocess with `--settings`
-pointed at your local backend. The delegated task runs through the actual
-Claude Code agent loop — its own tool calls (Read/Edit/Bash/...), its own
-context management, its own `CLAUDE.md` — just backed by a different model.
-From the repo's point of view it *is* Claude Code, not an approximation of it.
+request. It launches a real Claude Code agent with `--settings` pointed at your
+local backend. The delegated task runs through the actual Claude Code agent
+loop — its own tool calls (Read/Edit/Bash/...), its own context management, its
+own `CLAUDE.md` — just backed by a different model. From the repo's point of
+view it *is* Claude Code, not an approximation of it.
 
 This also keeps your subscription untouched: the local delegation is a
 separate process using its own `--settings` file (pointed at a local
@@ -37,27 +84,21 @@ anything in this tool. Each run gets its own working directory copy of
 nothing shared except the filesystem, so parallel runs touching the same
 files can still race each other — scope `allowed_tools`/`cwd` accordingly.
 
-## Bi-directional: the delegated run can ask back
+## The delegated agent can ask back (natively)
 
-Each `delegate_to_local` run is launched with its own `--mcp-config` that
-points back at this same `server.py`, spawned a second time as a **separate
-process** with `CLAUDE_LOCAL_DELEGATE_ROLE=child` in its environment. In that
-mode the script exposes only `ask_parent`/`check_message_status` — not
-`delegate_to_local` itself, so a delegated run can't spawn further
-delegations unboundedly.
+Because each delegation is a real native background agent, it does not need a
+custom ask-back protocol. When a delegated agent gets stuck on something only
+the parent session can decide, it surfaces Claude Code's own **`blocked`**
+state in `claude agents`. The parent reads that state through
+`check_delegate_status` (which also prints the agent's last words, its
+question) and answers with the **native `SendMessage` tool** addressed to the
+agent — the same cross-session messaging your own sessions use. No
+`ask_parent`/`check_message_status` tools, no second child-mode `server.py`
+process, no message files.
 
-When the local model calls `ask_parent`, it writes a question to a JSON file
-under the run's `messages/` directory and blocks (server-side, inside
-`check_message_status`, up to ~50s per call) waiting for an answer. The
-parent session sees pending questions surfaced in `check_delegate_status`'s
-output and answers with `reply_to_delegate`; the waiting child picks up the
-answer on its next poll and continues. Parent and child are always different
-OS processes — coordination is entirely through files in the run directory,
-not shared memory.
-
-This is genuinely load-bearing, not decorative: without it, a delegated run
-that hits something it can't decide either guesses (silently, possibly
-wrong) or fails outright. With it, it can stop and ask instead.
+This is load-bearing for the same reason as before: without it a delegated
+agent that hits something it can't decide either guesses (silently, possibly
+wrong) or fails outright. With it, it stops and the parent can unblock it.
 
 ## Two different token budgets, two different defaults
 
@@ -65,20 +106,16 @@ The local model's tokens are free (self-hosted); the parent session's tokens
 are the paid ones. The defaults reflect that asymmetry rather than treating
 "fewer tokens" as universally good:
 
-- **Local side, `bare` (default `false`):** loading full context (skills,
-  plugins, hooks, CLAUDE.md) costs the local model tens of thousands of extra
-  input tokens per call in testing — irrelevant, since those tokens are
-  free, and full context can only help accuracy on tasks that touch anything
-  project-specific. Set `bare: true` only when you're confident a task is
-  generic enough not to need any of that (e.g. "summarize this text") and
-  you want the latency win; CLAUDE.md is still re-added even in bare mode,
-  since project conventions are worth keeping regardless.
-- **Parent side, `check_delegate_status`:** this *is* paid-token territory,
-  so it returns a compact progress summary (parsed from the run's
-  stream-json log: assistant text, tool calls, tool results) instead of a
-  raw log tail. A raw tail is mostly `system/init` noise — the full
-  skill/tool catalog dump, easily thousands of tokens — for zero signal
-  about what the delegated run is actually doing.
+- **Local side:** the delegated agent loads the full project context (CLAUDE.md,
+  skills, MCP servers) the way any real session does — it costs the local model
+  input tokens, which are free, and can only help accuracy on anything
+  project-specific.
+- **Parent side, `check_delegate_status`:** this *is* paid-token territory, so
+  it reads the agent's **native state** (a single `claude agents --json` field)
+  and, when `blocked`, the agent's last assistant line from its transcript — a
+  compact, structured read — instead of dumping a raw log tail, which is mostly
+  `system/init` noise (the full skill/tool catalog, thousands of tokens) for
+  zero signal.
 
 ## Requirements
 
@@ -157,115 +194,105 @@ correct both times. The gap was elsewhere:
 
 ### Tools
 
-**`delegate_to_local`** — starts a run, returns immediately.
+**`delegate_to_local`** — spawns one native background agent, returns immediately.
 
 | Parameter | Required | Default | Description |
 |---|---|---|---|
-| `task` | yes | — | Self-contained task description. The local sub-session starts with no memory of the parent conversation. |
-| `allowed_tools` | no | `Read,Grep,Glob` (read-only) | Comma-separated tools the local sub-session may use without prompting. Widen to `Read,Edit,Write,Bash,Grep,Glob` for tasks that need to write files or run commands. |
-| `cwd` | no | server's cwd | Working directory for the local sub-session. |
-| `resume_session_id` | no | — | Continue a prior run's local sub-session (its `session_id`, from `get_delegate_result`) instead of starting fresh. |
-| `bare` | no | `false` | Run with `claude --bare` to cut a large fixed per-call token overhead, at the cost of dropping project skills/plugins/hooks. See "Two different token budgets" above. CLAUDE.md is always re-added even when `true`. |
+| `task` | yes | — | Self-contained task description. The agent starts with no memory of the parent conversation. |
+| `allowed_tools` | no | `Read,Grep,Glob` (read-only) | Comma-separated tools granted to the agent. Widen to `Read,Edit,Write` for tasks that write files. |
+| `cwd` | no | server's cwd | Working directory for the agent. |
+| `name` | no | slug of the task | Display name shown in `claude agents`. |
+| `permission_mode` | no | `acceptEdits` | Native `--permission-mode`. `acceptEdits` = read/edit/write run unattended, Bash stays gated. Use `bypassPermissions` only for genuinely unattended-shell work. |
 
-Returns a `run_id`.
+Returns the agent's **native id** (the id you see in `claude agents`).
 
-**`check_delegate_status`** — `{run_id}` → status (`running` / `completed` /
-`error`) plus a compact progress summary while it's still going, a
-best-effort running turn/token count (real numbers only land in
-`get_delegate_result` after completion; this is a during-the-run estimate),
-a ⚠ warning if 2+ tool calls look like permission/hook denials (the run is
-probably stuck wanting access `allowed_tools` didn't grant it), and any
-pending questions the run has asked via `ask_parent`.
+**`check_delegate_status`** — `{run_id}` → the agent's **native state**
+(`working` / `blocked` / `completed` / `failed` / `stopped`) plus its cwd and
+full session id. When the state is `blocked`, the agent's last words (its
+question) are printed so you can answer with the native `SendMessage` tool.
+Cheap: reads `claude agents --json`, does not touch the model.
 
-**`get_delegate_result`** — `{run_id}` → the final answer (with any
-`<think>...</think>` block stripped defensively, in case a local model
-leaks reasoning despite the settings that are supposed to suppress it),
-local `session_id`, output tokens + tok/s, and cost estimate. Errors if the
-run hasn't finished yet. **Review the output before trusting it** -- see the
-A/B test above for why.
+**`get_delegate_result`** — `{run_id}` → the agent's final answer, read from
+its **native transcript** (`~/.claude/projects/<dir>/<sessionId>.jsonl`).
+Errors while the agent is still `working`/`blocked` — call
+`check_delegate_status` first. **Review the output before trusting it** — see
+the A/B test above for why a local-model agent can look right while being
+subtly wrong.
 
-**`reply_to_delegate`** — `{run_id, message_id, answer}` → answers a pending
-question surfaced by `check_delegate_status`.
-
-The delegated run itself gets two more tools automatically (you never call
-these from the parent session): **`ask_parent`** (`{question}` → `message_id`)
-and **`check_message_status`** (`{message_id}` → the answer, once given).
-
-**`fan_out_to_local`** — `{items[], shared_instruction, allowed_tools?, cwd?, bare?}`
-→ map-reduce over the local model. Splits `items` (independent chunks --
-doc pages, files, search results, whatever) into one parallel
-`delegate_to_local` run each, all sharing `shared_instruction`. Returns a
-`batch_id` immediately (same async pattern as everything else here). Why
-this beats stuffing everything into one giant local context: each item
-still fits comfortably in the local model's own window, chunking tends to
-beat one huge context on accuracy anyway (long-context recall degrades the
-more you cram in -- "lost in the middle"), and the *parent* session never
-has to read the raw material, only the final synthesized answer.
+**`fan_out_to_local`** — `{items[], shared_instruction, allowed_tools?, cwd?, permission_mode?}`
+→ map-reduce over the local model: spawns one native background agent per item,
+all sharing `shared_instruction`. Returns a `batch_id` immediately (same async
+pattern as everything else here). Why this beats stuffing everything into one
+giant local context: each item fits comfortably in its own window, chunking
+tends to beat one huge context on accuracy (long-context recall degrades the
+more you cram in — "lost in the middle"), and the *parent* session never reads
+the raw material, only the per-item answers.
 
 Real ceiling to know about: parallel items share this box's fixed vLLM
-concurrency (`--max-num-seqs`, default assumed 16 here -- override via
+concurrency (`--max-num-seqs`, default assumed 16 here — override via
 `CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY`) and, more importantly, its
 VRAM/KV-cache pool. More items than that don't fail, they queue behind the
-first batch -- and if each item's context is itself large, several running
-near-simultaneously can contend for the same KV-cache, so parallelism
-doesn't scale as cleanly as "more items = more parallel" implies. The tool
-warns when a batch exceeds the configured ceiling; it does not cap batch
-size itself.
+first batch — and if each item's context is itself large, several running
+near-simultaneously contend for the same KV-cache, so parallelism doesn't scale
+as cleanly as "more items = more parallel" implies. The tool warns when a batch
+exceeds the configured ceiling; it does not cap batch size itself.
 
-**`check_fanout_status`** — `{batch_id}` → completed/errored/running counts
-across the batch, plus a denial-warning aggregated across still-running
-items (same signal as `check_delegate_status`'s, batch-wide).
+**`check_fanout_status`** — `{batch_id}` → native-state counts across the
+batch (working / blocked / completed / failed / stopped) plus each agent's
+state.
 
-**`get_fanout_result`** — `{batch_id, aggregate_instruction?}` → errors if
-any item isn't done yet (check status first). Without
-`aggregate_instruction`, returns every item's raw result concatenated, for
-you to read and synthesize yourself. With it, starts **one more ordinary
-`delegate_to_local` run** that reads all the items' results and synthesizes
-per that instruction -- aggregation isn't a separate code path, it's just
-another delegated run, so it gets `ask_parent`, the blocked-call detector,
-and the same "review before trusting" caveat as any other result. Poll it
-with the normal `check_delegate_status`/`get_delegate_result`.
+**`get_fanout_result`** — `{batch_id}` → every item's final answer, read from
+each agent's native transcript, concatenated. Errors until all agents are
+settled. Synthesize yourself (or delegate the synthesis to one more
+`delegate_to_local` run if you want it done by the model).
 
-### Run artifacts
+### Where the agents live (native, not a home-grown store)
 
-Each run gets `~/.claude-local-delegate/runs/<run_id>/` containing
-`prompt.md` (the task text), `output.log` (raw `claude -p` stream-json
-output), `meta.json`, `exit_code` once finished, `mcp-config.json` (the
-generated config that wires up `ask_parent` for this run), and a `messages/`
-subdirectory with one JSON file per `ask_parent` question — useful for
-debugging a run that didn't do what you expected. Override the location with
-`CLAUDE_LOCAL_DELEGATE_RUNS_DIR`. Nothing prunes this directory automatically
-yet; clean it out periodically if you delegate a lot.
+There is no `~/.claude-local-delegate/runs/` anymore. Each delegated task is a
+first-class background session owned by Claude Code's agent-view supervisor:
 
-### Cost estimate caveat
+- **Roster / state**: `claude agents --json` (or the `claude agents` panel) —
+  id, cwd, native `state`.
+- **Transcript (the result)**: `~/.claude/projects/<sanitized-cwd>/<sessionId>.jsonl`
+  — the same file `claude attach` / `claude logs` read.
+- **This server's only on-disk artifact** is `~/.claude-local-delegate/batches/<batch_id>.json`,
+  which maps a fan-out `batch_id` to the native agent ids it spawned so
+  `check_fanout_status` / `get_fanout_result` can aggregate them. Nothing
+  else to prune.
 
-The `est. cost` in `get_delegate_result` is Claude Code's own client-side
-estimate, computed as if the tokens were billed at Anthropic API rates. It is
-**not real money** when the local model is genuinely free to run — treat it
-only as a rough token-volume signal, not an actual bill.
+To inspect or drive an agent directly, no MCP needed: `claude attach <id>`,
+`claude logs <id>`, `claude stop <id>` — or, from within a Claude Code
+session, the native `SendMessage`/`ListAgents` tools.<think>...</think>` block stripped defensively, in case a local model
+leaks reasoning despite the settings that are supposed to suppress it),
+local `session_id`, output tokens + tok/s, and cost estimate. Errors if the
+### Cost / token notes
+
+`get_delegate_result` returns the agent's **native transcript** text, so there
+is no separate cost or tok/s figure here — those live in the agent's own
+session (visible via `claude attach <id>` or its transcript). When the local
+model is genuinely free to run, treat any client-side estimate as a rough
+token-volume signal, not a bill.
 
 ## Safety note
 
-The local sub-session runs *unsupervised* with whatever `allowed_tools` you
-grant it — there's no human approving each tool call the way there is in an
-interactive session. Keep the default read-only scope unless a task
-genuinely needs write/exec access, and don't delegate tasks that touch
-secrets, production systems, or anything you wouldn't want an unattended
-process doing on your machine. Nothing currently kills a run that hangs or
-runs long — check `check_delegate_status`/the log if one seems stuck, and
-kill the `bash -c` wrapper PID (in `meta.json`) manually if needed.
+The delegated agent runs *unsupervised* under whatever `--permission-mode`
+you give it. The default `acceptEdits` lets it read/edit/write files without
+per-call prompts but keeps Bash gated — a good, conservative analogue of the
+old read-only/write-only delegations. Raise to `bypassPermissions` only for
+work that genuinely needs unattended shell access, and accept that it is an
+autonomous loop with no approval gates: don't point one at secrets,
+production systems, or anything you wouldn't want an unattended agent doing on
+this machine.
 
-Hooks and permission gates configured for your account/project (e.g. from
-`~/.claude/settings.json` or managed/policy settings) still apply inside a
-delegated run in non-`bare` mode, same as an interactive session — this
-tool deliberately does **not** give the delegated run any way to get a hook
-or permission denial approved on its own (an earlier design that routed
-denials through `ask_parent` for the parent session to approve was dropped:
-it would have let one AI session grant another AI session's blocked action
-with no human in the loop). A denied run either finds another way to make
-progress or gets stuck; `check_delegate_status` flags 2+ denials so you
-notice and can decide -- widen `allowed_tools` and restart, or intervene by
-hand -- rather than the run quietly burning turns against the same wall.
+This server deliberately does **not** let one AI session approve another
+AI session's blocked action. A delegated agent that gets gated shows its
+native `blocked` state; you (the human) unblock it — with `--permission-mode`
+at spawn, or by replying through the native `SendMessage` tool if it asks a
+question. That keeps a human in the loop exactly where it matters.
+
+To stop a delegated agent that hangs or runs long, use the native
+`claude stop <id>` (or `claude attach <id>` then interrupt). There is no
+home-grown wrapper PID to hunt down.
 
 ## Testing manually
 
@@ -298,12 +325,9 @@ sessions with only this server's `--mcp-config` and no other context.
   description, not something it could have inferred from a hidden default.
 - Task 2 (three independent facts to combine): correctly chose
   `fan_out_to_local` over three manual `delegate_to_local` calls, correctly
-  sequenced `fan_out_to_local` → `check_fanout_status` →
-  `get_fanout_result(aggregate_instruction=...)`, correctly identified that
-  the resulting aggregation run needed the *ordinary*
-  `check_delegate_status`/`get_delegate_result` tools rather than the
-  fan-out ones, and cited the "review before trusting" line from
-  `get_delegate_result`'s description verbatim as its next step.
+  sequenced `fan_out_to_local` → `check_fanout_status` → `get_fanout_result`,
+  and cited the "review before trusting" line from `get_delegate_result`'s
+  description verbatim as its next step.
 
 No description gaps found in either run -- both sessions reasoned about the
 right sequence, including the aggregation-becomes-a-normal-run detail,
@@ -311,37 +335,43 @@ purely from `tools/list` output.
 
 ## Possible future work
 
-- **Auto-expiring runs directory** — nothing prunes `~/.claude-local-delegate/runs/`
-  yet.
-- **Configurable timeout / auto-kill** for runs that hang.
-- **Notice pending questions proactively** — right now the parent only
-  learns about a pending `ask_parent` question by calling
-  `check_delegate_status`; there's no push/interrupt.
+- **Auto-expire delegated agents** — native background sessions persist until
+  the supervisor stops idle ones; a delegate-specific TTL/cleanup is not
+  wired here (use `claude stop <id>` or `claude agents` to manage them).
+- **Configurable timeout / auto-kill** for agents that hang.
+- **Proactive "needs input" notice** — the parent learns an agent is `blocked`
+  by calling `check_delegate_status` (the native state); Claude Code itself
+  has no push to the parent session yet.
 - **Multi-model routing** (à la [Sakana Fugu](https://arxiv.org/html/2606.21228v1),
   a model orchestrator that picks the right model per query): not
-  implemented, and not really applicable here yet -- this tool talks to
-  exactly one local model (whatever `--settings` points at). It'd become
-  relevant if you ran more than one local model side by side (e.g. a small
-  fast one and a bigger one) and wanted `delegate_to_local` to pick between
-  them by task shape, the way [houtini-ai/lm](https://github.com/houtini-ai/lm)
-  does with a scored `bestTaskTypes` match against `/v1/models`.
+  implemented, and not really applicable here yet — this tool talks to exactly
+  one local model (whatever `--settings` points at). It'd become relevant if
+  you ran more than one local model side by side (e.g. a small fast one and a
+  bigger one) and wanted `delegate_to_local` to pick between them by task
+  shape, the way [houtini-ai/lm](https://github.com/houtini-ai/lm) does with a
+  scored `bestTaskTypes` match against `/v1/models`.
+
+## Why a native agent is the right answer to "delegate to a local model"
+
+An in-session subagent (the `Agent`/`Task` tool, or agent-teams teammates)
+**cannot** run against a different provider or base URL than its parent —
+Claude Code has one `ANTHROPIC_BASE_URL` per session, and
+`CLAUDE_CODE_SUBAGENT_MODEL` only swaps the model *id* within it. Your local
+model sits at a *different* endpoint, so the only native way to run it is a
+**separate top-level session** pointed there with `--settings`. That is exactly
+what `claude --bg` (agent view) is: independent, supervised, panel-visible
+Claude Code sessions. So rather than inventing a bespoke "delegation entity",
+this server just spawns and observes those native background agents.
 
 ## Ideas looked at and deliberately not taken
 
 - **Algorithmic tool-output compression** (BM25/FTS indexing of raw tool
   output instead of dumping it into context, as in the "Context Mode" MCP
   server) — solves a different problem (built-in tool output bloat, e.g.
-  `curl`/`kubectl`) than what this tool does; `check_delegate_status`
-  already avoids the equivalent problem here by summarizing structured
-  stream-json events rather than indexing free text.
+  `curl`/`kubectl`) than what this tool does.
 - **Per-model prompt tuning / SQLite model-metadata cache** (from
   houtini-ai/lm) — real technique for juggling many differently-behaved
   local models; not relevant with a single fixed local backend.
-
-Design for `ask_parent` borrowed from
-[dvcrn/mcp-server-subagent](https://github.com/dvcrn/mcp-server-subagent).
-Think-block stripping and the "measure real token/tok-s numbers" instinct
-borrowed from [houtini-ai/lm](https://github.com/houtini-ai/lm).
 
 ## License
 
