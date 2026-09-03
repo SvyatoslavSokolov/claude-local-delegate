@@ -100,11 +100,19 @@ This is load-bearing for the same reason as before: without it a delegated
 agent that hits something it can't decide either guesses (silently, possibly
 wrong) or fails outright. With it, it stops and the parent can unblock it.
 
-## Supervising a delegated run (watch / redirect / stop)
+## Supervising a delegated run (watch → stop → re-delegate)
 
 A delegated agent is unattended, but you should still **watch it like a human
 watching the agent-view panel** — read what it *says*, not what it *does*, so
 following a run stays cheap in paid tokens.
+
+**The loop that works:** `watch_delegate` → `stop_delegate` → `delegate_to_local`
+again. A *running* local `claude --bg` agent does **not** read a mid-run
+`SendMessage` — it finishes its current run first, and a fast local model
+usually finishes before the message is looked at; once it is `done` it is
+unreachable by `SendMessage`. So when a run drifts, stop it and re-delegate a
+sharper task rather than trying to steer it live. `SendMessage` is reliable only
+for answering an agent that is **`blocked`** on its own question.
 
 - **Every delegation is spawned with a supervision preamble** (`announce_plan`,
   on by default): the agent must post a numbered plan as its first message,
@@ -117,14 +125,21 @@ following a run stays cheap in paid tokens.
   output, file contents and code stripped**, plus output tokens burned so far.
   Call it repeatedly to follow a run. `check_delegate_status` now also shows the
   task, the agent's last sentence, and tokens-so-far in one compact read.
-- **Redirect** — `SendMessage` to the agent with the new direction. It is
-  picked up at the agent's next tool round.
-- **`stop_delegate(run_id, mode)`** — when the run is drifting, or an in-flight
-  `SendMessage` is being ignored (the agent won't read a new instruction until
-  its current step finishes). `mode: "interrupt"` (default, SIGINT) asks it to
-  drop the current step; `mode: "terminate"` (SIGTERM) ends the run. Then
-  `SendMessage` the correction (a settled agent resumes from its transcript) or
-  re-delegate. Native equivalent: the `TaskStop` tool with the agent's name.
+- **`stop_delegate(run_id, mode)`** — when the run is drifting. `mode:
+  "interrupt"` (default, SIGINT) asks it to drop the current step; `mode:
+  "terminate"` (SIGTERM) ends the run. The agent settles to `done` in ~10–15 s,
+  before its next step. Native equivalent: the `TaskStop` tool with the agent's
+  name.
+- **Course-correct** — after stopping, read what the agent managed with
+  `get_delegate_result(run_id)`, then `delegate_to_local` again with a smaller,
+  sharper task, carrying any useful partial result forward in the new task text.
+  A stopped agent is `done` and not reachable by `SendMessage`.
+- **Answer a `blocked` agent** — the one case for `SendMessage`: when
+  `check_delegate_status` / `watch_delegate` shows state `blocked`, the agent
+  asked its own question; reply with the native `SendMessage` tool. (If the
+  parent session's permission-mode class differs from the delegate's — e.g.
+  parent `auto`, delegate default `bypassPermissions` — that message is held for
+  a one-time user approval.)
 
 **Prefer many small delegations over one long run.** A task you can state as a
 single outcome is easy to watch and cheap to redo if it drifts; a sprawling one
@@ -307,8 +322,10 @@ stripped**, plus output tokens burned. `max_lines` tails the narration
 
 **`stop_delegate`** — `{run_id, mode?}` → halt a drifting agent by signalling
 its process. `mode: "interrupt"` (default, SIGINT) / `"terminate"` (SIGTERM).
-Follow with `SendMessage` to redirect (settled agent resumes from its
-transcript) or re-delegate. Native equivalent: `TaskStop` with the agent name.
+The agent settles to `done` in ~10–15 s; it is then not reachable by
+`SendMessage`, so course-correct by calling `delegate_to_local` again with a
+sharper task (`get_delegate_result` still returns the stopped run's transcript).
+Native equivalent: `TaskStop` with the agent name.
 
 **`check_delegate_status`** — `{run_id}` → the agent's **native state**
 (`working` / `blocked` / `completed` / `failed` / `stopped`) plus its cwd and
@@ -397,8 +414,11 @@ question. That keeps a human in the loop exactly where it matters.
 To stop a delegated agent that hangs, runs long, or drifts off task, use
 `stop_delegate(run_id)` (signals the agent's process — `interrupt`/`terminate`),
 the native `TaskStop` tool with its name, or `claude attach <id>` then
-interrupt. To then point it a different way, `SendMessage` to it (a settled
-agent resumes from its transcript) or re-delegate a smaller task.
+interrupt. It settles to `done` in ~10–15 s; to then point it a different way,
+`delegate_to_local` again with a sharper task (re-use its transcript via
+`get_delegate_result`). A running agent won't read a mid-run `SendMessage`, and
+a stopped one is unreachable by it — reserve `SendMessage` for answering a
+`blocked` agent.
 
 ## Testing manually
 

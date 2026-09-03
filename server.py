@@ -32,6 +32,30 @@ Replying to a delegated agent is the NATIVE `SendMessage(<agent>)` tool on the
 parent side (the agent's own ListAgents sees it), not an MCP call -- that is
 what "working on the agents and their requests, natively" means here.
 
+RECOVERING A DRIFTING AGENT (tested behaviour, read before you try to steer one):
+a local `claude --bg` agent does NOT read a mid-run SendMessage -- it finishes
+its current run first, and a fast local model usually finishes before the
+message is ever looked at; once it settles to `done` it is no longer reachable
+by SendMessage at all. So SendMessage is reliable in exactly ONE case: the
+agent is `blocked` (state == blocked), i.e. it stopped and asked its own
+question -- answer that with SendMessage. (If the parent session runs in a
+different permission-mode class than the delegate -- e.g. parent on `auto`,
+delegate on the default `bypassPermissions` -- that one SendMessage is held
+for the user to approve once; approve it. Everything else here, watch_delegate
+/ stop_delegate / delegate_to_local, is MCP-side and never gated.)
+
+For everything else -- the agent is running and going the wrong way -- the loop
+that actually works is:
+  1. watch_delegate  -- confirm from the narration that it is drifting
+  2. stop_delegate   -- SIGINT; it settles to `done` in ~10-15s, before its
+                        next step
+  3. delegate_to_local  -- re-delegate a smaller, sharper task. Nothing is
+                        lost: the stopped run's transcript stays readable with
+                        get_delegate_result, so fold anything useful it already
+                        produced into the new task text.
+Do NOT sit in a watch->SendMessage->watch loop hoping a running agent picks up
+a correction; it will not.
+
 Stdlib-only. Implements the MCP stdio transport directly (newline-delimited
 JSON-RPC 2.0), same as before.
 """
@@ -534,9 +558,10 @@ def start_delegate(args):
                 f"watch_delegate({short_id!r}) (its plain-text plan + step narration, no code); "
                 f"check_delegate_status({short_id!r}) for state + tokens; "
                 f"get_delegate_result({short_id!r}) for the final answer.\n"
-                f"To redirect it: SendMessage to it with the new direction. If it ignores an "
-                f"in-flight message or is going the wrong way, stop_delegate({short_id!r}) first, "
-                f"then SendMessage (it resumes from its transcript)."
+                f"To course-correct if it drifts: stop_delegate({short_id!r}), then "
+                f"delegate_to_local again with a sharper task (the stopped run stays "
+                f"readable via get_delegate_result). A running local agent will NOT read a "
+                f"mid-run SendMessage; use SendMessage only to answer it when it is `blocked`."
             ),
         }],
         "isError": False,
@@ -697,12 +722,19 @@ def watch_delegate(args):
         + f"\n\n--- COST --- ~{out:,} output tokens over {turns} model turns "
         f"(input+cache ~{inp:,})."
     )
-    if state in ("working", "blocked"):
+    if state == "blocked":
         body += (
-            f"\n\nGoing the wrong way? stop_delegate({handle!r}) to halt it, then "
-            f"SendMessage to it with the corrected direction (it resumes from its "
-            f"transcript). On track? Just call watch_delegate again later. It is "
-            f"cheaper to stop + re-delegate a smaller task than to let a long run drift."
+            f"\n\nIt is `blocked` on its own question (last words above). Answer it "
+            f"with the native SendMessage tool addressed to this agent -- that is the "
+            f"one case where a delegated agent reliably reads a message."
+        )
+    elif state == "working":
+        body += (
+            f"\n\nGoing the wrong way? stop_delegate({handle!r}) to halt it (settles in "
+            f"~10-15s), then delegate_to_local again with a sharper task -- its stopped "
+            f"transcript stays readable via get_delegate_result. Do NOT SendMessage a "
+            f"correction to a running agent: it won't read it until the run ends. "
+            f"On track? Just call watch_delegate again later."
         )
     return {"content": [{"type": "text", "text": body}], "isError": False}
 
@@ -710,8 +742,10 @@ def watch_delegate(args):
 def stop_delegate(args):
     """Halt a delegated agent by signalling its process (pid from the native
     roster). mode 'interrupt' = SIGINT (ask it to drop the current step),
-    'terminate' = SIGTERM (end the run). Either way: follow with SendMessage to
-    redirect (a settled agent resumes from its transcript) or re-delegate.
+    'terminate' = SIGTERM (end the run). The agent settles to `done` in ~10-15s
+    and is then NOT reachable by SendMessage -- course-correct by calling
+    delegate_to_local again with a sharper task (the stopped run's transcript
+    stays readable via get_delegate_result).
     The native equivalent is the TaskStop tool with the agent's name."""
     handle = args.get("run_id") or args.get("agent_id")
     if not handle:
@@ -732,8 +766,9 @@ def stop_delegate(args):
     state = agent.get("state") or agent.get("status") or "unknown"
     if state in ("completed", "failed", "stopped", "done", "idle"):
         return {"content": [{"type": "text", "text": (
-            f"agent {handle} is already {state}; nothing to stop. To give it a new "
-            f"direction, SendMessage to it (resumes from transcript) or re-delegate."
+            f"agent {handle} is already {state}; nothing to stop. To make progress on "
+            f"a new direction, call delegate_to_local again with a sharper task "
+            f"(this agent's transcript stays readable via get_delegate_result)."
         )}], "isError": False}
     if not pid:
         return _error_result(
@@ -756,9 +791,11 @@ def stop_delegate(args):
 
     return {"content": [{"type": "text", "text": (
         f"Sent {sig.name} to agent {handle} (pid {pid}, was {state}).\n"
-        f"Wait a second, then check_delegate_status. To redirect it, SendMessage "
-        f"to it with the new instruction -- a settled agent resumes from its "
-        f"transcript. To scrap it, use native TaskStop or re-delegate a smaller task."
+        f"Give it ~10-15s, then check_delegate_status to confirm it is `done`. "
+        f"Then course-correct by calling delegate_to_local again with a sharper task -- "
+        f"read what it already produced with get_delegate_result({handle!r}) and fold "
+        f"anything useful into the new task text. (A stopped agent is not reachable by "
+        f"SendMessage.) If SIGINT did not settle it, retry with mode='terminate'."
     )}], "isError": False}
 
 
@@ -907,8 +944,11 @@ PARENT_TOOLS = [
             "in one outcome ('rename X to Y across src/', 'add tests for module Z') is "
             "easy to watch and cheap to redo if it drifts; a sprawling one is neither. "
             "Split big work and delegate the pieces (or use fan_out_to_local). "
-            "Supervise with watch_delegate (plan + step narration, no code); redirect "
-            "with SendMessage; halt a drifting run with stop_delegate, then re-delegate."
+            "Supervise with watch_delegate (plan + step narration, no code). If it "
+            "drifts: stop_delegate, then delegate_to_local again with a sharper task -- "
+            "a RUNNING local agent does NOT read a mid-run SendMessage (it finishes its "
+            "run first), so reserve SendMessage for answering an agent that is `blocked` "
+            "on its own question. The stopped run stays readable via get_delegate_result."
         ),
         "inputSchema": {
             "type": "object",
@@ -970,8 +1010,11 @@ PARENT_TOOLS = [
             "contents and code stripped out -- plus output tokens burned. This is the "
             "'watch it like a human running the chat: read its messages, not its "
             "code' view. Call it repeatedly to follow a run. If the narration shows "
-            "it drifting: stop_delegate, then SendMessage the correction (it resumes "
-            "from its transcript), or re-delegate a smaller task."
+            "it drifting: stop_delegate, then re-delegate a smaller, sharper task "
+            "(delegate_to_local). Do NOT try to SendMessage a correction to a running "
+            "agent -- a local `claude --bg` agent won't read it until its run ends, by "
+            "which point it is `done` and unreachable; SendMessage is only for "
+            "answering an agent that is `blocked` on its own question."
         ),
         "inputSchema": {
             "type": "object",
@@ -987,11 +1030,13 @@ PARENT_TOOLS = [
         "description": (
             "Halt a delegated agent that is going the wrong way. Signals its process "
             "(pid from the native roster): mode 'interrupt' (default, SIGINT) asks it "
-            "to drop the current step; mode 'terminate' (SIGTERM) ends the run. After "
-            "stopping, SendMessage to the agent with the corrected direction -- a "
-            "settled agent resumes from its transcript -- or re-delegate a smaller, "
-            "sharper task. Use this when an in-flight SendMessage is being ignored "
-            "(the agent won't read a new instruction until its current step ends). "
+            "to drop the current step; mode 'terminate' (SIGTERM) ends the run. The "
+            "agent settles to `done` in ~10-15s (before its next step) and is then "
+            "NOT reachable by SendMessage -- recover by calling delegate_to_local "
+            "again with a smaller, sharper task; the stopped run's transcript stays "
+            "readable via get_delegate_result, so fold anything useful it already did "
+            "into the new task. This is the reliable way to course-correct: a running "
+            "local agent will not read a mid-run SendMessage. "
             "Native equivalent: the TaskStop tool with the agent's name."
         ),
         "inputSchema": {

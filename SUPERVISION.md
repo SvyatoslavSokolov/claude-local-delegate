@@ -4,6 +4,26 @@ A short operator guide for the parent Claude Code session that owns a
 delegated `claude --bg` run. You see only the child's plain-text messages —
 use these MCP tools to watch, intervene, and redirect.
 
+## TL;DR — the loop that works
+
+**watch_delegate → stop_delegate → delegate_to_local (re-delegate).**
+
+A running local `claude --bg` agent does **not** read a mid-run
+`SendMessage` — it finishes its current run first, and a fast local model
+usually finishes before the message is ever looked at; once it is `done`
+it is unreachable by `SendMessage` entirely. So do not sit in a
+watch→SendMessage→watch loop hoping a correction lands. When an agent
+drifts: `stop_delegate` (it settles to `done` in ~10–15 s, before its next
+step), then `delegate_to_local` again with a sharper task. Nothing is lost
+— the stopped run's transcript stays readable via `get_delegate_result`,
+so fold anything useful it already produced into the new task text.
+
+`SendMessage` is reliable in exactly one case: the agent is **`blocked`**
+on its own question — answer that. (If the parent session's
+permission-mode class differs from the delegate's — e.g. parent `auto`,
+delegate default `bypassPermissions` — that one message is held for a
+one-time user approval; approve it. The MCP tools below are never gated.)
+
 ## Watch: `watch_delegate(run_id)`
 
 The token-cheap view. Returns the agent's plan plus its per-step
@@ -25,13 +45,12 @@ Halt a drifting run:
   cleanly. Prefer this first.
 - `mode: "terminate"` — SIGTERM; hard stop when the run is hopeless.
 
-## Redirect after stopping
+## Course-correct after stopping
 
-The stopped agent keeps its transcript. Either:
-
-- `SendMessage` to the run to redirect it — it resumes from where it left
-  off with the new instruction, or
-- re-delegate a smaller, better-scoped task to a fresh run.
+The stopped agent is now `done` and **not** reachable by `SendMessage`.
+Read what it managed to do with `get_delegate_result(run_id)`, then call
+`delegate_to_local` again with a smaller, better-scoped task — carry any
+useful partial result forward in the new task text.
 
 ## Why the narration is readable
 
