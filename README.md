@@ -9,8 +9,8 @@ inspectable Claude Code session, not a bespoke "delegation entity" this
 server invented on its own.
 
 Parent-side tools: `delegate_to_local`, `check_delegate_status`,
-`get_delegate_result`, `fan_out_to_local`, `check_fanout_status`,
-`get_fanout_result`.
+`get_delegate_result`, `watch_delegate`, `stop_delegate`, `fan_out_to_local`,
+`check_fanout_status`, `get_fanout_result`.
 
 ## Why a native `claude --bg` agent instead of a `claude -p` black box
 
@@ -99,6 +99,38 @@ process, no message files.
 This is load-bearing for the same reason as before: without it a delegated
 agent that hits something it can't decide either guesses (silently, possibly
 wrong) or fails outright. With it, it stops and the parent can unblock it.
+
+## Supervising a delegated run (watch / redirect / stop)
+
+A delegated agent is unattended, but you should still **watch it like a human
+watching the agent-view panel** — read what it *says*, not what it *does*, so
+following a run stays cheap in paid tokens.
+
+- **Every delegation is spawned with a supervision preamble** (`announce_plan`,
+  on by default): the agent must post a numbered plan as its first message,
+  then one plain sentence of intent before each step and one of outcome after —
+  no pasted code, no file dumps. A mid-run message is treated as a
+  course-correction. Turn it off per call with `announce_plan: false` for a
+  trivial one-shot.
+- **`watch_delegate(run_id)`** — the token-cheap view: the agent's *original
+  task* + its plain-text narration (plan + per-step sentences) with **all tool
+  output, file contents and code stripped**, plus output tokens burned so far.
+  Call it repeatedly to follow a run. `check_delegate_status` now also shows the
+  task, the agent's last sentence, and tokens-so-far in one compact read.
+- **Redirect** — `SendMessage` to the agent with the new direction. It is
+  picked up at the agent's next tool round.
+- **`stop_delegate(run_id, mode)`** — when the run is drifting, or an in-flight
+  `SendMessage` is being ignored (the agent won't read a new instruction until
+  its current step finishes). `mode: "interrupt"` (default, SIGINT) asks it to
+  drop the current step; `mode: "terminate"` (SIGTERM) ends the run. Then
+  `SendMessage` the correction (a settled agent resumes from its transcript) or
+  re-delegate. Native equivalent: the `TaskStop` tool with the agent's name.
+
+**Prefer many small delegations over one long run.** A task you can state as a
+single outcome is easy to watch and cheap to redo if it drifts; a sprawling one
+is neither. Split big work and delegate the pieces (or `fan_out_to_local`). The
+supervision preamble also tells the agent to flag, in its plan, when a task is
+bigger than ~5 steps instead of silently doing all of it.
 
 ## Two different token budgets, two different defaults
 
@@ -202,9 +234,23 @@ correct both times. The gap was elsewhere:
 | `allowed_tools` | no | `Read,Grep,Glob` (read-only) | Comma-separated tools granted to the agent. Widen to `Read,Edit,Write` for tasks that write files. |
 | `cwd` | no | server's cwd | Working directory for the agent. |
 | `name` | no | slug of the task | Display name shown in `claude agents`. |
-| `permission_mode` | no | `acceptEdits` | Native `--permission-mode`. `acceptEdits` = read/edit/write run unattended, Bash stays gated. Use `bypassPermissions` only for genuinely unattended-shell work. |
+| `permission_mode` | no | `bypassPermissions` | Native `--permission-mode`. Default runs the full granted toolset (Bash included) unattended — a delegated agent that prompts on Bash would park forever. Narrow with `acceptEdits` (Bash gated) / `default` (all prompts) / `auto` (classifier-gated). |
+| `disallowed_tools` | no | — | Comma-separated tools to strip (e.g. `Bash`) — forces the agent onto a path it can finish when a user-level hook blocks a tool it would reach for. |
+| `agent` | no | `local-worker` | Subagent persona (system prompt). `""` = no persona. |
+| `announce_plan` | no | `true` | Prepend the supervision preamble: agent posts a numbered plan first, then one plain sentence before/after each step (what `watch_delegate` surfaces). `false` for a trivial one-shot. |
 
 Returns the agent's **native id** (the id you see in `claude agents`).
+
+**`watch_delegate`** — `{run_id, max_lines?}` → token-cheap supervision view:
+the agent's original task + its plain-text narration (numbered plan, one
+sentence of intent per step, one of outcome), with **all tool output and code
+stripped**, plus output tokens burned. `max_lines` tails the narration
+(default 48; `<=0` for the whole run). Call repeatedly to follow a run.
+
+**`stop_delegate`** — `{run_id, mode?}` → halt a drifting agent by signalling
+its process. `mode: "interrupt"` (default, SIGINT) / `"terminate"` (SIGTERM).
+Follow with `SendMessage` to redirect (settled agent resumes from its
+transcript) or re-delegate. Native equivalent: `TaskStop` with the agent name.
 
 **`check_delegate_status`** — `{run_id}` → the agent's **native state**
 (`working` / `blocked` / `completed` / `failed` / `stopped`) plus its cwd and
@@ -261,10 +307,10 @@ first-class background session owned by Claude Code's agent-view supervisor:
   else to prune.
 
 To inspect or drive an agent directly, no MCP needed: `claude attach <id>`,
-`claude logs <id>`, `claude stop <id>` — or, from within a Claude Code
-session, the native `SendMessage`/`ListAgents` tools.<think>...</think>` block stripped defensively, in case a local model
-leaks reasoning despite the settings that are supposed to suppress it),
-local `session_id`, output tokens + tok/s, and cost estimate. Errors if the
+`claude logs <id>` — or, from within a Claude Code session, the native
+`SendMessage` / `ListAgents` / `TaskStop` tools, or this server's
+`watch_delegate` / `stop_delegate`.
+
 ### Cost / token notes
 
 `get_delegate_result` returns the agent's **native transcript** text, so there
@@ -290,9 +336,11 @@ native `blocked` state; you (the human) unblock it — with `--permission-mode`
 at spawn, or by replying through the native `SendMessage` tool if it asks a
 question. That keeps a human in the loop exactly where it matters.
 
-To stop a delegated agent that hangs or runs long, use the native
-`claude stop <id>` (or `claude attach <id>` then interrupt). There is no
-home-grown wrapper PID to hunt down.
+To stop a delegated agent that hangs, runs long, or drifts off task, use
+`stop_delegate(run_id)` (signals the agent's process — `interrupt`/`terminate`),
+the native `TaskStop` tool with its name, or `claude attach <id>` then
+interrupt. To then point it a different way, `SendMessage` to it (a settled
+agent resumes from its transcript) or re-delegate a smaller task.
 
 ## Testing manually
 

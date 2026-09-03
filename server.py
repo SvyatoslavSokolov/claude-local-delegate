@@ -40,6 +40,7 @@ import json
 import os
 import glob
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -47,7 +48,7 @@ import uuid
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "claude-local-delegate"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 
 # Where the local backend profile lives (ANTHROPIC_BASE_URL -> vLLM/LiteLLM,
 # model env, etc). This is what the spawned `claude --bg` agents use, so they
@@ -117,6 +118,34 @@ DEFAULT_PERMISSION_MODE = os.environ.get(
     "CLAUDE_LOCAL_DELEGATE_PERMISSION_MODE", "bypassPermissions"
 )
 
+# Prepended to every delegated task (unless announce_plan=False). It turns the
+# agent into something a parent session can SUPERVISE cheaply: the parent reads
+# only the agent's plain-text messages (watch_delegate strips tool output), so
+# the agent is told to narrate intent in plain sentences, keep steps small, and
+# treat a mid-run message as a course-correction. The marker line lets
+# watch_delegate show the real task without this boilerplate.
+SUPERVISION_MARKER = "=== YOUR TASK (everything below is the task) ==="
+SUPERVISED_PREAMBLE = (
+    "SUPERVISED RUN. A parent session is watching you. It sees ONLY your "
+    "plain-text messages -- never your tool calls or their output. So:\n"
+    "  1. FIRST, before any tool call, post a short numbered plan (one line per step).\n"
+    "  2. Before each step: one plain sentence saying what you are about to do.\n"
+    "  3. After each step: one plain sentence on the outcome -- NOT a code or output dump.\n"
+    "  4. Keep messages terse: no pasted code, no file contents, no big tables.\n"
+    "  5. If a new instruction arrives mid-run, it is a course-correction from the "
+    "supervisor: acknowledge it in one line and change course immediately.\n"
+    "  6. Prefer finishing a small task over expanding scope. If the task is bigger "
+    "than ~5 steps, say so in your plan instead of silently doing all of it.\n"
+    "  7. Work IN PLACE at the exact paths you are given. Do NOT create or enter a "
+    "git worktree, do NOT call EnterWorktree, do NOT branch -- if a Write or Edit "
+    "fails, report the real error in one sentence and stop; never 'work around' it "
+    "by relocating the work.\n\n"
+    + SUPERVISION_MARKER + "\n"
+)
+DEFAULT_ANNOUNCE_PLAN = os.environ.get(
+    "CLAUDE_LOCAL_DELEGATE_ANNOUNCE_PLAN", "1"
+).strip().lower() not in ("0", "false", "no", "")
+
 
 # ---- native agent spawning ---------------------------------------------------
 
@@ -143,7 +172,7 @@ def _default_agent():
 
 
 def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
-                        disallowed_tools=None, agent=None):
+                        disallowed_tools=None, agent=None, announce_plan=None):
     """Spawn ONE native `claude --bg` agent on the local model.
 
     Returns (short_id, None) on success or (None, error_message).
@@ -187,6 +216,10 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     pmode = permission_mode or DEFAULT_PERMISSION_MODE
     # agent=None means "use the default persona"; agent="" means "no persona".
     pagent = _default_agent() if agent is None else agent
+    # Wrap the task so the delegated agent narrates its plan/steps in plain text
+    # (what watch_delegate surfaces to the parent). announce_plan=None -> default.
+    want_plan = DEFAULT_ANNOUNCE_PLAN if announce_plan is None else bool(announce_plan)
+    effective_task = (SUPERVISED_PREAMBLE + task) if want_plan else task
 
     cmd = [
         CLAUDE_BIN, "--bg",
@@ -207,7 +240,7 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     # arguments: `--allowedTools Read Write <task>` would swallow the task into
     # the tool list and the agent would start with no prompt (observed: blocked,
     # empty transcript). Put the task first, then the variadic flags.
-    cmd.append(task)
+    cmd.append(effective_task)
     if tools:
         cmd += ["--allowedTools", *tools]
     if disallowed:
@@ -323,6 +356,78 @@ def _last_assistant_text(transcript_path):
     return last
 
 
+def _first_user_text(transcript_path):
+    """The original prompt the agent was spawned with = the first user event that
+    carries real text (later user events are tool_results). Used by watch_delegate
+    so the parent can see WHAT the agent was told without re-reading anything."""
+    for e in _iter_events(transcript_path):
+        if e.get("type") != "user":
+            continue
+        content = e.get("message", {}).get("content", [])
+        if isinstance(content, str):
+            if content.strip():
+                return content.strip()
+            continue
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" and item.get("text", "").strip():
+                return item["text"].strip()
+    return None
+
+
+def _strip_preamble(prompt):
+    """Drop the SUPERVISED_PREAMBLE boilerplate so watch_delegate shows the task."""
+    if prompt and SUPERVISION_MARKER in prompt:
+        return prompt.split(SUPERVISION_MARKER, 1)[1].strip()
+    return prompt
+
+
+def _narration_digest(transcript_path, max_lines=48):
+    """Token-cheap supervision view: the agent's assistant plain-text messages in
+    order, each tool_use collapsed to a ONE-LINE label, and tool RESULTS dropped
+    entirely. This is what a human watching the agent think would see, minus the
+    code / file dumps -- the whole point of 'read its messages, not its output'.
+    max_lines <= 0 returns everything."""
+    lines = []
+    step = 0
+    for e in _iter_events(transcript_path):
+        if e.get("type") != "assistant":
+            continue
+        content = e.get("message", {}).get("content", [])
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and item.get("text", "").strip():
+                step += 1
+                lines.append(f"[{step}] {item['text'].strip()}")
+            elif item.get("type") == "tool_use":
+                inp = json.dumps(item.get("input", {}), ensure_ascii=False)
+                if len(inp) > 140:
+                    inp = inp[:140] + "…"
+                lines.append(f"      · {item.get('name')} {inp}")
+    if max_lines and max_lines > 0:
+        return lines[-max_lines:]
+    return lines
+
+
+def _token_usage(transcript_path):
+    """(input_plus_cache, output, model_turns) summed from the transcript's
+    assistant usage blocks. Directly answers 'how many tokens is this session
+    generating' -- the number the sessions-vs-throughput tuning needs."""
+    inp = out = turns = 0
+    for e in _iter_events(transcript_path):
+        if e.get("type") != "assistant":
+            continue
+        u = e.get("message", {}).get("usage", {}) or {}
+        inp += ((u.get("input_tokens") or 0)
+                + (u.get("cache_read_input_tokens") or 0)
+                + (u.get("cache_creation_input_tokens") or 0))
+        out += u.get("output_tokens") or 0
+        turns += 1
+    return inp, out, turns
+
+
 def _tail_transcript(transcript_path, max_events=24):
     """The last few assistant texts / tool names / tool_result snippets, as a flat
     list of strings. Used to classify WHY an agent is blocked (the tail holds the
@@ -410,9 +515,11 @@ def start_delegate(args):
     permission_mode = args.get("permission_mode")
     disallowed_tools = args.get("disallowed_tools")
     agent = args.get("agent")  # None -> default persona; "" -> no persona; name -> that persona
+    announce_plan = args.get("announce_plan")  # None -> DEFAULT_ANNOUNCE_PLAN
 
     short_id, err = _spawn_native_agent(
-        task, allowed_tools, cwd, name, permission_mode, disallowed_tools, agent
+        task, allowed_tools, cwd, name, permission_mode, disallowed_tools, agent,
+        announce_plan,
     )
     if err:
         return _error_result(err)
@@ -423,10 +530,13 @@ def start_delegate(args):
             "text": (
                 f"Spawned a native background agent on the local model. "
                 f"agent id: {short_id}\n"
-                f"It appears in `claude agents`; follow it with check_delegate_status({short_id!r}) "
-                f"and read it with get_delegate_result({short_id!r}).\n"
-                f"To send it a follow-up request, use the native SendMessage tool addressed to it "
-                f"(it shows up in ListAgents while running)."
+                f"It appears in `claude agents`. Supervise it cheaply with "
+                f"watch_delegate({short_id!r}) (its plain-text plan + step narration, no code); "
+                f"check_delegate_status({short_id!r}) for state + tokens; "
+                f"get_delegate_result({short_id!r}) for the final answer.\n"
+                f"To redirect it: SendMessage to it with the new direction. If it ignores an "
+                f"in-flight message or is going the wrong way, stop_delegate({short_id!r}) first, "
+                f"then SendMessage (it resumes from its transcript)."
             ),
         }],
         "isError": False,
@@ -456,6 +566,23 @@ def check_status(args):
         f"  cwd: {agent.get('cwd')}\n"
         f"  session: {session_id}"
     )
+
+    # Cheap always-on supervision: the task it was given, its last plain sentence,
+    # and tokens burned so far -- so "watch them always" costs almost nothing.
+    tr_watch = _find_transcript(session_id) if session_id else None
+    if tr_watch:
+        prompt = _strip_preamble(_first_user_text(tr_watch))
+        if prompt:
+            oneline = " ".join(prompt.split())
+            text += f"\n  task: {oneline[:200]}" + ("…" if len(oneline) > 200 else "")
+        last_said = ""
+        for ln in _narration_digest(tr_watch, max_lines=0):
+            if ln.startswith("["):
+                last_said = ln
+        if last_said:
+            text += f"\n  last said: {last_said[:280]}"
+        inp, out, turns = _token_usage(tr_watch)
+        text += f"\n  cost so far: ~{out:,} output tokens over {turns} model turns"
 
     # If the agent is `blocked` (the native "needs input" state), classify WHY and
     # surface its last words so the parent (main model) can act without re-reading
@@ -526,6 +653,115 @@ def get_result(args):
     return {"content": [{"type": "text", "text": result_text + footer}], "isError": False}
 
 
+def watch_delegate(args):
+    """Token-cheap supervision: the agent's ORIGINAL task + its plain-text
+    narration (plan, per-step intent, per-step outcome) with all tool output and
+    code stripped, plus tokens burned. This is the 'watch it like a human runs
+    the chat, read its messages not its code' view."""
+    handle = args.get("run_id") or args.get("agent_id")
+    if not handle:
+        return _error_result("`run_id` (the agent id) is required.")
+
+    agent, err = _resolve_agent(handle)
+    if err:
+        return _error_result(err)
+    if agent is None:
+        return _error_result(
+            f"No background agent with id {handle} in `claude agents --json`."
+        )
+
+    state = agent.get("state") or agent.get("status") or "unknown"
+    session_id = agent.get("sessionId") or ""
+    tr = _find_transcript(session_id) if session_id else None
+    if not tr:
+        return _error_result(
+            f"No transcript yet for {handle} (state {state}). It may have just "
+            "started -- try again in a few seconds."
+        )
+
+    prompt = _strip_preamble(_first_user_text(tr)) or "(prompt not found)"
+    max_lines = args.get("max_lines")
+    try:
+        max_lines = int(max_lines) if max_lines is not None else 48
+    except (TypeError, ValueError):
+        max_lines = 48
+    digest = _narration_digest(tr, max_lines=max_lines)
+    inp, out, turns = _token_usage(tr)
+
+    body = (
+        f"WATCHING agent {agent.get('id')} -- native state: {state}\n\n"
+        f"--- ORIGINAL TASK -------------------------------\n"
+        f"{prompt[:1400]}\n\n"
+        f"--- PROGRESS (plain narration; tool output & code omitted) ---\n"
+        + ("\n".join(digest) if digest else "(no assistant messages yet)")
+        + f"\n\n--- COST --- ~{out:,} output tokens over {turns} model turns "
+        f"(input+cache ~{inp:,})."
+    )
+    if state in ("working", "blocked"):
+        body += (
+            f"\n\nGoing the wrong way? stop_delegate({handle!r}) to halt it, then "
+            f"SendMessage to it with the corrected direction (it resumes from its "
+            f"transcript). On track? Just call watch_delegate again later. It is "
+            f"cheaper to stop + re-delegate a smaller task than to let a long run drift."
+        )
+    return {"content": [{"type": "text", "text": body}], "isError": False}
+
+
+def stop_delegate(args):
+    """Halt a delegated agent by signalling its process (pid from the native
+    roster). mode 'interrupt' = SIGINT (ask it to drop the current step),
+    'terminate' = SIGTERM (end the run). Either way: follow with SendMessage to
+    redirect (a settled agent resumes from its transcript) or re-delegate.
+    The native equivalent is the TaskStop tool with the agent's name."""
+    handle = args.get("run_id") or args.get("agent_id")
+    if not handle:
+        return _error_result("`run_id` (the agent id) is required.")
+    mode = (args.get("mode") or "interrupt").strip().lower()
+    if mode not in ("interrupt", "terminate"):
+        return _error_result("`mode` must be 'interrupt' or 'terminate'.")
+
+    agent, err = _resolve_agent(handle)
+    if err:
+        return _error_result(err)
+    if agent is None:
+        return _error_result(
+            f"No background agent with id {handle} in `claude agents --json`."
+        )
+
+    pid = agent.get("pid")
+    state = agent.get("state") or agent.get("status") or "unknown"
+    if state in ("completed", "failed", "stopped", "done", "idle"):
+        return {"content": [{"type": "text", "text": (
+            f"agent {handle} is already {state}; nothing to stop. To give it a new "
+            f"direction, SendMessage to it (resumes from transcript) or re-delegate."
+        )}], "isError": False}
+    if not pid:
+        return _error_result(
+            f"agent {handle} has no pid in the roster (state {state}). Use the "
+            f"native TaskStop tool with its name instead."
+        )
+
+    sig = signal.SIGINT if mode == "interrupt" else signal.SIGTERM
+    try:
+        os.kill(int(pid), sig)
+    except ProcessLookupError:
+        return {"content": [{"type": "text", "text": (
+            f"agent {handle} (pid {pid}) is already gone."
+        )}], "isError": False}
+    except (PermissionError, ValueError, OSError) as exc:
+        return _error_result(
+            f"Could not signal pid {pid}: {exc}. Use the native TaskStop tool "
+            f"with the agent's name."
+        )
+
+    return {"content": [{"type": "text", "text": (
+        f"Sent {sig.name} to agent {handle} (pid {pid}, was {state}).\n"
+        f"Wait a second, then check_delegate_status. To redirect it, SendMessage "
+        f"to it with the new instruction -- a settled agent resumes from its "
+        f"transcript. To scrap it, use native TaskStop or re-delegate a smaller task."
+    )}], "isError": False}
+
+
 def _batch_path(batch_id):
     return os.path.join(BATCHES_DIR, f"{batch_id}.json")
 
@@ -543,6 +779,7 @@ def fan_out_to_local(args):
     permission_mode = args.get("permission_mode")
     disallowed_tools = args.get("disallowed_tools")
     agent = args.get("agent")  # None -> default persona; "" -> no persona; name -> that persona
+    announce_plan = args.get("announce_plan")
     batch_tag = uuid.uuid4().hex[:4]
 
     agent_ids = []
@@ -550,7 +787,8 @@ def fan_out_to_local(args):
         task = f"{shared_instruction}\n\n--- item {i + 1}/{len(items)} ---\n\n{item}"
         name = _slug_from_task(f"fanout {batch_tag} item {i + 1} " + item.splitlines()[0])
         short_id, err = _spawn_native_agent(
-            task, allowed_tools, cwd, name, permission_mode, disallowed_tools, agent
+            task, allowed_tools, cwd, name, permission_mode, disallowed_tools, agent,
+            announce_plan,
         )
         if err:
             return _error_result(
@@ -664,7 +902,13 @@ PARENT_TOOLS = [
             "Poll with check_delegate_status, then read the answer with "
             "get_delegate_result. Use for mechanical/high-volume work where local-model "
             "latency is worth saving paid tokens; keep architecture decisions and "
-            "security-sensitive work in the main session."
+            "security-sensitive work in the main session.\n"
+            "PREFER MANY SMALL TASKS over one long run: a delegation you can describe "
+            "in one outcome ('rename X to Y across src/', 'add tests for module Z') is "
+            "easy to watch and cheap to redo if it drifts; a sprawling one is neither. "
+            "Split big work and delegate the pieces (or use fan_out_to_local). "
+            "Supervise with watch_delegate (plan + step narration, no code); redirect "
+            "with SendMessage; halt a drifting run with stop_delegate, then re-delegate."
         ),
         "inputSchema": {
             "type": "object",
@@ -676,6 +920,7 @@ PARENT_TOOLS = [
                 "permission_mode": {"type": "string", "description": f"Native --permission-mode for the background agent. Defaults to '{DEFAULT_PERMISSION_MODE}' so the unattended agent runs its full granted toolset (Bash included) without approval gates -- a delegated agent that prompts on Bash would park forever with no one to approve. Set to 'acceptEdits' (Bash gated) or 'default' (everything prompts) to narrow a specific delegation, or 'auto' for the classifier-gated middle ground."},
                 "disallowed_tools": {"type": "string", "description": "Comma-separated tools to strip from the agent (e.g. 'Bash'). Useful when a user-level hook/gate blocks a tool the agent would reach for on its own -- disallowing that tool forces the agent onto a path it can complete. Default: none."},
                 "agent": {"type": "string", "description": f"Subagent-definition persona to run the delegation as (its system prompt). Defaults to 'local-worker' (~/.claude/agents/local-worker.md: verifies by running a check, returns evidence, states assumptions). Pass another installed agent name to override, or empty string to run with no persona."},
+                "announce_plan": {"type": "boolean", "description": f"Prepend the supervision preamble that makes the agent post a numbered plan first and narrate each step in one plain sentence (what watch_delegate shows the parent). Default {DEFAULT_ANNOUNCE_PLAN}. Set false only for a trivial one-shot where narration is noise."},
             },
             "required": ["task"],
         },
@@ -685,9 +930,11 @@ PARENT_TOOLS = [
         "description": (
             "Read the NATIVE state of a delegated background agent by its id (from "
             "delegate_to_local): working / blocked / completed / failed / stopped. "
-            "'blocked' is the agent's native 'I need input' signal -- when that is "
-            "returned, the agent's last words (its question) are surfaced so you can "
-            "answer them with the native SendMessage tool. Cheap: does not touch the model."
+            "Also surfaces, cheaply, the task it was given, its last plain-text "
+            "sentence, and output tokens burned so far. 'blocked' is the agent's "
+            "native 'I need input' signal -- its last words (its question) are shown "
+            "so you can answer with the native SendMessage tool. For the full "
+            "step-by-step narration use watch_delegate. Does not touch the model."
         ),
         "inputSchema": {
             "type": "object",
@@ -715,6 +962,48 @@ PARENT_TOOLS = [
         },
     },
     {
+        "name": "watch_delegate",
+        "description": (
+            "Token-cheap supervision of a delegated agent: its ORIGINAL task plus "
+            "its plain-text narration (numbered plan, one sentence of intent before "
+            "each step, one sentence of outcome after), with ALL tool output, file "
+            "contents and code stripped out -- plus output tokens burned. This is the "
+            "'watch it like a human running the chat: read its messages, not its "
+            "code' view. Call it repeatedly to follow a run. If the narration shows "
+            "it drifting: stop_delegate, then SendMessage the correction (it resumes "
+            "from its transcript), or re-delegate a smaller task."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "The agent id returned by delegate_to_local."},
+                "max_lines": {"type": "integer", "description": "Max narration lines to return (tail). Default 48; <=0 for the whole run."},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "stop_delegate",
+        "description": (
+            "Halt a delegated agent that is going the wrong way. Signals its process "
+            "(pid from the native roster): mode 'interrupt' (default, SIGINT) asks it "
+            "to drop the current step; mode 'terminate' (SIGTERM) ends the run. After "
+            "stopping, SendMessage to the agent with the corrected direction -- a "
+            "settled agent resumes from its transcript -- or re-delegate a smaller, "
+            "sharper task. Use this when an in-flight SendMessage is being ignored "
+            "(the agent won't read a new instruction until its current step ends). "
+            "Native equivalent: the TaskStop tool with the agent's name."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "The agent id returned by delegate_to_local."},
+                "mode": {"type": "string", "enum": ["interrupt", "terminate"], "description": "'interrupt' (SIGINT, default) or 'terminate' (SIGTERM)."},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
         "name": "fan_out_to_local",
         "description": (
             "Map-reduce over the local model using NATIVE background agents: spawn one "
@@ -735,6 +1024,7 @@ PARENT_TOOLS = [
                     "permission_mode": {"type": "string", "description": f"Same as delegate_to_local's permission_mode, applied to every agent. Defaults to '{DEFAULT_PERMISSION_MODE}'."},
                     "disallowed_tools": {"type": "string", "description": "Same as delegate_to_local's disallowed_tools, applied to every agent."},
                     "agent": {"type": "string", "description": "Same as delegate_to_local's agent persona, applied to every agent. Defaults to 'local-worker'."},
+                    "announce_plan": {"type": "boolean", "description": f"Same as delegate_to_local's announce_plan, applied to every agent. Default {DEFAULT_ANNOUNCE_PLAN}."},
                 },
                 "required": ["items", "shared_instruction"],
             },
@@ -760,6 +1050,8 @@ TOOL_HANDLERS = {
     "delegate_to_local": start_delegate,
     "check_delegate_status": check_status,
     "get_delegate_result": get_result,
+    "watch_delegate": watch_delegate,
+    "stop_delegate": stop_delegate,
     "fan_out_to_local": fan_out_to_local,
     "check_fanout_status": check_fanout_status,
     "get_fanout_result": get_fanout_result,
