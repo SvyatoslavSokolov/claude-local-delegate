@@ -9,7 +9,9 @@ inspectable Claude Code session, not a bespoke "delegation entity" this
 server invented on its own.
 
 Parent-side tools: `delegate_to_local`, `check_delegate_status`,
-`get_delegate_result`, `watch_delegate`, `stop_delegate`, `fan_out_to_local`,
+`get_delegate_result`, `watch_delegate`, `stop_delegate`, `delegate_verified`
+(work → local-checker → revise loop), `check_verified_status`,
+`get_verified_result`, `fan_out_to_local`,
 `check_fanout_status`, `get_fanout_result`.
 
 ## Why a native `claude --bg` agent instead of a `claude -p` black box
@@ -367,6 +369,52 @@ each agent's native transcript, concatenated. Errors until all agents are
 settled. Synthesize yourself (or delegate the synthesis to one more
 `delegate_to_local` run if you want it done by the model).
 
+### Verified delegation (`delegate_verified`)
+
+For a task with a **checkable outcome** (code that must build / pass tests /
+meet stated criteria), `delegate_verified` runs a closed **work → independent
+check → revise** loop *entirely on the local model*, and hands the parent back
+only a result a checker has already signed off on — or a failure report with
+the checker's reasons. The point is that the parent session never has to review
+raw local-model output, or remember it has a delegate in flight.
+
+One worker `claude --bg` agent does the task. Then a **checker** agent — the
+`local-checker` persona, with **no Edit/Write tools by design** — re-verifies
+against the real working tree: reads the diff, builds, runs tests/lint, and
+ends its message with `VERDICT: PASS` or `VERDICT: FAIL` plus concrete reasons.
+On `FAIL` those reasons are prepended to a fresh worker round.
+
+It is a lazily-advanced state machine, same pattern as fan-out batches: state
+lives in `~/.claude-local-delegate/verified/<vid>.json`, and each
+`check_verified_status` call moves the run **at most one step** by reading the
+sub-agents' native state. Nothing blocks the single-threaded MCP loop; the
+parent's polling cadence drives it.
+
+**`delegate_verified`** — returns a `vid` immediately.
+
+| Parameter | Required | Default | Description |
+| :-- | :-- | :-- | :-- |
+| `task` | yes | — | Self-contained task for the worker. Exact paths, and what "done" means. |
+| `acceptance_criteria` | no | — | Explicit pass/fail conditions the checker must confirm (`pytest -q` green, `ruff check` passes, CLI prints X for input Y). **Strongly recommended** — without it the checker only derives its own best-guess checks and the gate is weak. |
+| `allowed_tools` | no | `Read,Grep,Glob,Edit,Write,Bash` | Tools for the **worker** (it must be able to change code). The checker's tools are fixed at `Read,Grep,Glob,Bash` — no Edit/Write. |
+| `cwd` | no | server's cwd | Working directory for both worker and checker. |
+| `max_iterations` | no | `3` (`CLAUDE_LOCAL_DELEGATE_MAX_VERIFY_ITERS`) | Max work→check rounds, clamped 1..10. |
+| `timeout_seconds` | no | `5400` (`CLAUDE_LOCAL_DELEGATE_VERIFY_TIMEOUT`) | Wall-clock ceiling for the whole loop; past it the run is force-failed. |
+
+Runaway-loop guards: iteration cap, **stagnation detection** (worker emits a
+byte-identical result two rounds running → stop), and the wall-clock ceiling.
+
+**`check_verified_status`** — `{vid}` → advances the loop one step and reports
+the phase (`working` / `checking` / `passed` / `failed`), elapsed vs timeout,
+iteration count, and a per-round trail (`worker id → checker id → verdict`).
+Poll it the way you'd poll `check_delegate_status`.
+
+**`get_verified_result`** — `{vid}` → errors (with the current phase) until the
+loop settles. On **PASS**: the signed-off worker answer plus the verification
+trail. On **FAIL**: the reason (iteration cap / stagnation / timeout / crashed
+sub-agent), the last checker's feedback, and the last candidate answer (kept,
+not discarded — the working tree still holds its changes).
+
 ### Where the agents live (native, not a home-grown store)
 
 There is no `~/.claude-local-delegate/runs/` anymore. Each delegated task is a
@@ -376,10 +424,12 @@ first-class background session owned by Claude Code's agent-view supervisor:
   id, cwd, native `state`.
 - **Transcript (the result)**: `~/.claude/projects/<sanitized-cwd>/<sessionId>.jsonl`
   — the same file `claude attach` / `claude logs` read.
-- **This server's only on-disk artifact** is `~/.claude-local-delegate/batches/<batch_id>.json`,
+- **This server's on-disk artifacts** are `~/.claude-local-delegate/batches/<batch_id>.json`,
   which maps a fan-out `batch_id` to the native agent ids it spawned so
-  `check_fanout_status` / `get_fanout_result` can aggregate them. Nothing
-  else to prune.
+  `check_fanout_status` / `get_fanout_result` can aggregate them, and
+  `~/.claude-local-delegate/verified/<vid>.json`, the state machine for a
+  `delegate_verified` run (spec, phase, per-iteration worker/checker ids and
+  verdicts, final answer). Both are small JSON; nothing else to prune.
 
 To inspect or drive an agent directly, no MCP needed: `claude attach <id>`,
 `claude logs <id>` — or, from within a Claude Code session, the native

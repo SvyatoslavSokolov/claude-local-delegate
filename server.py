@@ -60,6 +60,7 @@ Stdlib-only. Implements the MCP stdio transport directly (newline-delimited
 JSON-RPC 2.0), same as before.
 """
 
+import hashlib
 import json
 import os
 import glob
@@ -72,7 +73,7 @@ import uuid
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "claude-local-delegate"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
 
 # Where the local backend profile lives (ANTHROPIC_BASE_URL -> vLLM/LiteLLM,
 # model env, etc). This is what the spawned `claude --bg` agents use, so they
@@ -112,6 +113,33 @@ BATCHES_DIR = os.environ.get(
 # vLLM concurrency ceiling from this stack (--max-num-seqs). Not enforced here;
 # fan_out_to_local only warns past it (see README).
 LOCAL_SERVER_MAX_CONCURRENCY = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY", "16"))
+
+# ---- verified-delegation loop ----------------------------------------------
+# delegate_verified runs a CLOSED work->check->revise loop entirely on the local
+# model, so the PARENT session only ever sees an answer a local checker has
+# already signed off on. It is a lazily-advanced state machine (like fan_out's
+# file-backed batches): the parent just polls check_verified_status, and each
+# poll moves the run forward one step -- nothing blocks the single-threaded MCP
+# stdio loop. State lives in ~/.claude-local-delegate/verified/<vid>.json.
+VERIFIED_DIR = os.environ.get(
+    "CLAUDE_LOCAL_DELEGATE_VERIFIED_DIR",
+    os.path.expanduser("~/.claude-local-delegate/verified"),
+)
+DEFAULT_MAX_VERIFY_ITERS = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_VERIFY_ITERS", "3"))
+# Wall-clock ceiling for the WHOLE loop (all iterations). A local worker+checker
+# round is slow; 3 rounds can legitimately take a while. Past this the run is
+# force-failed so it can never spin unattended forever.
+DEFAULT_VERIFY_TIMEOUT = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_VERIFY_TIMEOUT", "5400"))
+# Persona for the checker agent (adversarial: re-verifies independently, runs the
+# build/tests, fixes NOTHING, emits a `VERDICT: PASS|FAIL` line). Falls back to
+# no persona if the file is absent, same graceful-degrade rule as _default_agent.
+CHECKER_PERSONA = os.environ.get("CLAUDE_LOCAL_DELEGATE_CHECKER_AGENT", "local-checker")
+# The worker in a verify loop must be able to change code; the read-only default
+# would make every check fail. Callers can still narrow this per run.
+DEFAULT_VERIFY_WORKER_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
+# The checker must inspect + run things but must NOT edit -- no Edit/Write here,
+# by design, so a "fix" can only come from a fresh worker round.
+VERIFY_CHECKER_TOOLS = "Read,Grep,Glob,Bash"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_LOCAL_DELEGATE_BIN", "claude")
 CLAUDE_CONFIG_DIR = os.environ.get(
@@ -294,16 +322,28 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
 
 
 def _parse_bg_id(bg_output):
-    """`claude --bg` prints e.g. `backgrounded · aa46976f`. Extract the 8-hex id."""
+    """`claude --bg` prints e.g. `backgrounded · aa46976f`. Extract that id.
+
+    Native agent ids are 8 hex chars. Guard against a LONGER hex-ish token (e.g.
+    a 12-hex run id echoed back inside the agent's --name) by capping length at
+    8, and by only scanning the part of the line AFTER the
+    `backgrounded`/`started` keyword -- the real id always follows it."""
+    def hexish(t):
+        return 6 <= len(t) <= 8 and all(c in "0123456789abcdef" for c in t)
+
     for line in bg_output.splitlines():
         low = line.lower()
-        if "backgrounded" in low or "started" in low:
-            for tok in line.replace("·", " ").split():
-                t = tok.strip()
-                if len(t) >= 6 and all(c in "0123456789abcdef" for c in t):
-                    return t
-    # Fallback: any bare 6-8 hex token.
-    m = re.search(r"\b[0-9a-f]{6,8}\b", bg_output)
+        kw = low.find("backgrounded")
+        if kw < 0:
+            kw = low.find("started")
+        if kw < 0:
+            continue
+        for tok in line[kw:].replace("·", " ").split():
+            t = tok.strip()
+            if hexish(t):
+                return t
+    # Fallback: prefer an exact 8-hex token, else any bare 6-8 hex run.
+    m = re.search(r"\b[0-9a-f]{8}\b", bg_output) or re.search(r"\b[0-9a-f]{6,8}\b", bg_output)
     return m.group(0) if m else None
 
 
@@ -921,6 +961,385 @@ def get_fanout_result(args):
     return {"content": [{"type": "text", "text": "\n\n".join(parts)}], "isError": False}
 
 
+# ---- verified-delegation loop (work -> check -> revise, all local) ----------
+#
+# Shape: a lazily-advanced state machine persisted to one JSON file per run.
+#   phase "working"  -> a worker `claude --bg` agent is (re)doing the task
+#   phase "checking" -> a checker `claude --bg` agent is independently verifying
+#   phase "passed"   -> terminal; final_answer holds the signed-off result
+#   phase "failed"   -> terminal; failure_report explains why (cap / stagnation /
+#                        timeout / a crashed sub-agent), last candidate kept
+#
+# _advance_verified() is called on every check_verified_status / get_verified_result
+# and moves the run AT MOST one transition per call by reading the sub-agents'
+# NATIVE state (the same `claude agents --json` the rest of this file uses). No
+# sleeping, no blocking -- the parent's polling cadence drives the loop.
+
+_VERDICT_RE = re.compile(r"VERDICT:\s*(PASS|FAIL)", re.IGNORECASE)
+
+
+def _verified_path(vid):
+    return os.path.join(VERIFIED_DIR, f"{vid}.json")
+
+
+def _load_verified(vid):
+    path = _verified_path(vid) if vid else None
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _save_verified(state):
+    os.makedirs(VERIFIED_DIR, exist_ok=True)
+    tmp = _verified_path(state["vid"]) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, _verified_path(state["vid"]))
+
+
+def _result_hash(text):
+    """Whitespace-normalised hash of a candidate answer, for stagnation detection
+    (worker emits a byte-identical result two rounds running -> it is stuck)."""
+    norm = " ".join((text or "").split())
+    return hashlib.sha1(norm.encode("utf-8", "replace")).hexdigest()
+
+
+def _parse_verdict(text):
+    """Last `VERDICT: PASS|FAIL` token in the checker's final message. None if the
+    checker never emitted one -- treated by the caller as a FAIL (can't confirm)."""
+    hits = _VERDICT_RE.findall(text or "")
+    return hits[-1].upper() if hits else None
+
+
+def _agent_settled_state(agent_id):
+    """(state, session_id) for a sub-agent id, via the native roster. state is one
+    of working/blocked/completed/failed/stopped/done/idle/unknown/missing."""
+    agent, _ = _resolve_agent(agent_id)
+    if agent is None:
+        return "missing", ""
+    st = agent.get("state") or agent.get("status") or "unknown"
+    return st, (agent.get("sessionId") or "")
+
+
+_TERMINAL_OK = ("completed", "done", "idle")
+_TERMINAL_BAD = ("failed", "stopped")
+
+
+def _spawn_verify_worker(state):
+    """Spawn the worker for the current iteration. On the first round the task is
+    the raw spec; on later rounds the previous checker's reasons are prepended as
+    a revision brief. Returns (worker_id, err)."""
+    it = state["iteration"]
+    spec = state["spec"]
+    accept = state.get("acceptance")
+    parts = [spec]
+    if accept:
+        parts.append("\n\n--- ACCEPTANCE CRITERIA (you must satisfy every one) ---\n" + accept)
+    if it > 1 and state["history"]:
+        last = state["history"][-1]
+        parts.append(
+            f"\n\n--- REVISION ROUND {it} ---\n"
+            "A previous attempt was REJECTED by independent verification. "
+            "Checker feedback:\n"
+            f"{last.get('reasons') or '(no reasons recorded)'}\n\n"
+            "Fix exactly these problems and redo the task. Work IN PLACE at the "
+            "same paths. Do not start over from scratch unless the feedback says to."
+        )
+    task = "".join(parts)
+    # Name is cosmetic (the run is tracked by vid in the state file), but it MUST
+    # NOT contain the vid or any long hex token: _parse_bg_id scans the spawn
+    # output for a hex id and would grab an echoed --name instead of the real
+    # agent id. Keep it plain-alpha.
+    return _spawn_native_agent(
+        task, state["allowed_tools"], state["cwd"],
+        f"verified-worker-r{it}",
+        permission_mode=None, disallowed_tools=None, agent=None, announce_plan=None,
+    )
+
+
+def _spawn_verify_checker(state, candidate):
+    """Spawn the adversarial checker for the current iteration. It gets the spec,
+    the criteria, and the worker's self-reported result, and must verify against
+    the ACTUAL working tree. Returns (checker_id, err)."""
+    it = state["iteration"]
+    spec = state["spec"]
+    accept = state.get("acceptance")
+    task = (
+        "You are the INDEPENDENT VERIFIER for a task another agent just did in "
+        f"this working directory ({state['cwd']}). Do NOT trust its self-report; "
+        "check the real files and RUN things.\n\n"
+        "--- ORIGINAL TASK ---\n" + spec + "\n\n"
+        + (("--- ACCEPTANCE CRITERIA ---\n" + accept + "\n\n") if accept else
+           "--- ACCEPTANCE CRITERIA ---\n(none supplied -- derive reasonable checks "
+           "from the task itself and say which you used)\n\n")
+        + "--- WORKER'S SELF-REPORTED RESULT ---\n" + (candidate or "(empty)") + "\n\n"
+        "--- YOUR JOB ---\n"
+        "1. Inspect the actual changes on disk (git diff / read the files).\n"
+        "2. Build / run tests / run lint as applicable, and any check the criteria imply.\n"
+        "3. Decide if the task is genuinely, completely done and not broken.\n"
+        "You must FIX NOTHING. You have no Edit/Write tools on purpose.\n\n"
+        "END your final message with, on its own line, exactly:\n"
+        "  VERDICT: PASS   (if every criterion is met and nothing is broken)\n"
+        "  VERDICT: FAIL   (otherwise)\n"
+        "then 1-6 lines of concrete reasons: what you ran, what passed, what failed, "
+        "and for a FAIL the smallest change that would fix it."
+    )
+    return _spawn_native_agent(
+        task, VERIFY_CHECKER_TOOLS, state["cwd"],
+        f"verified-checker-r{it}",  # plain-alpha: no vid / hex -- see _spawn_verify_worker
+        permission_mode=None, disallowed_tools=None,
+        agent=(CHECKER_PERSONA if _persona_exists(CHECKER_PERSONA) else ""),
+        announce_plan=None,
+    )
+
+
+def _persona_exists(name):
+    return bool(name) and os.path.isfile(os.path.expanduser(f"~/.claude/agents/{name}.md"))
+
+
+def _fail_verified(state, report):
+    state["phase"] = "failed"
+    state["failure_report"] = report
+    _save_verified(state)
+    return f"FAILED: {report}"
+
+
+def _advance_verified(state):
+    """Move the run forward at most one transition. Returns a human-readable
+    one-liner describing the (possibly unchanged) phase. Saves on any change."""
+    phase = state["phase"]
+    if phase in ("passed", "failed"):
+        return f"{phase.upper()} (terminal)"
+
+    # Global wall-clock guard -- applies in any non-terminal phase.
+    elapsed = time.time() - state["created_at"]
+    if elapsed > state["timeout"]:
+        return _fail_verified(
+            state,
+            f"timeout after {int(elapsed)}s (limit {state['timeout']}s), "
+            f"stuck in phase '{phase}' on iteration {state['iteration']}",
+        )
+
+    it = state["iteration"]
+
+    if phase == "working":
+        wid = state["current_worker_id"]
+        st, sid = _agent_settled_state(wid)
+        if st in ("working", "blocked", "unknown"):
+            return f"iteration {it}/{state['max_iters']}: worker {wid} is {st}"
+        if st in _TERMINAL_BAD or st == "missing":
+            return _fail_verified(state, f"worker {wid} ended in state '{st}' on iteration {it}")
+        # worker settled OK -> grab its candidate answer, launch the checker
+        tr = _find_transcript(sid) if sid else None
+        candidate = (_last_assistant_text(tr) if tr else None) or ""
+        cand_hash = _result_hash(candidate)
+        prev_hash = state["history"][-1]["cand_hash"] if state["history"] else None
+        state["history"].append({
+            "iter": it, "worker_id": wid, "cand_hash": cand_hash,
+            "candidate": candidate, "checker_id": None, "verdict": None, "reasons": None,
+        })
+        # Stagnation: identical candidate two rounds running -> the loop cannot
+        # make progress, stop now instead of burning the remaining iterations.
+        if prev_hash is not None and cand_hash == prev_hash:
+            last_reasons = state["history"][-2].get("reasons") if len(state["history"]) >= 2 else None
+            return _fail_verified(
+                state,
+                "stagnation: worker produced a byte-identical result two rounds "
+                f"running without passing. Last checker feedback: {last_reasons or '(none)'}",
+            )
+        cid, err = _spawn_verify_checker(state, candidate)
+        if err:
+            return _fail_verified(state, f"could not spawn checker for iteration {it}: {err}")
+        state["history"][-1]["checker_id"] = cid
+        state["current_checker_id"] = cid
+        state["phase"] = "checking"
+        _save_verified(state)
+        return f"iteration {it}/{state['max_iters']}: worker done, checker {cid} launched"
+
+    if phase == "checking":
+        cid = state["current_checker_id"]
+        st, sid = _agent_settled_state(cid)
+        if st in ("working", "blocked", "unknown"):
+            return f"iteration {it}/{state['max_iters']}: checker {cid} is {st}"
+        if st in _TERMINAL_BAD or st == "missing":
+            return _fail_verified(state, f"checker {cid} ended in state '{st}' on iteration {it}")
+        tr = _find_transcript(sid) if sid else None
+        checker_text = (_last_assistant_text(tr) if tr else None) or ""
+        verdict = _parse_verdict(checker_text)
+        rec = state["history"][-1]
+        rec["verdict"] = verdict or "FAIL(no-verdict)"
+        rec["reasons"] = checker_text[-2000:]
+        if verdict == "PASS":
+            state["phase"] = "passed"
+            state["final_answer"] = rec["candidate"]
+            _save_verified(state)
+            return f"PASSED on iteration {it}/{state['max_iters']}"
+        # FAIL (or no parseable verdict) -> revise if we have iterations left
+        if it >= state["max_iters"]:
+            return _fail_verified(
+                state,
+                f"did not pass verification in {state['max_iters']} iteration(s). "
+                f"Last checker feedback: {(checker_text or '(none)')[-1200:]}",
+            )
+        state["iteration"] = it + 1
+        wid, err = _spawn_verify_worker(state)
+        if err:
+            return _fail_verified(state, f"could not spawn worker for iteration {it + 1}: {err}")
+        state["current_worker_id"] = wid
+        state["current_checker_id"] = None
+        state["phase"] = "working"
+        _save_verified(state)
+        return f"iteration {it} FAILED, revision round {it + 1} launched (worker {wid})"
+
+    return f"unknown phase '{phase}'"
+
+
+def _verify_trail(state):
+    """Compact per-iteration audit line for the status/result output."""
+    lines = []
+    for h in state["history"]:
+        lines.append(
+            f"  r{h['iter']}: worker {h['worker_id']} -> checker "
+            f"{h.get('checker_id') or '-'} -> {h.get('verdict') or 'pending'}"
+        )
+    return "\n".join(lines) if lines else "  (no iterations yet)"
+
+
+def delegate_verified(args):
+    task = args.get("task")
+    if not task or not isinstance(task, str):
+        return _error_result("`task` is required and must be a non-empty string.")
+
+    acceptance = args.get("acceptance_criteria")
+    if acceptance is not None and not isinstance(acceptance, str):
+        return _error_result("`acceptance_criteria`, if given, must be a string.")
+    cwd = args.get("cwd") or os.getcwd()
+    allowed_tools = args.get("allowed_tools") or DEFAULT_VERIFY_WORKER_TOOLS
+    try:
+        max_iters = int(args.get("max_iterations") or DEFAULT_MAX_VERIFY_ITERS)
+    except (TypeError, ValueError):
+        return _error_result("`max_iterations` must be an integer.")
+    max_iters = max(1, min(max_iters, 10))
+    try:
+        timeout = int(args.get("timeout_seconds") or DEFAULT_VERIFY_TIMEOUT)
+    except (TypeError, ValueError):
+        return _error_result("`timeout_seconds` must be an integer.")
+
+    vid = uuid.uuid4().hex[:12]
+    state = {
+        "vid": vid,
+        "created_at": time.time(),
+        "phase": "working",
+        "spec": task,
+        "acceptance": acceptance,
+        "cwd": cwd,
+        "allowed_tools": allowed_tools,
+        "max_iters": max_iters,
+        "timeout": timeout,
+        "iteration": 1,
+        "current_worker_id": None,
+        "current_checker_id": None,
+        "history": [],
+        "final_answer": None,
+        "failure_report": None,
+    }
+    wid, err = _spawn_verify_worker(state)
+    if err:
+        return _error_result(f"Failed to spawn the first worker: {err}")
+    state["current_worker_id"] = wid
+    _save_verified(state)
+
+    return {
+        "content": [{
+            "type": "text",
+            "text": (
+                f"Started a VERIFIED local delegation. vid: {vid}\n"
+                f"iteration 1/{max_iters}, worker agent: {wid} "
+                f"(also visible in `claude agents`).\n\n"
+                "This runs a closed work -> independent-check -> revise loop "
+                "ENTIRELY on the local model. Poll check_verified_status("
+                f"{vid!r}); it advances the loop one step per call. Call "
+                f"get_verified_result({vid!r}) only once it reports PASSED or "
+                "FAILED -- you then get a result a local checker has signed off "
+                "on, or a failure report with the checker's reasons. "
+                f"Guards: {max_iters} iterations max, stagnation detection, "
+                f"{timeout}s wall-clock."
+            ),
+        }],
+        "isError": False,
+    }
+
+
+def check_verified_status(args):
+    vid = args.get("vid") or args.get("run_id")
+    if not vid:
+        return _error_result("`vid` (from delegate_verified) is required.")
+    state = _load_verified(vid)
+    if state is None:
+        return _error_result(f"Unknown vid: {vid}")
+
+    line = _advance_verified(state)
+    phase = state["phase"]
+    elapsed = int(time.time() - state["created_at"])
+    text = (
+        f"verified run {vid}: phase = {phase} ({line})\n"
+        f"  elapsed: {elapsed}s / {state['timeout']}s   iterations: "
+        f"{state['iteration']}/{state['max_iters']}\n"
+        f"  trail:\n{_verify_trail(state)}"
+    )
+    if phase == "passed":
+        text += f"\n\nDONE -- call get_verified_result({vid!r}) for the signed-off answer."
+    elif phase == "failed":
+        text += (
+            f"\n\nSTOPPED -- call get_verified_result({vid!r}) for the failure report "
+            "plus the last candidate answer (not discarded)."
+        )
+    else:
+        text += "\n\nStill running. Poll check_verified_status again to advance it."
+    return {"content": [{"type": "text", "text": text}], "isError": False}
+
+
+def get_verified_result(args):
+    vid = args.get("vid") or args.get("run_id")
+    if not vid:
+        return _error_result("`vid` (from delegate_verified) is required.")
+    state = _load_verified(vid)
+    if state is None:
+        return _error_result(f"Unknown vid: {vid}")
+
+    _advance_verified(state)
+    phase = state["phase"]
+    if phase not in ("passed", "failed"):
+        return _error_result(
+            f"verified run {vid} is still {phase} (iteration "
+            f"{state['iteration']}/{state['max_iters']}). Call check_verified_status "
+            "until it reports PASSED or FAILED."
+        )
+
+    trail = _verify_trail(state)
+    if phase == "passed":
+        body = (
+            f"VERIFIED PASS -- vid {vid}, signed off on iteration {state['iteration']}"
+            f"/{state['max_iters']} by an independent local checker.\n\n"
+            f"--- VERIFICATION TRAIL ---\n{trail}\n\n"
+            f"--- SIGNED-OFF RESULT ---\n{state['final_answer'] or '(worker produced no text)'}"
+        )
+        return {"content": [{"type": "text", "text": body}], "isError": False}
+
+    last = state["history"][-1] if state["history"] else {}
+    body = (
+        f"VERIFIED FAIL -- vid {vid}. {state['failure_report']}\n\n"
+        f"--- VERIFICATION TRAIL ---\n{trail}\n\n"
+        f"--- LAST CHECKER FEEDBACK ---\n{(last.get('reasons') or '(none)')}\n\n"
+        f"--- LAST CANDIDATE (unverified, kept so it is not lost) ---\n"
+        f"{last.get('candidate') or '(none)'}\n\n"
+        "The working tree still holds the last worker's changes. Inspect them, or "
+        "re-run delegate_verified with tighter acceptance_criteria."
+    )
+    return {"content": [{"type": "text", "text": body}], "isError": True}
+
+
 # ---- tool schema (parent side only) ------------------------------------------
 
 PARENT_TOOLS = [
@@ -1084,6 +1503,78 @@ PARENT_TOOLS = [
         "description": "Read every agent's final answer from its native transcript for a fan_out_to_local batch. Errors until all agents are settled.",
         "inputSchema": {"type": "object", "properties": {"batch_id": {"type": "string"}}, "required": ["batch_id"]},
     },
+    {
+        "name": "delegate_verified",
+        "description": (
+            "Delegate a task to the local model AND have it independently verified "
+            "by a second local agent before you ever see the answer. Runs a closed "
+            "work -> check -> revise loop ENTIRELY on the local model: a worker "
+            "`claude --bg` agent does the task, then an adversarial checker agent "
+            "(no Edit/Write tools) re-verifies against the real working tree -- "
+            "reads the diff, builds, runs tests/lint -- and emits VERDICT: "
+            "PASS|FAIL. On FAIL the checker's reasons are fed back into a fresh "
+            "worker round. You get back ONLY a result a checker signed off on, or "
+            "a failure report with the reasons -- so the parent session never has "
+            "to review raw local-model output or remember to. Use this instead of "
+            "delegate_to_local when the task has a checkable outcome (code that "
+            "must build / pass tests / meet stated criteria). Returns a `vid` "
+            "immediately; poll check_verified_status(vid) to advance the loop "
+            "(one step per call, nothing blocks), then get_verified_result(vid) "
+            "once it says PASSED or FAILED. Guards against runaway loops: "
+            f"{DEFAULT_MAX_VERIFY_ITERS} iterations max (override with "
+            "max_iterations), stagnation detection (identical result twice -> "
+            f"stop), and a {DEFAULT_VERIFY_TIMEOUT}s wall-clock ceiling."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "The self-contained task for the worker. Include exact paths and what 'done' means. The worker starts with no memory of this conversation."},
+                "acceptance_criteria": {"type": "string", "description": "Explicit pass/fail conditions the checker must confirm (e.g. 'pytest -q is green', 'ruff check passes', 'CLI prints X for input Y'). STRONGLY recommended -- without it the checker only derives its own best-guess checks and the gate is weak."},
+                "allowed_tools": {"type": "string", "description": f"Comma-separated tools for the WORKER. Defaults to '{DEFAULT_VERIFY_WORKER_TOOLS}' (it must be able to change code). The checker's tools are fixed at '{VERIFY_CHECKER_TOOLS}' -- no Edit/Write, on purpose."},
+                "cwd": {"type": "string", "description": "Working directory for both worker and checker. Defaults to this server's cwd."},
+                "max_iterations": {"type": "integer", "description": f"Max work->check rounds before giving up. Default {DEFAULT_MAX_VERIFY_ITERS}, clamped to 1..10."},
+                "timeout_seconds": {"type": "integer", "description": f"Wall-clock ceiling for the whole loop. Default {DEFAULT_VERIFY_TIMEOUT}. Past this the run is force-failed."},
+            },
+            "required": ["task"],
+        },
+    },
+    {
+        "name": "check_verified_status",
+        "description": (
+            "Advance and report a delegate_verified run. Each call moves the "
+            "work->check->revise state machine forward at most one step by "
+            "reading the sub-agents' native state -- so poll this the way you'd "
+            "poll check_delegate_status. Shows the current phase (working / "
+            "checking / passed / failed), elapsed vs timeout, iteration count, "
+            "and a per-round trail (worker id -> checker id -> verdict). When it "
+            "reports PASSED or FAILED, call get_verified_result."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vid": {"type": "string", "description": "The vid returned by delegate_verified."},
+            },
+            "required": ["vid"],
+        },
+    },
+    {
+        "name": "get_verified_result",
+        "description": (
+            "Fetch the outcome of a delegate_verified run. Errors (with the "
+            "current phase) until the loop has settled. On PASS: the signed-off "
+            "worker answer plus the verification trail. On FAIL: the failure "
+            "reason (iteration cap / stagnation / timeout / crashed sub-agent), "
+            "the last checker's feedback, and the last candidate answer (kept, "
+            "not discarded -- the working tree still has its changes)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vid": {"type": "string", "description": "The vid returned by delegate_verified."},
+            },
+            "required": ["vid"],
+        },
+    },
 ]
 
 
@@ -1100,6 +1591,9 @@ TOOL_HANDLERS = {
     "fan_out_to_local": fan_out_to_local,
     "check_fanout_status": check_fanout_status,
     "get_fanout_result": get_fanout_result,
+    "delegate_verified": delegate_verified,
+    "check_verified_status": check_verified_status,
+    "get_verified_result": get_verified_result,
 }
 TOOLS = PARENT_TOOLS
 
