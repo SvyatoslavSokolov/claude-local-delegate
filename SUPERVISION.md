@@ -1,5 +1,20 @@
 # Supervising a Delegated Background Agent
 
+## Before you delegate: writing the task
+
+This file is about a run that already exists. The task text is what decides whether it
+succeeds — see **[TASK_DESIGN.md](TASK_DESIGN.md)** for the briefing rules distilled from
+real failures (consumer discovery as a precondition, why `py_compile` never proves an
+import move, oracle + wrong-direction control for numeric refactors, one file per task
+with the anchors pre-found, pinning the exact environment in every command).
+
+Note the division of labour: `~/.claude/agents/local-worker.md` is the **persona** — it
+governs how the agent behaves in any task (run a real check, show the output, list
+assumptions, say what it could not verify). `TASK_DESIGN.md` is for **you**, the caller —
+the per-task facts the persona cannot know: which line the anchor is on, which callers
+must be checked first, which interpreter in the container actually sees the package.
+
+
 A short operator guide for the parent Claude Code session that owns a
 delegated `claude --bg` run. You see only the child's plain-text messages —
 use these MCP tools to watch, intervene, and redirect.
