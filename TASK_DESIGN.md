@@ -397,7 +397,11 @@ against one local model; an earlier attempt at eight produced the same simultane
 signature. The drops are `The response stopped arriving`, not the output-token cap — raising
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` does nothing for them. Treat the pool size as a tuning knob
 with evidence behind it: when several agents drop within the same minute, that is load, not
-coincidence, and the fix is fewer of them, not a bigger cap.
+coincidence, and the fix is fewer of them, not a bigger cap. `project_sync` now reports the
+real headroom (`pool.local_running` / `pool.headroom`), counting only delegates recorded as
+running on the local backend — a paid background session no longer occupies a slot it never
+used. `contrib/bench_concurrency.py` measures where the ceiling actually sits (levels 1/2/4/8
+into CSV); run it on an idle GPU before trusting a number.
 - **Split the question.** Two 15-step tasks beat one 40-step task, and their failures are
   independent.
 

@@ -73,7 +73,7 @@ import uuid
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "claude-local-delegate"
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.8.0"
 
 # Where the local backend profile lives (ANTHROPIC_BASE_URL -> vLLM/LiteLLM,
 # model env, etc). This is what the spawned `claude --bg` agents use, so they
@@ -110,9 +110,42 @@ BATCHES_DIR = os.environ.get(
     "CLAUDE_LOCAL_DELEGATE_BATCHES_DIR",
     os.path.expanduser("~/.claude-local-delegate/batches"),
 )
+# Shared state root (same variable coordination_runtime.py uses).
+STATE_DIR = os.environ.get(
+    "CLAUDE_LOCAL_DELEGATE_STATE_DIR", os.path.expanduser("~/.claude-local-delegate"),
+)
+# Model-routing provenance: which backend each spawned run ACTUALLY went to.
+# The native roster (`claude agents --json`) reports no model, so without this
+# record a paid Anthropic background session is indistinguishable from a local
+# vLLM one -- and the pool ceiling below would count it against the GPU it never
+# touches. Every spawn this server performs is written here; anything absent is
+# by definition not ours and not local.
+PROVENANCE_PATH = os.path.join(STATE_DIR, "runs.json")
+PROVENANCE_KEEP = 500
+# Tools that cannot change the machine. An allowlist of only these is a genuinely
+# read-only delegation -- and only then is `dontAsk` safe as the permission mode.
+READ_ONLY_TOOLS = frozenset({"Read", "Grep", "Glob", "NotebookRead", "TodoWrite"})
+# bypassPermissions IGNORES --allowedTools (documented; anthropics/claude-code#12232),
+# so a "read-only" delegate spawned in bypass could still run anything it asked
+# for. dontAsk enforces the allowlist instead: unlisted tools are DENIED, not
+# prompted, so the agent stays unattended-safe without gaining shell.
+READ_ONLY_PERMISSION_MODE = os.environ.get(
+    "CLAUDE_LOCAL_DELEGATE_READONLY_PERMISSION_MODE", "dontAsk",
+)
+
 # vLLM concurrency ceiling from this stack (--max-num-seqs). Not enforced here;
 # fan_out_to_local only warns past it (see README).
 LOCAL_SERVER_MAX_CONCURRENCY = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY", "16"))
+
+# Result compaction. A fan-out of 8 agents returning their full final answers
+# used to paste all 8 in one tool result; the parent pays for every line of it.
+# Default is a tail plus a sha256 of the full text; `full: true` still returns
+# everything, and the transcript on disk is never truncated.
+DEFAULT_RESULT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_RESULT_LINES", "40"))
+DEFAULT_FANOUT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_FANOUT_LINES", "15"))
+# How much of the worker's self-report the checker is shown. Its evidence comes
+# from git and from re-running things, not from the worker's prose.
+CHECKER_REPORT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_CHECKER_REPORT_LINES", "30"))
 
 # ---- verified-delegation loop ----------------------------------------------
 # delegate_verified runs a CLOSED work->check->revise loop entirely on the local
@@ -199,6 +232,52 @@ DEFAULT_ANNOUNCE_PLAN = os.environ.get(
 ).strip().lower() not in ("0", "false", "no", "")
 
 
+# ---- routing provenance ------------------------------------------------------
+
+def _is_read_only(allowed_tools):
+    granted = {t.strip() for t in (allowed_tools or DEFAULT_ALLOWED_TOOLS).split(",") if t.strip()}
+    return bool(granted) and granted.issubset(READ_ONLY_TOOLS)
+
+
+def _load_provenance():
+    try:
+        with open(PROVENANCE_PATH) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    runs = data.get("runs")
+    return runs if isinstance(runs, dict) else {}
+
+
+def _record_provenance(run_id, entry):
+    """Append one spawn record. Best-effort: provenance must never fail a spawn."""
+    try:
+        runs = _load_provenance()
+        runs[run_id] = entry
+        if len(runs) > PROVENANCE_KEEP:
+            keep = sorted(runs.items(), key=lambda kv: kv[1].get("at", 0))[-PROVENANCE_KEEP:]
+            runs = dict(keep)
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = PROVENANCE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"runs": runs}, f)
+        os.replace(tmp, PROVENANCE_PATH)
+    except OSError:
+        pass
+
+
+def _provenance_for(run_id):
+    return _load_provenance().get(run_id)
+
+
+def _settings_fingerprint(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
 # ---- native agent spawning ---------------------------------------------------
 
 def _slug_from_task(task, max_words=6):
@@ -224,7 +303,8 @@ def _default_agent():
 
 
 def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
-                        disallowed_tools=None, agent=None, announce_plan=None):
+                        disallowed_tools=None, agent=None, announce_plan=None,
+                        resume_session=None):
     """Spawn ONE native `claude --bg` agent on the local model.
 
     Returns (short_id, None) on success or (None, error_message).
@@ -265,7 +345,13 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     # delegations unboundedly. Disallow the whole claude-local-delegate server.
     if "mcp__claude-local-delegate" not in disallowed:
         disallowed.append("mcp__claude-local-delegate")
-    pmode = permission_mode or DEFAULT_PERMISSION_MODE
+    # Least privilege that actually holds: an allowlist is only enforced outside
+    # bypassPermissions, so a read-only delegation runs in dontAsk (see the
+    # READ_ONLY_PERMISSION_MODE note). Writers still default to bypass, because
+    # an unattended agent that prompts is an agent that hangs.
+    pmode = permission_mode or (
+        READ_ONLY_PERMISSION_MODE if _is_read_only(allowed_tools) else DEFAULT_PERMISSION_MODE
+    )
     # agent=None means "use the default persona"; agent="" means "no persona".
     pagent = _default_agent() if agent is None else agent
     # Wrap the task so the delegated agent narrates its plan/steps in plain text
@@ -273,12 +359,21 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     want_plan = DEFAULT_ANNOUNCE_PLAN if announce_plan is None else bool(announce_plan)
     effective_task = (SUPERVISED_PREAMBLE + task) if want_plan else task
 
+    from local_backend import environment, profile
+    try:
+        backend_env = environment(settings_path)
+        backend_model = profile(settings_path)["ANTHROPIC_MODEL"]
+    except (OSError, ValueError) as exc:
+        return None, f"Invalid local backend profile: {exc}"
+
     cmd = [
-        CLAUDE_BIN, "--bg",
+        CLAUDE_BIN, "--settings", settings_path, "--bg",
+        "--model", backend_model,
         "--name", name,
-        "--settings", settings_path,
         "--permission-mode", pmode,
     ]
+    if resume_session:
+        cmd += ["--resume", resume_session, "--fork-session"]
     if pagent:
         cmd += ["--agent", pagent]
     # MCP servers (ParallelSearch, context7, ...) come from USER SCOPE
@@ -300,7 +395,7 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
 
     try:
         proc = subprocess.run(
-            cmd, cwd=cwd,
+            cmd, cwd=cwd, env=backend_env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
         )
     except FileNotFoundError:
@@ -313,6 +408,20 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
         return None, f"claude --bg exited {proc.returncode}.\n{out.strip()[-1500:]}"
 
     short_id = _parse_bg_id(out)
+    if short_id:
+        _record_provenance(short_id, {
+            "at": time.time(),
+            "backend": "local",
+            "model": backend_model,
+            "base_url": backend_env.get("ANTHROPIC_BASE_URL", ""),
+            "settings_path": settings_path,
+            "settings_sha": _settings_fingerprint(settings_path),
+            "permission_mode": pmode,
+            "allowed_tools": tools,
+            "read_only": _is_read_only(allowed_tools),
+            "cwd": cwd,
+            "name": name,
+        })
     if not short_id:
         return None, (
             "Spawned but could not parse the agent id from "
@@ -424,18 +533,7 @@ def _first_user_text(transcript_path):
     """The original prompt the agent was spawned with = the first user event that
     carries real text (later user events are tool_results). Used by watch_delegate
     so the parent can see WHAT the agent was told without re-reading anything."""
-    for e in _iter_events(transcript_path):
-        if e.get("type") != "user":
-            continue
-        content = e.get("message", {}).get("content", [])
-        if isinstance(content, str):
-            if content.strip():
-                return content.strip()
-            continue
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text" and item.get("text", "").strip():
-                return item["text"].strip()
-    return None
+    return _transcript_summary(transcript_path)["prompt"]
 
 
 def _strip_preamble(prompt):
@@ -445,20 +543,53 @@ def _strip_preamble(prompt):
     return prompt
 
 
-def _narration_digest(transcript_path, max_lines=48):
-    """Token-cheap supervision view: the agent's assistant plain-text messages in
-    order, each tool_use collapsed to a ONE-LINE label, and tool RESULTS dropped
-    entirely. This is what a human watching the agent think would see, minus the
-    code / file dumps -- the whole point of 'read its messages, not its output'.
-    max_lines <= 0 returns everything."""
+# One pass, one cache. check_delegate_status used to walk the whole JSONL twice
+# per poll (digest + usage); on a 500k-token session that is the dominant cost of
+# supervision. _transcript_summary walks once and memoises on (size, mtime), so
+# polling a finished or idle agent is free and polling a live one costs one pass.
+_SUMMARY_CACHE = {}
+_SUMMARY_CACHE_MAX = 32
+_DIGEST_KEEP = 400  # bound memory: nobody reads more narration than this
+
+
+def _transcript_summary(transcript_path):
+    """{'prompt', 'digest', 'input', 'output', 'turns'} from ONE pass over the
+    transcript, cached per (path, size, mtime). digest holds at most the last
+    _DIGEST_KEEP lines -- the supervision view never shows more."""
+    try:
+        st = os.stat(transcript_path)
+        key = (transcript_path, st.st_size, st.st_mtime_ns)
+    except OSError:
+        key = None
+    if key is not None:
+        hit = _SUMMARY_CACHE.get(key)
+        if hit is not None:
+            return hit
+
+    prompt = None
     lines = []
+    inp = out = turns = 0
     step = 0
     for e in _iter_events(transcript_path):
-        if e.get("type") != "assistant":
-            continue
+        kind = e.get("type")
         content = e.get("message", {}).get("content", [])
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
+        if kind == "user":
+            if prompt is None:
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text" and item.get("text", "").strip():
+                        prompt = item["text"].strip()
+                        break
+            continue
+        if kind != "assistant":
+            continue
+        u = e.get("message", {}).get("usage", {}) or {}
+        inp += ((u.get("input_tokens") or 0)
+                + (u.get("cache_read_input_tokens") or 0)
+                + (u.get("cache_creation_input_tokens") or 0))
+        out += u.get("output_tokens") or 0
+        turns += 1
         for item in content:
             if not isinstance(item, dict):
                 continue
@@ -466,10 +597,29 @@ def _narration_digest(transcript_path, max_lines=48):
                 step += 1
                 lines.append(f"[{step}] {item['text'].strip()}")
             elif item.get("type") == "tool_use":
-                inp = json.dumps(item.get("input", {}), ensure_ascii=False)
-                if len(inp) > 140:
-                    inp = inp[:140] + "…"
-                lines.append(f"      · {item.get('name')} {inp}")
+                raw = json.dumps(item.get("input", {}), ensure_ascii=False)
+                if len(raw) > 140:
+                    raw = raw[:140] + "\u2026"
+                lines.append(f"      \u00b7 {item.get('name')} {raw}")
+        if len(lines) > _DIGEST_KEEP * 2:
+            del lines[:-_DIGEST_KEEP]
+
+    summary = {"prompt": prompt, "digest": lines[-_DIGEST_KEEP:],
+               "input": inp, "output": out, "turns": turns}
+    if key is not None:
+        if len(_SUMMARY_CACHE) >= _SUMMARY_CACHE_MAX:
+            _SUMMARY_CACHE.clear()
+        _SUMMARY_CACHE[key] = summary
+    return summary
+
+
+def _narration_digest(transcript_path, max_lines=48):
+    """Token-cheap supervision view: the agent's assistant plain-text messages in
+    order, each tool_use collapsed to a ONE-LINE label, and tool RESULTS dropped
+    entirely. This is what a human watching the agent think would see, minus the
+    code / file dumps -- the whole point of 'read its messages, not its output'.
+    max_lines <= 0 returns everything retained (at most _DIGEST_KEEP lines)."""
+    lines = _transcript_summary(transcript_path)["digest"]
     if max_lines and max_lines > 0:
         return lines[-max_lines:]
     return lines
@@ -479,17 +629,8 @@ def _token_usage(transcript_path):
     """(input_plus_cache, output, model_turns) summed from the transcript's
     assistant usage blocks. Directly answers 'how many tokens is this session
     generating' -- the number the sessions-vs-throughput tuning needs."""
-    inp = out = turns = 0
-    for e in _iter_events(transcript_path):
-        if e.get("type") != "assistant":
-            continue
-        u = e.get("message", {}).get("usage", {}) or {}
-        inp += ((u.get("input_tokens") or 0)
-                + (u.get("cache_read_input_tokens") or 0)
-                + (u.get("cache_creation_input_tokens") or 0))
-        out += u.get("output_tokens") or 0
-        turns += 1
-    return inp, out, turns
+    s = _transcript_summary(transcript_path)
+    return s["input"], s["output"], s["turns"]
 
 
 def _tail_transcript(transcript_path, max_events=24):
@@ -634,20 +775,34 @@ def check_status(args):
 
     # Cheap always-on supervision: the task it was given, its last plain sentence,
     # and tokens burned so far -- so "watch them always" costs almost nothing.
+    # Recorded at spawn time, not inferred: the native roster carries no model,
+    # so this is the only honest answer to "which backend ran this?".
+    prov = _provenance_for(agent.get("id"))
+    if prov:
+        host = (prov.get("base_url") or "").split("//")[-1].rstrip("/")
+        text += (f"\n  backend: {prov.get('model')} @ {host} "
+                 f"(recorded local delegate, {prov.get('permission_mode')})")
+    else:
+        text += ("\n  backend: NOT recorded by this server -- it is not a delegate this "
+                 "MCP spawned (a paid session, or spawned before provenance existed).")
+
+    # ONE pass over the transcript for prompt + narration + tokens (it used to be
+    # two full walks per poll, which is what made polling a long session costly).
     tr_watch = _find_transcript(session_id) if session_id else None
     if tr_watch:
-        prompt = _strip_preamble(_first_user_text(tr_watch))
+        summary = _transcript_summary(tr_watch)
+        prompt = _strip_preamble(summary["prompt"])
         if prompt:
             oneline = " ".join(prompt.split())
             text += f"\n  task: {oneline[:200]}" + ("…" if len(oneline) > 200 else "")
         last_said = ""
-        for ln in _narration_digest(tr_watch, max_lines=0):
+        for ln in summary["digest"]:
             if ln.startswith("["):
                 last_said = ln
         if last_said:
             text += f"\n  last said: {last_said[:280]}"
-        inp, out, turns = _token_usage(tr_watch)
-        text += f"\n  cost so far: ~{out:,} output tokens over {turns} model turns"
+        text += (f"\n  cost so far: ~{summary['output']:,} output tokens over "
+                 f"{summary['turns']} model turns")
 
     # If the agent is `blocked` (the native "needs input" state), classify WHY and
     # surface its last words so the parent (main model) can act without re-reading
@@ -670,6 +825,38 @@ def check_status(args):
         )
 
     return {"content": [{"type": "text", "text": text}], "isError": False}
+
+
+def _compact(text, max_lines, label, how_to_get_full):
+    """Tail-first compression for tool output that lands in the PARENT's context.
+    A delegate's final answer can be thousands of lines; the parent almost always
+    needs the conclusion plus a handle to the rest. Returns (body, was_trimmed).
+    The sha256 makes the elision auditable -- the full text is still on disk."""
+    text = text or ""
+    lines = text.splitlines()
+    head_lines = 4
+    # Compacting has to actually remove something, or the "elided" count goes
+    # negative and the reader pays the framing for nothing.
+    if max_lines <= 0 or len(lines) <= max_lines + head_lines:
+        return text, False
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+    head = "\n".join(lines[:head_lines])
+    tail = "\n".join(lines[-max_lines:])
+    return (
+        f"[{label}: showing first {head_lines} + last {max_lines} of {len(lines)} lines "
+        f"({len(text):,} chars, sha256:{digest}). {how_to_get_full}]\n"
+        f"{head}\n\n        \u2026 [{len(lines) - max_lines - head_lines} lines elided] \u2026\n\n{tail}"
+    ), True
+
+
+def _result_max_lines(args, default):
+    if args.get("full"):
+        return 0
+    try:
+        value = int(args.get("max_lines"))
+    except (TypeError, ValueError):
+        return default
+    return default if value == 0 else value
 
 
 def get_result(args):
@@ -709,6 +896,11 @@ def get_result(args):
             f"{agent.get('id')}`."
         )
 
+    body, trimmed = _compact(
+        result_text, _result_max_lines(args, DEFAULT_RESULT_LINES),
+        "compacted", f"call get_delegate_result({handle!r}, full=true) for the whole text",
+    )
+    result_text = body
     footer = (
         f"\n\n-- native agent id {agent.get('id')}, session {session_id}, "
         f"state {state}. This is the agent's own final answer from its transcript; "
@@ -951,6 +1143,10 @@ def get_fanout_result(args):
             continue
         tr = _find_transcript(sid)
         txt = _last_assistant_text(tr) if tr else "(no transcript found)"
+        txt, _ = _compact(
+            txt, _result_max_lines(args, DEFAULT_FANOUT_LINES), "compacted",
+            f"call get_delegate_result({aid!r}, full=true) for this item's whole text",
+        )
         parts.append(f"--- item {i + 1}/{len(batch['agent_ids'])} [{aid}] ---\n{txt}")
 
     if incomplete:
@@ -1026,6 +1222,45 @@ _TERMINAL_OK = ("completed", "done", "idle")
 _TERMINAL_BAD = ("failed", "stopped")
 
 
+def _git_evidence(cwd):
+    """(porcelain_status, diffstat) for cwd, or (None, None) when it is not a git
+    repo. This is the checker's brief: what actually changed on disk, from git,
+    not from the worker's own account of itself."""
+    def run(argv):
+        try:
+            proc = subprocess.run(["git", "-C", cwd, *argv], stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.decode("utf-8", "replace")
+
+    status = run(["status", "--porcelain"])
+    if status is None:
+        return None, None
+    return status, (run(["diff", "--stat", "HEAD"]) or "")
+
+
+def _skip_verification(state):
+    """Why a checker round would be pure cost, or None if it must run.
+
+    A verifier doubles the round-trip. It earns that when there is something
+    objective to check: stated criteria, or changes on disk. A read-only lookup
+    with no criteria has neither -- the checker can only re-read the same files
+    and re-state an opinion."""
+    if state.get("always_verify") or state.get("acceptance"):
+        return None
+    if _is_read_only(state.get("allowed_tools")):
+        return ("read-only delegation with no acceptance criteria: nothing changed "
+                "on disk for an independent checker to verify")
+    status, _ = _git_evidence(state["cwd"])
+    if status is not None and not status.strip():
+        return ("no acceptance criteria and `git status --porcelain` is clean: the "
+                "worker changed nothing for a checker to verify")
+    return None
+
+
 def _spawn_verify_worker(state):
     """Spawn the worker for the current iteration. On the first round the task is
     the raw spec; on later rounds the previous checker's reasons are prepended as
@@ -1065,6 +1300,7 @@ def _spawn_verify_checker(state, candidate):
     it = state["iteration"]
     spec = state["spec"]
     accept = state.get("acceptance")
+    status, diffstat = _git_evidence(state["cwd"])
     task = (
         "You are the INDEPENDENT VERIFIER for a task another agent just did in "
         f"this working directory ({state['cwd']}). Do NOT trust its self-report; "
@@ -1073,8 +1309,18 @@ def _spawn_verify_checker(state, candidate):
         + (("--- ACCEPTANCE CRITERIA ---\n" + accept + "\n\n") if accept else
            "--- ACCEPTANCE CRITERIA ---\n(none supplied -- derive reasonable checks "
            "from the task itself and say which you used)\n\n")
-        + "--- WORKER'S SELF-REPORTED RESULT ---\n" + (candidate or "(empty)") + "\n\n"
-        "--- YOUR JOB ---\n"
+        # The worker's self-report is a claim, not evidence, and its size scales
+        # with the work; git's account of the tree does not. Send the tail of the
+        # claim plus the real diffstat, so the checker's context stays flat.
+        + "--- WORKER'S SELF-REPORTED RESULT (tail; a claim, not evidence) ---\n"
+        + _compact(candidate or "(empty)", CHECKER_REPORT_LINES, "tail",
+                   "the full text is in the worker's transcript")[0] + "\n\n"
+        + (("--- WHAT ACTUALLY CHANGED ON DISK (git) ---\n"
+            + "git status --porcelain:\n" + (status.strip() or "(clean)") + "\n\n"
+            + "git diff --stat HEAD:\n" + (diffstat.strip() or "(no tracked changes)") + "\n\n")
+           if status is not None else
+           "--- WHAT ACTUALLY CHANGED ON DISK ---\n(not a git repository; inspect the files yourself)\n\n")
+        + "--- YOUR JOB ---\n"
         "1. Inspect the actual changes on disk (git diff / read the files).\n"
         "2. Build / run tests / run lint as applicable, and any check the criteria imply.\n"
         "3. Decide if the task is genuinely, completely done and not broken.\n"
@@ -1148,6 +1394,15 @@ def _advance_verified(state):
                 "stagnation: worker produced a byte-identical result two rounds "
                 f"running without passing. Last checker feedback: {last_reasons or '(none)'}",
             )
+        skip = _skip_verification(state)
+        if skip:
+            state["history"][-1]["verdict"] = "PASS(unverified)"
+            state["history"][-1]["reasons"] = "checker skipped: " + skip
+            state["skipped_verification"] = skip
+            state["phase"] = "passed"
+            state["final_answer"] = candidate
+            _save_verified(state)
+            return f"PASSED on iteration {it} WITHOUT a checker ({skip})"
         cid, err = _spawn_verify_checker(state, candidate)
         if err:
             return _fail_verified(state, f"could not spawn checker for iteration {it}: {err}")
@@ -1235,6 +1490,8 @@ def delegate_verified(args):
         "acceptance": acceptance,
         "cwd": cwd,
         "allowed_tools": allowed_tools,
+        "always_verify": bool(args.get("always_verify")),
+        "skipped_verification": None,
         "max_iters": max_iters,
         "timeout": timeout,
         "iteration": 1,
@@ -1325,6 +1582,14 @@ def get_verified_result(args):
             f"--- VERIFICATION TRAIL ---\n{trail}\n\n"
             f"--- SIGNED-OFF RESULT ---\n{state['final_answer'] or '(worker produced no text)'}"
         )
+        if state.get("skipped_verification"):
+            body = (
+                f"UNVERIFIED PASS -- vid {vid}. No checker ran: {state['skipped_verification']}. "
+                "Review this yourself, or re-run with acceptance_criteria (or always_verify=true) "
+                "to force an independent check.\n\n"
+                f"--- TRAIL ---\n{trail}\n\n"
+                f"--- RESULT ---\n{state['final_answer'] or '(worker produced no text)'}"
+            )
         return {"content": [{"type": "text", "text": body}], "isError": False}
 
     last = state["history"][-1] if state["history"] else {}
@@ -1376,7 +1641,7 @@ PARENT_TOOLS = [
                 "allowed_tools": {"type": "string", "description": f"Comma-separated tools the agent may use without prompting. Defaults to read-only ('{DEFAULT_ALLOWED_TOOLS}'). Widen only when it must write files or run commands -- it runs unsupervised."},
                 "cwd": {"type": "string", "description": "Working directory for the agent. Defaults to this server's cwd."},
                 "name": {"type": "string", "description": "Optional display name for the agent (shown in `claude agents`). Defaults to a short slug of the task."},
-                "permission_mode": {"type": "string", "description": f"Native --permission-mode for the background agent. Defaults to '{DEFAULT_PERMISSION_MODE}' so the unattended agent runs its full granted toolset (Bash included) without approval gates -- a delegated agent that prompts on Bash would park forever with no one to approve. Set to 'acceptEdits' (Bash gated) or 'default' (everything prompts) to narrow a specific delegation, or 'auto' for the classifier-gated middle ground."},
+                "permission_mode": {"type": "string", "description": f"Native --permission-mode for the background agent. A READ-ONLY allowlist (Read/Grep/Glob) defaults to '{READ_ONLY_PERMISSION_MODE}', where the allowlist is actually enforced; anything wider defaults to '{DEFAULT_PERMISSION_MODE}' so the unattended agent runs its full granted toolset (Bash included) without approval gates -- a delegated agent that prompts on Bash would park forever with no one to approve. Set to 'acceptEdits' (Bash gated) or 'default' (everything prompts) to narrow a specific delegation, or 'auto' for the classifier-gated middle ground."},
                 "disallowed_tools": {"type": "string", "description": "Comma-separated tools to strip from the agent (e.g. 'Bash'). Useful when a user-level hook/gate blocks a tool the agent would reach for on its own -- disallowing that tool forces the agent onto a path it can complete. Default: none."},
                 "agent": {"type": "string", "description": f"Subagent-definition persona to run the delegation as (its system prompt). Defaults to 'local-worker' (~/.claude/agents/local-worker.md: verifies by running a check, returns evidence, states assumptions). Pass another installed agent name to override, or empty string to run with no persona."},
                 "announce_plan": {"type": "boolean", "description": f"Prepend the supervision preamble that makes the agent post a numbered plan first and narrate each step in one plain sentence (what watch_delegate shows the parent). Default {DEFAULT_ANNOUNCE_PLAN}. Set false only for a trivial one-shot where narration is noise."},
@@ -1390,7 +1655,9 @@ PARENT_TOOLS = [
             "Read the NATIVE state of a delegated background agent by its id (from "
             "delegate_to_local): working / blocked / completed / failed / stopped. "
             "Also surfaces, cheaply, the task it was given, its last plain-text "
-            "sentence, and output tokens burned so far. 'blocked' is the agent's "
+            "sentence, and output tokens burned so far. Poll at the pace the agent "
+            "works (a step takes tens of seconds), not in a tight loop. "
+            "'blocked' is the agent's "
             "native 'I need input' signal -- its last words (its question) are shown "
             "so you can answer with the native SendMessage tool. For the full "
             "step-by-step narration use watch_delegate. Does not touch the model."
@@ -1410,12 +1677,16 @@ PARENT_TOOLS = [
             "Errors if the agent is still working/blocked -- call check_delegate_status "
             "first. IMPORTANT: review this before treating it as final; a local-model "
             "agent can produce plausible-looking but subtly wrong output that only a "
-            "read-through catches."
+            "read-through catches. Compacted by default (first lines + last "
+            f"{DEFAULT_RESULT_LINES} lines + a sha256 of the full text) so a long "
+            "answer does not flood this session; pass full=true for everything."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "run_id": {"type": "string", "description": "The agent id returned by delegate_to_local."},
+                "full": {"type": "boolean", "description": "Return the entire final answer instead of the compacted tail. Default false."},
+                "max_lines": {"type": "integer", "description": f"Tail size when compacting. Default {DEFAULT_RESULT_LINES}; <0 means no limit."},
             },
             "required": ["run_id"],
         },
@@ -1476,7 +1747,11 @@ PARENT_TOOLS = [
             "its own window; chunking also tends to beat one huge context on accuracy). "
             "Returns immediately with a batch_id; poll check_fanout_status, then "
             "get_fanout_result once all settle. The real ceiling is the local server's "
-            "concurrency/KV-cache pool, not the number of items."
+            "concurrency/KV-cache pool, not the number of items. PREFIX CACHING: "
+            "`shared_instruction` is placed FIRST in every item's prompt, so all children "
+            "share one token prefix and vLLM reuses its KV blocks -- only the first child "
+            "pays that prefill. Put everything common in `shared_instruction` and keep "
+            "`items` short and distinct; per-item preamble throws that reuse away."
         ),
             "inputSchema": {
                 "type": "object",
@@ -1500,8 +1775,18 @@ PARENT_TOOLS = [
     },
     {
         "name": "get_fanout_result",
-        "description": "Read every agent's final answer from its native transcript for a fan_out_to_local batch. Errors until all agents are settled.",
-        "inputSchema": {"type": "object", "properties": {"batch_id": {"type": "string"}}, "required": ["batch_id"]},
+        "description": (
+            "Read every agent's final answer from its native transcript for a "
+            "fan_out_to_local batch. Errors until all agents are settled. Each item is "
+            f"compacted to its last {DEFAULT_FANOUT_LINES} lines plus a sha256 by default "
+            "(N full answers in one tool result is the single biggest context cost of a "
+            "fan-out); pass full=true, or fetch one item with get_delegate_result(agent_id, full=true)."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "batch_id": {"type": "string"},
+            "full": {"type": "boolean", "description": "Return every item's whole answer. Default false."},
+            "max_lines": {"type": "integer", "description": f"Per-item tail size. Default {DEFAULT_FANOUT_LINES}."},
+        }, "required": ["batch_id"]},
     },
     {
         "name": "delegate_verified",
@@ -1532,6 +1817,7 @@ PARENT_TOOLS = [
                 "acceptance_criteria": {"type": "string", "description": "Explicit pass/fail conditions the checker must confirm (e.g. 'pytest -q is green', 'ruff check passes', 'CLI prints X for input Y'). STRONGLY recommended -- without it the checker only derives its own best-guess checks and the gate is weak."},
                 "allowed_tools": {"type": "string", "description": f"Comma-separated tools for the WORKER. Defaults to '{DEFAULT_VERIFY_WORKER_TOOLS}' (it must be able to change code). The checker's tools are fixed at '{VERIFY_CHECKER_TOOLS}' -- no Edit/Write, on purpose."},
                 "cwd": {"type": "string", "description": "Working directory for both worker and checker. Defaults to this server's cwd."},
+                "always_verify": {"type": "boolean", "description": "Force the checker round even when there is nothing objective to verify. By default a run with no acceptance_criteria that changed nothing on disk (or was read-only) returns the worker's answer WITHOUT spending a second local round-trip on a checker that could only re-state an opinion."},
                 "max_iterations": {"type": "integer", "description": f"Max work->check rounds before giving up. Default {DEFAULT_MAX_VERIFY_ITERS}, clamped to 1..10."},
                 "timeout_seconds": {"type": "integer", "description": f"Wall-clock ceiling for the whole loop. Default {DEFAULT_VERIFY_TIMEOUT}. Past this the run is force-failed."},
             },
@@ -1654,4 +1940,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from coordination_runtime import install
+    install(sys.modules[__name__])
     main()

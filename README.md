@@ -14,6 +14,87 @@ Parent-side tools: `delegate_to_local`, `check_delegate_status`,
 `get_verified_result`, `fan_out_to_local`,
 `check_fanout_status`, `get_fanout_result`.
 
+## 0.8 — cheaper results, enforced least-privilege, and spawn provenance
+
+v0.8.0 makes supervision cheaper and the defaults honest. The headline changes:
+
+- **Result compaction.** `get_delegate_result` returns the first 4 + last 40
+  lines of the agent's final answer plus a `sha256` of the full text, instead of
+  the whole thing. `full: true` returns everything; `max_lines` sets the tail.
+  `get_fanout_result` compacts **each** item to its last 15 lines the same way,
+  with the same params. Defaults come from `CLAUDE_LOCAL_DELEGATE_RESULT_LINES`
+  (40) and `CLAUDE_LOCAL_DELEGATE_FANOUT_LINES` (15). Nothing on disk is
+  truncated — the transcript is intact and `full: true` still returns all of it.
+- **Real least-privilege for read-only delegates.** A delegation whose
+  `allowed_tools` are only read-only (Read, Grep, Glob, NotebookRead, TodoWrite)
+  now spawns with `--permission-mode dontAsk` instead of `bypassPermissions`,
+  because `bypassPermissions` **ignores** `--allowedTools`
+  (anthropics/claude-code#12232) — so the allowlist is finally enforced rather
+  than advisory. Delegations that can write still default to `bypassPermissions`
+  (an unattended agent that prompts is an agent that hangs). Override:
+  `CLAUDE_LOCAL_DELEGATE_READONLY_PERMISSION_MODE`.
+- **Routing provenance.** Every spawn is recorded in
+  `~/.claude-local-delegate/runs.json`: model, base URL, settings-file sha,
+  permission mode, allowed tools, cwd, name, timestamp. `check_delegate_status`
+  prints a `backend:` line from that record, and says plainly when a session was
+  **not** spawned by this server.
+- **Pool accounting fixed.** The local concurrency ceiling
+  (`CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY`, default 16) now counts only
+  background sessions recorded as local delegates, plus in-flight spawns.
+  Previously **any** `claude agents` background session — including a paid
+  Anthropic supervisor session — occupied a slot in the local vLLM pool it never
+  touched.
+- **Cheaper status polls.** The transcript JSONL is now parsed **once** per poll
+  instead of twice (`_transcript_summary`), and the result is memoised on
+  (path, size, mtime), so polling an idle or finished agent costs nothing.
+- **Lock contention gone.** Read-only MCP calls
+  (`project_sync`, `local_backend_info`, `check_delegate_status`,
+  `watch_delegate`, `get_delegate_result`, `check_fanout_status`,
+  `get_fanout_result`) no longer take the cross-process operations flock, and
+  `delegate_to_local` / `fan_out_to_local` / `continue_delegate` release it while
+  the `claude --bg` subprocess starts (up to 120 s), holding their pool slot with
+  an in-flight ticket file (`~/.claude-local-delegate/inflight.json`) instead.
+  Previously one spawn froze every other supervisor's reads and spawns for up to
+  two minutes.
+- **Conditional verifier.** In `delegate_verified`, if a run has **no
+  `acceptance_criteria`** and either the delegation was read-only or
+  `git status --porcelain` in its cwd is clean, no checker is spawned at all — the
+  run returns the worker's answer marked **"UNVERIFIED PASS"** with the reason.
+  New `always_verify` forces the checker anyway. When the checker **does** run,
+  its prompt now carries `git status --porcelain` + `git diff --stat HEAD` (real
+  evidence) plus only the last 30 lines of the worker's self-report, instead of
+  the entire self-report — so the checker's context no longer grows with the size
+  of the worker's output.
+- **Concurrency benchmark.** `contrib/bench_concurrency.py` is a standalone
+  driver that speaks to this server over stdio and measures fan-out concurrency
+  scaling (levels 1/2/4/8) into CSV.
+- **Codex tool-output caps.** Codex clients can cap a tool's output per tool via
+  `[mcp_servers.claude-local-delegate.tools.<tool>] output_token_limit = N` in
+  `~/.codex/config.toml`; `contrib/install_codex.py` writes those blocks for fresh
+  installs.
+
+## 0.7 — Claude Code + Codex support
+
+v0.7 lets both Claude Code and Codex share one local backend, coordinated in
+[COORDINATION.md](COORDINATION.md). Your **main sessions** still start as plain
+`claude` or `codex` — nothing about launching them changes. A single MCP
+registration (added via `python3 contrib/install_codex.py --apply`) reuses the
+existing local vLLM profile **for child processes only**, so workers and
+checkers run on the local model even when their parent is Codex. No second
+model profile or duplicated secrets. The installer also writes per-tool
+`[mcp_servers.claude-local-delegate.tools.<tool>] output_token_limit = N`
+blocks into `~/.codex/config.toml`, so a Codex client caps each tool's output
+on its side too (the server-side compaction above is the first of the two).
+
+Both clients work off the **same task reservations** in
+`~/.claude-local-delegate/coordination.sqlite3`: claim a task before delegating
+and never overlap a write. Because Codex has no native `SendMessage`, it talks
+to a settled worker with the portable **`continue_delegate`** (fork/restart,
+transcript retained); Claude keeps native `SendMessage`. Coordination is
+**cooperative, not OS-enforced** — reservations are checked before spawning,
+not filesystem locks, so for strong isolation use separate worktrees and a
+single integration owner.
+
 ## Why a native `claude --bg` agent instead of a `claude -p` black box
 
 The v0.3 design spawned a headless `claude -p` subprocess with its own
@@ -49,12 +130,28 @@ ids, one place to look. The MCP is just the spawner and the reader.
 A native `claude --bg` session starts in **manual mode**, where `--allowedTools`
 does *not* auto-approve (unlike headless `claude -p`): the agent would block
 on its first gated tool with no human present. So the spawner always passes a
-`--permission-mode`. The default is `acceptEdits` — read/edit/write run
-unattended, Bash stays gated — which is the safe analogue of the old
-read-only/write-only delegations. Pass `permission_mode: "bypassPermissions"`
-to a delegation only when it genuinely needs unattended shell access and you
-accept an autonomous loop with no approval gates (the auto-mode safety
-classifier may itself object to that flag, which is the correct behavior).
+`--permission-mode`. The default is **split by whether the allowlist is
+read-only**:
+
+- A delegation whose `allowed_tools` are only read-only (Read, Grep, Glob,
+  NotebookRead, TodoWrite) runs in `dontAsk` (override
+  `CLAUDE_LOCAL_DELEGATE_READONLY_PERMISSION_MODE`). This is where the
+  `--allowedTools` list is actually **enforced**: `dontAsk` denies unlisted
+  tools instead of prompting for them. That matters because
+  `bypassPermissions` **ignores `--allowedTools`**
+  (anthropics/claude-code#12232) — a "read-only" delegate spawned in bypass
+  could still run anything it asked for, so the allowlist used to be advisory
+  rather than binding.
+- A delegation that can write (or that you widen with `Bash`) defaults to
+  `bypassPermissions` (override `CLAUDE_LOCAL_DELEGATE_PERMISSION_MODE`): an
+  unattended agent that prompts on its first gated tool would park forever, so
+  writers keep the full granted toolset unattended. This is an autonomous loop
+  with no approval gates — don't point one at secrets or anything you wouldn't
+  want an unattended agent doing on this machine.
+
+Narrow a specific delegation with `permission_mode: "acceptEdits"` (Bash gated),
+`"default"` (everything prompts), or `"auto"` (classifier-gated) when a task
+should not have an unattended shell.
 
 ## Why this instead of a prompt-wrapper MCP tool
 
@@ -309,7 +406,7 @@ correct both times. The gap was elsewhere:
 | `allowed_tools` | no | `Read,Grep,Glob` (read-only) | Comma-separated tools granted to the agent. Widen to `Read,Edit,Write` for tasks that write files. |
 | `cwd` | no | server's cwd | Working directory for the agent. |
 | `name` | no | slug of the task | Display name shown in `claude agents`. |
-| `permission_mode` | no | `bypassPermissions` | Native `--permission-mode`. Default runs the full granted toolset (Bash included) unattended — a delegated agent that prompts on Bash would park forever. Narrow with `acceptEdits` (Bash gated) / `default` (all prompts) / `auto` (classifier-gated). |
+| `permission_mode` | no | `dontAsk` if read-only, else `bypassPermissions` | Native `--permission-mode`. A read-only allowlist defaults to `dontAsk` so `--allowedTools` is actually enforced (bypass **ignores** the allowlist — anthropics/claude-code#12232); anything wider defaults to `bypassPermissions` so the unattended agent runs its full granted toolset (Bash included) without prompting and parking. Narrow with `acceptEdits` (Bash gated) / `default` (all prompts) / `auto` (classifier-gated). |
 | `disallowed_tools` | no | — | Comma-separated tools to strip (e.g. `Bash`) — forces the agent onto a path it can finish when a user-level hook blocks a tool it would reach for. |
 | `agent` | no | `local-worker` | Subagent persona (system prompt). `""` = no persona. |
 | `announce_plan` | no | `true` | Prepend the supervision preamble: agent posts a numbered plan first, then one plain sentence before/after each step (what `watch_delegate` surfaces). `false` for a trivial one-shot. |
@@ -335,12 +432,16 @@ full session id. When the state is `blocked`, the agent's last words (its
 question) are printed so you can answer with the native `SendMessage` tool.
 Cheap: reads `claude agents --json`, does not touch the model.
 
-**`get_delegate_result`** — `{run_id}` → the agent's final answer, read from
-its **native transcript** (`~/.claude/projects/<dir>/<sessionId>.jsonl`).
-Errors while the agent is still `working`/`blocked` — call
-`check_delegate_status` first. **Review the output before trusting it** — see
-the A/B test above for why a local-model agent can look right while being
-subtly wrong.
+**`get_delegate_result`** — `{run_id, full?, max_lines?}` → the agent's final
+answer, read from its **native transcript** (`~/.claude/projects/<dir>/<sessionId>.jsonl`).
+Compacted by default: the first 4 + last 40 lines plus a `sha256` of the full
+text (so a long answer can't flood the parent's context); `full: true` returns
+everything and `max_lines` overrides the tail size
+(`CLAUDE_LOCAL_DELEGATE_RESULT_LINES`, default 40). Nothing on disk is
+truncated — the transcript is intact. Errors while the agent is still
+`working`/`blocked` — call `check_delegate_status` first. **Review the output
+before trusting it** — see the A/B test above for why a local-model agent can
+look right while being subtly wrong.
 
 **`fan_out_to_local`** — `{items[], shared_instruction, allowed_tools?, cwd?, permission_mode?}`
 → map-reduce over the local model: spawns one native background agent per item,
@@ -364,9 +465,13 @@ exceeds the configured ceiling; it does not cap batch size itself.
 batch (working / blocked / completed / failed / stopped) plus each agent's
 state.
 
-**`get_fanout_result`** — `{batch_id}` → every item's final answer, read from
-each agent's native transcript, concatenated. Errors until all agents are
-settled. Synthesize yourself (or delegate the synthesis to one more
+**`get_fanout_result`** — `{batch_id, full?, max_lines?}` → every item's final
+answer, read from each agent's native transcript, concatenated. Each item is
+compacted to its last 15 lines plus a `sha256` by default
+(`CLAUDE_LOCAL_DELEGATE_FANOUT_LINES`, default 15) — N full answers in one tool
+result is the single biggest context cost of a fan-out; `full: true` returns
+each item whole, and `max_lines` overrides the per-item tail. Errors until all
+agents are settled. Synthesize yourself (or delegate the synthesis to one more
 `delegate_to_local` run if you want it done by the model).
 
 ### Verified delegation (`delegate_verified`)
@@ -398,6 +503,7 @@ parent's polling cadence drives it.
 | `acceptance_criteria` | no | — | Explicit pass/fail conditions the checker must confirm (`pytest -q` green, `ruff check` passes, CLI prints X for input Y). **Strongly recommended** — without it the checker only derives its own best-guess checks and the gate is weak. |
 | `allowed_tools` | no | `Read,Grep,Glob,Edit,Write,Bash` | Tools for the **worker** (it must be able to change code). The checker's tools are fixed at `Read,Grep,Glob,Bash` — no Edit/Write. |
 | `cwd` | no | server's cwd | Working directory for both worker and checker. |
+| `always_verify` | no | `false` | Force the checker round even when there is nothing objective to verify (see "Conditional verification" below). |
 | `max_iterations` | no | `3` (`CLAUDE_LOCAL_DELEGATE_MAX_VERIFY_ITERS`) | Max work→check rounds, clamped 1..10. |
 | `timeout_seconds` | no | `5400` (`CLAUDE_LOCAL_DELEGATE_VERIFY_TIMEOUT`) | Wall-clock ceiling for the whole loop; past it the run is force-failed. |
 
@@ -415,6 +521,18 @@ trail. On **FAIL**: the reason (iteration cap / stagnation / timeout / crashed
 sub-agent), the last checker's feedback, and the last candidate answer (kept,
 not discarded — the working tree still holds its changes).
 
+**Conditional verification.** The checker is a full second local round-trip, so
+it only runs when there is something objective to check. A run with **no
+`acceptance_criteria`** AND (a read-only delegation, or a clean
+`git status --porcelain` in its cwd) skips the checker entirely: the run returns
+the worker's answer marked **"UNVERIFIED PASS"** with the reason — review that
+one yourself, or re-run with `acceptance_criteria` (or `always_verify: true`) to
+force an independent check. When the checker **does** run, its prompt carries
+`git status --porcelain` + `git diff --stat HEAD` (evidence from the real tree)
+plus only the last 30 lines of the worker's self-report, instead of the whole
+self-report — so the checker's context stays flat regardless of how long the
+worker's output is.
+
 ### Where the agents live (native, not a home-grown store)
 
 There is no `~/.claude-local-delegate/runs/` anymore. Each delegated task is a
@@ -426,10 +544,16 @@ first-class background session owned by Claude Code's agent-view supervisor:
   — the same file `claude attach` / `claude logs` read.
 - **This server's on-disk artifacts** are `~/.claude-local-delegate/batches/<batch_id>.json`,
   which maps a fan-out `batch_id` to the native agent ids it spawned so
-  `check_fanout_status` / `get_fanout_result` can aggregate them, and
+  `check_fanout_status` / `get_fanout_result` can aggregate them,
   `~/.claude-local-delegate/verified/<vid>.json`, the state machine for a
   `delegate_verified` run (spec, phase, per-iteration worker/checker ids and
-  verdicts, final answer). Both are small JSON; nothing else to prune.
+  verdicts, final answer), `~/.claude-local-delegate/runs.json`, the per-spawn
+  routing provenance (model, base URL, settings sha, permission mode, allowed
+  tools, cwd, name, timestamp — the source of `check_delegate_status`'s
+  `backend:` line and the pool accounting), and
+  `~/.claude-local-delegate/inflight.json`, the in-flight spawn tickets that
+  hold a pool slot while a `claude --bg` subprocess starts. All small JSON;
+  nothing to prune by hand.
 
 To inspect or drive an agent directly, no MCP needed: `claude attach <id>`,
 `claude logs <id>` — or, from within a Claude Code session, the native
@@ -442,18 +566,21 @@ To inspect or drive an agent directly, no MCP needed: `claude attach <id>`,
 is no separate cost or tok/s figure here — those live in the agent's own
 session (visible via `claude attach <id>` or its transcript). When the local
 model is genuinely free to run, treat any client-side estimate as a rough
-token-volume signal, not a bill.
+token-volume signal, not a bill. The answer handed to the parent is compacted
+by default (head + tail + `sha256`; `full: true` for everything), so the cost
+you actually pay in the supervising session is bounded regardless of how long
+the local agent's final answer is.
 
 ## Safety note
 
 The delegated agent runs *unsupervised* under whatever `--permission-mode`
-you give it. The default `acceptEdits` lets it read/edit/write files without
-per-call prompts but keeps Bash gated — a good, conservative analogue of the
-old read-only/write-only delegations. Raise to `bypassPermissions` only for
-work that genuinely needs unattended shell access, and accept that it is an
-autonomous loop with no approval gates: don't point one at secrets,
-production systems, or anything you wouldn't want an unattended agent doing on
-this machine.
+you give it. The default is split: a **read-only** delegation (allowlist of
+only Read/Grep/Glob/NotebookRead/TodoWrite) runs in `dontAsk`, where the
+allowlist is genuinely **enforced** (unlisted tools are denied, not
+prompted) — so a "read-only" delegate cannot silently gain shell. A delegation
+that can **write** defaults to `bypassPermissions`, an autonomous loop with no
+approval gates: don't point one at secrets, production systems, or anything
+you wouldn't want an unattended agent doing on this machine.
 
 This server deliberately does **not** let one AI session approve another
 AI session's blocked action. A delegated agent that gets gated shows its

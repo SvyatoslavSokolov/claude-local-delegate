@@ -38,6 +38,8 @@ on its own question — answer that. (If the parent session's
 permission-mode class differs from the delegate's — e.g. parent `auto`,
 delegate default `bypassPermissions` — that one message is held for a
 one-time user approval; approve it. The MCP tools below are never gated.)
+A **read-only** delegation (allowlist of `Read,Grep,Glob`) is spawned in
+`dontAsk` instead, where the allowlist is enforced rather than advisory.
 
 ## Watch: `watch_delegate(run_id)`
 
@@ -94,6 +96,11 @@ The stopped agent is now `done` and **not** reachable by `SendMessage`.
 Read what it managed to do with `get_delegate_result(run_id)`, then call
 `delegate_to_local` again with a smaller, better-scoped task — carry any
 useful partial result forward in the new task text.
+
+`get_delegate_result` returns the **tail** of the answer (plus a sha256 of the
+full text) rather than all of it, because a long answer is charged to this
+session. When you actually need the whole thing, pass `full: true`; the
+transcript on disk was never truncated.
 
 ## Why the narration is readable
 
