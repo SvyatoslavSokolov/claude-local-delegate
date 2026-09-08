@@ -52,6 +52,26 @@ Cheap one-shot snapshot: current state, the last sentence of the run, and
 tokens used. Use it when `watch_delegate` isn't needed and you just want
 to know "is it still alive, and where is it?"
 
+**A still token counter is not a stall.** An agent in `working` whose output
+tokens have not moved between two polls is very often loading context — the
+prefill of a large prompt produces no output tokens and can take a while,
+especially on a busy backend. Do not `stop_delegate` on that evidence: you
+throw away a run that was about to continue, and the replacement pays the same
+context cost again from zero.
+
+The signals that actually justify intervening:
+
+- state is **`blocked`** — a real state; the agent is waiting on its own
+  question, or its stream dropped. This is the one case worth acting on.
+- `watch_delegate` narration shows it *doing* the wrong thing — reading files
+  outside the task, re-deriving what the brief already gave it, looping over
+  the same check.
+- it edited a file and then went quiet: verify the file is not half-edited
+  (a partial import move can pass `py_compile` and still be broken), and if it
+  is, revert that file rather than waiting.
+
+"Quiet" on its own means keep waiting.
+
 ## Stop: `stop_delegate(run_id, mode)`
 
 Halt a drifting run:
