@@ -61,8 +61,16 @@ context cost again from zero.
 
 The signals that actually justify intervening:
 
-- state is **`blocked`** — a real state; the agent is waiting on its own
-  question, or its stream dropped. This is the one case worth acting on.
+- state is **`blocked`** — a real state. Read its last words, because the
+  three causes need different responses:
+  - *"API Error: The response stopped arriving"* — the stream dropped. Check
+    whether it left a file half-edited, then re-delegate; nothing else to do.
+  - *"exceeded the 16384 output token maximum"* — it tried to emit a report
+    bigger than the cap. This one is **preventable, not recoverable**: the next
+    brief must say "keep the final report short, no large excerpts". An agent
+    asked to paste a whole file will hit this every time.
+  - it is genuinely waiting on its own question — the one case where
+    `SendMessage` is the right tool.
 - `watch_delegate` narration shows it *doing* the wrong thing — reading files
   outside the task, re-deriving what the brief already gave it, looping over
   the same check.
