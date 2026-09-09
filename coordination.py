@@ -12,6 +12,11 @@ import time
 import uuid
 
 
+# sync() flags a task stale at 900s. A takeover is a heavier act, so it needs a longer
+# idle period on top of the no-live-children check.
+TAKEOVER_IDLE_SECONDS = 1800
+
+
 def overlap(a, b):
     return a == b or a.startswith(b.rstrip('/') + '/') or b.startswith(a.rstrip('/') + '/')
 
@@ -111,8 +116,29 @@ class Board:
             t = next((t for t in tasks if t['id'] == args['task_id']), None)
             if not t:
                 raise ValueError('unknown task_id')
+            takeover = False
             if t['owner'] != owner:
-                raise ValueError('task belongs to another session; use project_note to request a handoff')
+                # Owner-only release deadlocks when the owning session dies: it can never call
+                # project_sync, so a handoff request is never delivered, and nothing expires.
+                # Allow a release only when the reservation is long stale AND has no live
+                # children -- the exact condition the module docstring gives as the reason
+                # reservations do not expire. Anything else still refuses.
+                idle = time.time() - t['updated_at']
+                if not args.get('takeover'):
+                    raise ValueError(
+                        'task belongs to another session; use project_note to request a handoff, '
+                        f'or pass takeover=true to release it (idle {int(idle)}s, needs '
+                        f'{TAKEOVER_IDLE_SECONDS}s and no running delegates)')
+                if idle < TAKEOVER_IDLE_SECONDS:
+                    raise ValueError(
+                        f'takeover refused: reservation was updated {int(idle)}s ago, '
+                        f'under the {TAKEOVER_IDLE_SECONDS}s threshold')
+                if args.get('status', t['status']) not in ('done', 'cancelled'):
+                    raise ValueError('takeover may only release a task (done or cancelled)')
+                if not runs_settled(t['runs']):
+                    raise ValueError(
+                        'takeover refused: the owning session still has delegated work running')
+                takeover = True
             status = args.get('status', t['status'])
             if status not in ('active', 'paused', 'waiting', 'done', 'cancelled'):
                 raise ValueError('invalid status')
@@ -127,7 +153,10 @@ class Board:
                 if t['blockers']:
                     return {'task': t, 'blocked': True}
             t['status'] = status
-            t['note'] = args.get('note', t['note'])[:2000]
+            note = args.get('note', t['note'])
+            if takeover:
+                note = f'[taken over by {owner}] ' + (note or '')
+            t['note'] = note[:2000]
             self._save(con, t)
             self._event(con, t, status, t['note'])
             return {'task': t}
@@ -135,6 +164,8 @@ class Board:
     def sync(self, owner, args):
         project = str(Path(args['project']).expanduser().resolve())
         cursor = max(0, int(args.get('after_event', 0)))
+        completed_limit = max(0, min(20, int(args.get('completed_limit', 3))))
+        event_limit = max(0, min(50, int(args.get('event_limit', 20))))
         with self.transaction() as con:
             tasks = self._all(con)
             relevant = [t for t in tasks if overlap(project, t['project'])]
@@ -145,9 +176,30 @@ class Board:
                     # Nothing starts by itself, but the supervisor should not have
                     # to re-derive which of its parked tasks are now startable.
                     t['ready'] = not t['blockers']
-            rows = con.execute('SELECT id, body FROM events WHERE project=? AND id>? ORDER BY id LIMIT 50', (project, cursor)).fetchall()
-            return {'session_id': owner, 'tasks': [t for t in relevant if t['status'] not in ('done', 'cancelled')] + [t for t in relevant if t['status'] in ('done', 'cancelled')][-20:],
-                    'events': [{'event_id': r['id'], **json.loads(r['body'])} for r in rows],
+            active = [t for t in relevant if t['status'] not in ('done', 'cancelled')]
+            completed = [t for t in relevant if t['status'] in ('done', 'cancelled')]
+            recent = completed[-completed_limit:] if completed_limit else []
+            # Completed history can contain thousands of paths/runs and long notes.
+            # A supervisor normally needs only a small handoff digest; the SQLite
+            # board remains the source of truth for offline analysis.
+            recent = [dict({k: t.get(k) for k in
+                            ('id', 'task_key', 'summary', 'status', 'updated_at')},
+                           note=(t.get('note') or '')[:240]) for t in recent]
+            query_limit = event_limit + 1
+            rows = con.execute('SELECT id, body FROM events WHERE project=? AND id>? ORDER BY id LIMIT ?',
+                               (project, cursor, query_limit)).fetchall() if event_limit else []
+            has_more = len(rows) > event_limit
+            rows = rows[:event_limit]
+            events = []
+            for r in rows:
+                event = {'event_id': r['id'], **json.loads(r['body'])}
+                event['text'] = (event.get('text') or '')[:240]
+                events.append(event)
+            counts = {status: sum(t['status'] == status for t in relevant)
+                      for status in ('active', 'paused', 'waiting', 'done', 'cancelled')}
+            return {'session_id': owner, 'tasks': active + recent,
+                    'task_counts': counts, 'completed_returned': len(recent),
+                    'events': events, 'has_more_events': has_more,
                     'next_event': rows[-1]['id'] if rows else cursor,
                     'note': 'Reservations are cooperative. Stale does not mean safe to release. Paused tasks retain their paths.'}
 
@@ -171,9 +223,22 @@ class Board:
                 if writes and t['mode'] != 'write':
                     raise ValueError('shell/write delegation needs a write reservation')
                 return t
-            if any(t['status'] in ('active', 'paused') and any(overlap(cwd, p) for p in t['paths'])
-                   and (writes or t['mode'] == 'write') for t in tasks):
-                raise ValueError('project has reserved work; claim a task and pass task_id before delegating')
+            for t in tasks:
+                if t['status'] not in ('active', 'paused') or not (writes or t['mode'] == 'write'):
+                    continue
+                hit = next((p for p in t['paths'] if overlap(cwd, p)), None)
+                if hit is None:
+                    continue
+                # Name the blocker. "project has reserved work" alone sent a user hunting
+                # through the board by hand for the one task that was in their way.
+                mine = t['owner'] == owner
+                raise ValueError(
+                    f"blocked by reservation {t['task_key']!r} (id {t['id']}, "
+                    f"{'yours' if mine else 'owned by ' + t['owner']}, mode {t['mode']}, "
+                    f"status {t['status']}) on path {hit!r}. "
+                    + ('Pass its task_id to delegate under it, or claim a task with '
+                       'non-overlapping paths.' if mine else
+                       'Ask that session to release it, or use project_note to request a handoff.'))
             return None
 
     def owner_for_run(self, run_id):
@@ -195,13 +260,16 @@ def schema(name, description, properties, required):
 
 STRING = {'type': 'string'}
 TOOLS = [
-    schema('project_sync', 'Cheap shared Claude/Codex task board and incremental notes. Call before starting work and at checkpoints. No model invocation.',
-           {'project': STRING, 'after_event': {'type': 'integer', 'minimum': 0}}, ['project']),
+    schema('project_sync', 'Compact shared task board: all unfinished tasks, a small recent-completed digest, aggregate counts, and bounded incremental events. Call before work and at checkpoints. Increase limits only when history is actually needed.',
+           {'project': STRING, 'after_event': {'type': 'integer', 'minimum': 0},
+            'completed_limit': {'type': 'integer', 'minimum': 0, 'maximum': 20, 'description': 'Recent terminal task digests to return; default 3.'},
+            'event_limit': {'type': 'integer', 'minimum': 0, 'maximum': 50, 'description': 'Incremental events to return; default 20.'}}, ['project']),
     schema('task_claim', 'Atomically reserve a unique task and literal file/directory paths. Read/read may overlap; writes exclude reads and writes. Conflicts/dependencies create waiting tasks. Only active tasks may start.',
            {'project': STRING, 'task_key': STRING, 'summary': STRING, 'paths': {'type': 'array', 'items': STRING},
             'mode': {'type': 'string', 'enum': ['read', 'write']}, 'depends_on': {'type': 'array', 'items': STRING}}, ['project', 'task_key']),
-    schema('task_update', 'Update your task. active retries waiting dependencies/locks; paused retains locks; waiting releases locks; done/cancelled release only after children settle. Record evidence in note. No automatic stale lock expiry.',
-           {'task_id': STRING, 'status': {'type': 'string', 'enum': ['active', 'paused', 'waiting', 'done', 'cancelled']}, 'note': STRING}, ['task_id']),
+    schema('task_update', 'Update your task. active retries waiting dependencies/locks; paused retains locks; waiting releases locks; done/cancelled release only after children settle. Record evidence in note. Nothing expires on its own, but a reservation whose owning session has gone away can be released with takeover=true: only to done or cancelled, only once it has been idle past the threshold, and only when it has no delegated work still running. The release is stamped into its note.',
+           {'task_id': STRING, 'status': {'type': 'string', 'enum': ['active', 'paused', 'waiting', 'done', 'cancelled']}, 'note': STRING,
+            'takeover': {'type': 'boolean', 'description': "Release another session's abandoned reservation. Refused unless it is idle past the threshold and has no running delegates."}}, ['task_id']),
     schema('project_note', 'Post a short coordination note or handoff/pause request for the other supervisor. Delivered when they call project_sync, not a push notification or forced pause.',
            {'project': STRING, 'task_id': STRING, 'message': STRING}, ['project', 'message']),
 ]

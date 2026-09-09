@@ -93,6 +93,23 @@ class BoardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.claim('s1', paths=['link'])
 
+    def test_sync_compacts_completed_history_and_events(self):
+        for i in range(6):
+            task = self.claim('done-%d' % i, paths=['done-%d.txt' % i])['task']
+            self.board.update('alice', {
+                'task_id': task['id'], 'status': 'done', 'note': 'x' * 500,
+            }, self.settled)
+        data = self.board.sync('reader', {
+            'project': self.project, 'completed_limit': 2, 'event_limit': 3,
+        })
+        self.assertEqual(data['task_counts']['done'], 6)
+        self.assertEqual(data['completed_returned'], 2)
+        self.assertEqual(len(data['tasks']), 2)
+        self.assertNotIn('paths', data['tasks'][0])
+        self.assertEqual(len(data['tasks'][0]['note']), 240)
+        self.assertEqual(len(data['events']), 3)
+        self.assertTrue(data['has_more_events'])
+
 
 if __name__ == '__main__':
     unittest.main()

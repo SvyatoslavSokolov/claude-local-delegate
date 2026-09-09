@@ -141,8 +141,17 @@ LOCAL_SERVER_MAX_CONCURRENCY = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_CON
 # used to paste all 8 in one tool result; the parent pays for every line of it.
 # Default is a tail plus a sha256 of the full text; `full: true` still returns
 # everything, and the transcript on disk is never truncated.
-DEFAULT_RESULT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_RESULT_LINES", "40"))
+DEFAULT_RESULT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_RESULT_LINES", "30"))
 DEFAULT_FANOUT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_FANOUT_LINES", "15"))
+# A result call may wait inside the MCP process instead of making the paid
+# supervisor take one model turn per status poll. Keep this below Codex's
+# installer-written 240s tool timeout. Callers with a shorter client timeout can
+# request a smaller value if their client has a tighter timeout.
+MAX_RESULT_WAIT_SECONDS = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_RESULT_WAIT", "220"))
+RESULT_WAIT_POLL_SECONDS = float(os.environ.get("CLAUDE_LOCAL_DELEGATE_RESULT_WAIT_POLL", "3"))
+# How many consecutive state-less roster reads still count as "still working"
+# before the wait gives up and reports what it actually saw.
+MAX_UNKNOWN_STATE_READS = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_UNKNOWN_READS", "3"))
 # How much of the worker's self-report the checker is shown. Its evidence comes
 # from git and from re-running things, not from the worker's prose.
 CHECKER_REPORT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_CHECKER_REPORT_LINES", "30"))
@@ -203,7 +212,7 @@ DEFAULT_PERMISSION_MODE = os.environ.get(
     "CLAUDE_LOCAL_DELEGATE_PERMISSION_MODE", "bypassPermissions"
 )
 
-# Prepended to every delegated task (unless announce_plan=False). It turns the
+# Optionally prepended when announce_plan=True. It turns the
 # agent into something a parent session can SUPERVISE cheaply: the parent reads
 # only the agent's plain-text messages (watch_delegate strips tool output), so
 # the agent is told to narrate intent in plain sentences, keep steps small, and
@@ -228,8 +237,29 @@ SUPERVISED_PREAMBLE = (
     + SUPERVISION_MARKER + "\n"
 )
 DEFAULT_ANNOUNCE_PLAN = os.environ.get(
-    "CLAUDE_LOCAL_DELEGATE_ANNOUNCE_PLAN", "1"
+    "CLAUDE_LOCAL_DELEGATE_ANNOUNCE_PLAN", "0"
 ).strip().lower() not in ("0", "false", "no", "")
+
+
+# Appended to every delegated task. The parent compacts a final answer longer
+# than DEFAULT_RESULT_LINES, and an elided middle is exactly where a delegate's
+# assumptions and evidence live -- so ask for an answer that fits instead of
+# cutting one that doesn't. This caps the REPORT, never the work: the agent is
+# told explicitly to do the full job and the full verification first.
+REPORT_CONTRACT = (
+    "\n\n=== HOW TO REPORT (does not change the work) ===\n"
+    "Do the task in full and verify it properly -- run the real check, do not "
+    "shorten the work to shorten the report.\n"
+    f"Then write a final message of AT MOST {{max_lines}} lines. Fit it by leaving out "
+    "narration, not substance: no pasted file contents, no command transcripts, no "
+    "restating the task, no summary of what you were going to do.\n"
+    "Those lines must carry, in this order: (1) what you changed, as exact "
+    "file:line or path per item; (2) the verification you actually ran and its "
+    "real result, quoted in one line each; (3) any assumption you made or anything "
+    "you could not do. If something failed, say so plainly -- a truthful short "
+    "failure report is worth more than a tidy one.\n"
+    "Long output belongs in the files and in your transcript, not in this message."
+)
 
 
 # ---- routing provenance ------------------------------------------------------
@@ -304,6 +334,7 @@ def _default_agent():
 
 def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
                         disallowed_tools=None, agent=None, announce_plan=None,
+                        report_contract=True,
                         resume_session=None):
     """Spawn ONE native `claude --bg` agent on the local model.
 
@@ -358,6 +389,10 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     # (what watch_delegate surfaces to the parent). announce_plan=None -> default.
     want_plan = DEFAULT_ANNOUNCE_PLAN if announce_plan is None else bool(announce_plan)
     effective_task = (SUPERVISED_PREAMBLE + task) if want_plan else task
+    # The checker opts out: its final message has a mandatory VERDICT shape of its
+    # own, and a second, later "how to report" block would displace it.
+    if report_contract:
+        effective_task += REPORT_CONTRACT.format(max_lines=DEFAULT_RESULT_LINES)
 
     from local_backend import environment, profile
     try:
@@ -735,10 +770,10 @@ def start_delegate(args):
             "text": (
                 f"Spawned a native background agent on the local model. "
                 f"agent id: {short_id}\n"
-                f"It appears in `claude agents`. Supervise it cheaply with "
-                f"watch_delegate({short_id!r}) (its plain-text plan + step narration, no code); "
-                f"check_delegate_status({short_id!r}) for state + tokens; "
-                f"get_delegate_result({short_id!r}) for the final answer.\n"
+                f"It appears in `claude agents`. For the normal path, call "
+                f"get_delegate_result({short_id!r}, wait_seconds={MAX_RESULT_WAIT_SECONDS}) once; it waits "
+                f"server-side and returns the compact final answer without paid polling turns. "
+                f"Use watch_delegate/check_delegate_status only to diagnose progress or drift.\n"
                 f"To course-correct if it drifts: stop_delegate({short_id!r}), then "
                 f"delegate_to_local again with a sharper task (the stopped run stays "
                 f"readable via get_delegate_result). A running local agent will NOT read a "
@@ -859,22 +894,64 @@ def _result_max_lines(args, default):
     return default if value == 0 else value
 
 
+def _result_wait_seconds(args):
+    """Bound a server-side wait so it stays below the client's tool timeout."""
+    try:
+        value = int(args.get("wait_seconds", 0))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(value, MAX_RESULT_WAIT_SECONDS))
+
+
 def get_result(args):
     handle = args.get("run_id") or args.get("agent_id")
     if not handle:
         return _error_result("`run_id` (the agent id) is required.")
 
-    agent, err = _resolve_agent(handle)
-    if err:
-        return _error_result(err)
-    if agent is None:
-        return _error_result(f"No background agent with id {handle} found in the roster.")
+    wait_seconds = _result_wait_seconds(args)
+    deadline = time.monotonic() + wait_seconds
+    # A roster read can come back without a state for reasons that have nothing to
+    # do with the agent (a partial write, a transient read error). Treat that as
+    # "keep waiting" only briefly: a genuinely unknown state should not silently
+    # spend the caller's whole wait window.
+    unknown_reads = 0
+    while True:
+        agent, err = _resolve_agent(handle)
+        if err:
+            return _error_result(err)
+        if agent is None:
+            return _error_result(f"No background agent with id {handle} found in the roster.")
+        state = agent.get("state") or agent.get("status") or "unknown"
+        if state == "unknown":
+            unknown_reads += 1
+            if unknown_reads > MAX_UNKNOWN_STATE_READS:
+                break
+        else:
+            unknown_reads = 0
+        if state not in ("working", "busy", "unknown") or time.monotonic() >= deadline:
+            break
+        interval = max(0.05, RESULT_WAIT_POLL_SECONDS)
+        time.sleep(min(interval, max(0.05, deadline - time.monotonic())))
 
-    state = agent.get("state") or agent.get("status") or "unknown"
     session_id = agent.get("sessionId") or ""
+
+    # A blocked agent needs supervisor input, so surface the actionable status
+    # immediately instead of presenting its question as a final answer.
+    if state == "blocked" and wait_seconds:
+        return check_status({"run_id": handle})
 
     # Still working? Don't hand back a partial answer.
     if state in ("working", "busy", "unknown"):
+        if wait_seconds:
+            status = check_status({"run_id": handle})
+            status_text = status.get("content", [{}])[0].get("text", "")
+            if not status.get("isError"):
+                status["content"][0]["text"] = (
+                    f"No final result after waiting {wait_seconds}s inside this tool call.\n"
+                    + status_text
+                    + "\nCall get_delegate_result again with wait_seconds to continue waiting."
+                )
+                return status
         return _error_result(
             f"agent {handle} is still {state} -- call check_delegate_status first. "
             f"get_delegate_result returns its final answer only once it has settled "
@@ -1336,7 +1413,7 @@ def _spawn_verify_checker(state, candidate):
         f"verified-checker-r{it}",  # plain-alpha: no vid / hex -- see _spawn_verify_worker
         permission_mode=None, disallowed_tools=None,
         agent=(CHECKER_PERSONA if _persona_exists(CHECKER_PERSONA) else ""),
-        announce_plan=None,
+        announce_plan=None, report_contract=False,
     )
 
 
@@ -1611,40 +1688,23 @@ PARENT_TOOLS = [
     {
         "name": "delegate_to_local",
         "description": (
-            "Delegate a self-contained task to a NATIVE Claude Code background agent "
-            "(`claude --bg`) running on the local model (vLLM/LiteLLM via --settings). "
-            "Unlike an in-session subagent, this agent is a real top-level Claude Code "
-            "session: it shows up in `claude agents`, can be inspected with "
-            "`claude logs <id>` / `claude attach <id>`, and the parent can send it "
-            "follow-up requests through the native SendMessage tool (it appears in "
-            "ListAgents while running). Returns immediately with the agent's native id "
-            "-- this does NOT block, so call it several times back-to-back to run "
-            "delegations in parallel (bounded by the local server's concurrency). "
-            "Poll with check_delegate_status, then read the answer with "
-            "get_delegate_result. Use for mechanical/high-volume work where local-model "
-            "latency is worth saving paid tokens; keep architecture decisions and "
-            "security-sensitive work in the main session.\n"
-            "PREFER MANY SMALL TASKS over one long run: a delegation you can describe "
-            "in one outcome ('rename X to Y across src/', 'add tests for module Z') is "
-            "easy to watch and cheap to redo if it drifts; a sprawling one is neither. "
-            "Split big work and delegate the pieces (or use fan_out_to_local). "
-            "Supervise with watch_delegate (plan + step narration, no code). If it "
-            "drifts: stop_delegate, then delegate_to_local again with a sharper task -- "
-            "a RUNNING local agent does NOT read a mid-run SendMessage (it finishes its "
-            "run first), so reserve SendMessage for answering an agent that is `blocked` "
-            "on its own question. The stopped run stays readable via get_delegate_result."
+            "Start one native Claude Code background agent on the local model and return "
+            "its id immediately. Give one self-contained, mechanical task; keep architecture "
+            "and final review in the parent. Normal flow: call get_delegate_result once with "
+            f"wait_seconds={MAX_RESULT_WAIT_SECONDS} (this client's ceiling). Use status/watch only for diagnosis. To correct drift, stop and "
+            "re-delegate a tighter task; a running agent reads messages only after its turn."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "task": {"type": "string", "description": "The self-contained task. The agent starts with no memory of this conversation."},
-                "allowed_tools": {"type": "string", "description": f"Comma-separated tools the agent may use without prompting. Defaults to read-only ('{DEFAULT_ALLOWED_TOOLS}'). Widen only when it must write files or run commands -- it runs unsupervised."},
+                "task": {"type": "string", "description": "Self-contained task; the agent has no conversation memory."},
+                "allowed_tools": {"type": "string", "description": f"Comma-separated tools; default '{DEFAULT_ALLOWED_TOOLS}'. Add write/Bash only when needed."},
                 "cwd": {"type": "string", "description": "Working directory for the agent. Defaults to this server's cwd."},
                 "name": {"type": "string", "description": "Optional display name for the agent (shown in `claude agents`). Defaults to a short slug of the task."},
-                "permission_mode": {"type": "string", "description": f"Native --permission-mode for the background agent. A READ-ONLY allowlist (Read/Grep/Glob) defaults to '{READ_ONLY_PERMISSION_MODE}', where the allowlist is actually enforced; anything wider defaults to '{DEFAULT_PERMISSION_MODE}' so the unattended agent runs its full granted toolset (Bash included) without approval gates -- a delegated agent that prompts on Bash would park forever with no one to approve. Set to 'acceptEdits' (Bash gated) or 'default' (everything prompts) to narrow a specific delegation, or 'auto' for the classifier-gated middle ground."},
-                "disallowed_tools": {"type": "string", "description": "Comma-separated tools to strip from the agent (e.g. 'Bash'). Useful when a user-level hook/gate blocks a tool the agent would reach for on its own -- disallowing that tool forces the agent onto a path it can complete. Default: none."},
-                "agent": {"type": "string", "description": f"Subagent-definition persona to run the delegation as (its system prompt). Defaults to 'local-worker' (~/.claude/agents/local-worker.md: verifies by running a check, returns evidence, states assumptions). Pass another installed agent name to override, or empty string to run with no persona."},
-                "announce_plan": {"type": "boolean", "description": f"Prepend the supervision preamble that makes the agent post a numbered plan first and narrate each step in one plain sentence (what watch_delegate shows the parent). Default {DEFAULT_ANNOUNCE_PLAN}. Set false only for a trivial one-shot where narration is noise."},
+                "permission_mode": {"type": "string", "description": f"Native mode. Read-only defaults to '{READ_ONLY_PERMISSION_MODE}'; writers to unattended '{DEFAULT_PERMISSION_MODE}'."},
+                "disallowed_tools": {"type": "string", "description": "Comma-separated tools to remove. Default none."},
+                "agent": {"type": "string", "description": "Persona name; default local-worker; empty disables it."},
+                "announce_plan": {"type": "boolean", "description": f"Prepend a plan/step narration preamble for a run you intend to watch. Default {DEFAULT_ANNOUNCE_PLAN}; leave off for the normal summary-only path to avoid extra local turns."},
             },
             "required": ["task"],
         },
@@ -1652,15 +1712,8 @@ PARENT_TOOLS = [
     {
         "name": "check_delegate_status",
         "description": (
-            "Read the NATIVE state of a delegated background agent by its id (from "
-            "delegate_to_local): working / blocked / completed / failed / stopped. "
-            "Also surfaces, cheaply, the task it was given, its last plain-text "
-            "sentence, and output tokens burned so far. Poll at the pace the agent "
-            "works (a step takes tens of seconds), not in a tight loop. "
-            "'blocked' is the agent's "
-            "native 'I need input' signal -- its last words (its question) are shown "
-            "so you can answer with the native SendMessage tool. For the full "
-            "step-by-step narration use watch_delegate. Does not touch the model."
+            "Diagnostic state snapshot for one agent. Routine waiting should use "
+            f"get_delegate_result(wait_seconds={MAX_RESULT_WAIT_SECONDS}) to avoid parent-model polling turns."
         ),
         "inputSchema": {
             "type": "object",
@@ -1673,13 +1726,9 @@ PARENT_TOOLS = [
     {
         "name": "get_delegate_result",
         "description": (
-            "Read the delegated agent's final answer from its NATIVE transcript. "
-            "Errors if the agent is still working/blocked -- call check_delegate_status "
-            "first. IMPORTANT: review this before treating it as final; a local-model "
-            "agent can produce plausible-looking but subtly wrong output that only a "
-            "read-through catches. Compacted by default (first lines + last "
-            f"{DEFAULT_RESULT_LINES} lines + a sha256 of the full text) so a long "
-            "answer does not flood this session; pass full=true for everything."
+            "Wait for and read an agent's final answer. Default output is first lines, "
+            f"last {DEFAULT_RESULT_LINES} lines and a full-text sha256; use full=true only when needed. "
+            "Review the result before accepting it."
         ),
         "inputSchema": {
             "type": "object",
@@ -1687,6 +1736,7 @@ PARENT_TOOLS = [
                 "run_id": {"type": "string", "description": "The agent id returned by delegate_to_local."},
                 "full": {"type": "boolean", "description": "Return the entire final answer instead of the compacted tail. Default false."},
                 "max_lines": {"type": "integer", "description": f"Tail size when compacting. Default {DEFAULT_RESULT_LINES}; <0 means no limit."},
+                "wait_seconds": {"type": "integer", "description": f"Server-side wait, default 0. Pass {MAX_RESULT_WAIT_SECONDS} (this client's max) on the normal path; most runs take minutes, so a smaller value just buys extra paid round-trips. On timeout returns one status snapshot."},
             },
             "required": ["run_id"],
         },
@@ -1694,17 +1744,8 @@ PARENT_TOOLS = [
     {
         "name": "watch_delegate",
         "description": (
-            "Token-cheap supervision of a delegated agent: its ORIGINAL task plus "
-            "its plain-text narration (numbered plan, one sentence of intent before "
-            "each step, one sentence of outcome after), with ALL tool output, file "
-            "contents and code stripped out -- plus output tokens burned. This is the "
-            "'watch it like a human running the chat: read its messages, not its "
-            "code' view. Call it repeatedly to follow a run. If the narration shows "
-            "it drifting: stop_delegate, then re-delegate a smaller, sharper task "
-            "(delegate_to_local). Do NOT try to SendMessage a correction to a running "
-            "agent -- a local `claude --bg` agent won't read it until its run ends, by "
-            "which point it is `done` and unreachable; SendMessage is only for "
-            "answering an agent that is `blocked` on its own question."
+            "Diagnostic narration with tool output and code removed. If the agent drifts, "
+            "stop it and re-delegate a tighter task."
         ),
         "inputSchema": {
             "type": "object",
@@ -1718,16 +1759,8 @@ PARENT_TOOLS = [
     {
         "name": "stop_delegate",
         "description": (
-            "Halt a delegated agent that is going the wrong way. Signals its process "
-            "(pid from the native roster): mode 'interrupt' (default, SIGINT) asks it "
-            "to drop the current step; mode 'terminate' (SIGTERM) ends the run. The "
-            "agent settles to `done` in ~10-15s (before its next step) and is then "
-            "NOT reachable by SendMessage -- recover by calling delegate_to_local "
-            "again with a smaller, sharper task; the stopped run's transcript stays "
-            "readable via get_delegate_result, so fold anything useful it already did "
-            "into the new task. This is the reliable way to course-correct: a running "
-            "local agent will not read a mid-run SendMessage. "
-            "Native equivalent: the TaskStop tool with the agent's name."
+            "Stop a drifting agent with SIGINT (interrupt, default) or SIGTERM "
+            "(terminate). Its transcript remains readable."
         ),
         "inputSchema": {
             "type": "object",
@@ -1741,17 +1774,8 @@ PARENT_TOOLS = [
     {
         "name": "fan_out_to_local",
         "description": (
-            "Map-reduce over the local model using NATIVE background agents: spawn one "
-            "`claude --bg` agent per item, all sharing `shared_instruction`. Use this "
-            "instead of stuffing everything into one giant local context (each item fits "
-            "its own window; chunking also tends to beat one huge context on accuracy). "
-            "Returns immediately with a batch_id; poll check_fanout_status, then "
-            "get_fanout_result once all settle. The real ceiling is the local server's "
-            "concurrency/KV-cache pool, not the number of items. PREFIX CACHING: "
-            "`shared_instruction` is placed FIRST in every item's prompt, so all children "
-            "share one token prefix and vLLM reuses its KV blocks -- only the first child "
-            "pays that prefill. Put everything common in `shared_instruction` and keep "
-            "`items` short and distinct; per-item preamble throws that reuse away."
+            "Run independent items in parallel, one local agent each. Put common context "
+            "in shared_instruction first for vLLM prefix-cache reuse; keep items short."
         ),
             "inputSchema": {
                 "type": "object",
@@ -1791,33 +1815,19 @@ PARENT_TOOLS = [
     {
         "name": "delegate_verified",
         "description": (
-            "Delegate a task to the local model AND have it independently verified "
-            "by a second local agent before you ever see the answer. Runs a closed "
-            "work -> check -> revise loop ENTIRELY on the local model: a worker "
-            "`claude --bg` agent does the task, then an adversarial checker agent "
-            "(no Edit/Write tools) re-verifies against the real working tree -- "
-            "reads the diff, builds, runs tests/lint -- and emits VERDICT: "
-            "PASS|FAIL. On FAIL the checker's reasons are fed back into a fresh "
-            "worker round. You get back ONLY a result a checker signed off on, or "
-            "a failure report with the reasons -- so the parent session never has "
-            "to review raw local-model output or remember to. Use this instead of "
-            "delegate_to_local when the task has a checkable outcome (code that "
-            "must build / pass tests / meet stated criteria). Returns a `vid` "
-            "immediately; poll check_verified_status(vid) to advance the loop "
-            "(one step per call, nothing blocks), then get_verified_result(vid) "
-            "once it says PASSED or FAILED. Guards against runaway loops: "
-            f"{DEFAULT_MAX_VERIFY_ITERS} iterations max (override with "
-            "max_iterations), stagnation detection (identical result twice -> "
-            f"stop), and a {DEFAULT_VERIFY_TIMEOUT}s wall-clock ceiling."
+            "Run a local worker, then a read-only checker, revising on failure. Use for "
+            "objective acceptance criteria. Returns vid immediately; advance with "
+            f"check_verified_status. Default max {DEFAULT_MAX_VERIFY_ITERS} rounds and "
+            f"{DEFAULT_VERIFY_TIMEOUT}s total."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "task": {"type": "string", "description": "The self-contained task for the worker. Include exact paths and what 'done' means. The worker starts with no memory of this conversation."},
-                "acceptance_criteria": {"type": "string", "description": "Explicit pass/fail conditions the checker must confirm (e.g. 'pytest -q is green', 'ruff check passes', 'CLI prints X for input Y'). STRONGLY recommended -- without it the checker only derives its own best-guess checks and the gate is weak."},
-                "allowed_tools": {"type": "string", "description": f"Comma-separated tools for the WORKER. Defaults to '{DEFAULT_VERIFY_WORKER_TOOLS}' (it must be able to change code). The checker's tools are fixed at '{VERIFY_CHECKER_TOOLS}' -- no Edit/Write, on purpose."},
+                "task": {"type": "string", "description": "Self-contained task with exact paths and completion conditions."},
+                "acceptance_criteria": {"type": "string", "description": "Explicit checks the checker must confirm."},
+                "allowed_tools": {"type": "string", "description": f"Worker tools; default '{DEFAULT_VERIFY_WORKER_TOOLS}'. Checker is read-only."},
                 "cwd": {"type": "string", "description": "Working directory for both worker and checker. Defaults to this server's cwd."},
-                "always_verify": {"type": "boolean", "description": "Force the checker round even when there is nothing objective to verify. By default a run with no acceptance_criteria that changed nothing on disk (or was read-only) returns the worker's answer WITHOUT spending a second local round-trip on a checker that could only re-state an opinion."},
+                "always_verify": {"type": "boolean", "description": "Force checking even without criteria or disk changes."},
                 "max_iterations": {"type": "integer", "description": f"Max work->check rounds before giving up. Default {DEFAULT_MAX_VERIFY_ITERS}, clamped to 1..10."},
                 "timeout_seconds": {"type": "integer", "description": f"Wall-clock ceiling for the whole loop. Default {DEFAULT_VERIFY_TIMEOUT}. Past this the run is force-failed."},
             },
@@ -1827,13 +1837,7 @@ PARENT_TOOLS = [
     {
         "name": "check_verified_status",
         "description": (
-            "Advance and report a delegate_verified run. Each call moves the "
-            "work->check->revise state machine forward at most one step by "
-            "reading the sub-agents' native state -- so poll this the way you'd "
-            "poll check_delegate_status. Shows the current phase (working / "
-            "checking / passed / failed), elapsed vs timeout, iteration count, "
-            "and a per-round trail (worker id -> checker id -> verdict). When it "
-            "reports PASSED or FAILED, call get_verified_result."
+            "Advance a verified run by one work/check/revise step and report its phase."
         ),
         "inputSchema": {
             "type": "object",
@@ -1846,12 +1850,7 @@ PARENT_TOOLS = [
     {
         "name": "get_verified_result",
         "description": (
-            "Fetch the outcome of a delegate_verified run. Errors (with the "
-            "current phase) until the loop has settled. On PASS: the signed-off "
-            "worker answer plus the verification trail. On FAIL: the failure "
-            "reason (iteration cap / stagnation / timeout / crashed sub-agent), "
-            "the last checker's feedback, and the last candidate answer (kept, "
-            "not discarded -- the working tree still has its changes)."
+            "Fetch a settled verified result: signed-off answer, or failure reason and last candidate."
         ),
         "inputSchema": {
             "type": "object",

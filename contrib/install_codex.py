@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import tomllib
 
@@ -13,18 +14,37 @@ import tomllib
 # final answer is charged to the supervising session. The server already compacts
 # these; this is the second, client-side ceiling (docs: tools.<tool>.output_token_limit).
 OUTPUT_TOKEN_LIMITS = {
-    'get_delegate_result': 12000,
-    'get_fanout_result': 16000,
-    'get_verified_result': 12000,
-    'watch_delegate': 8000,
-    'project_sync': 8000,
-    'check_delegate_status': 4000,
-    'check_fanout_status': 4000,
-    'check_verified_status': 4000,
+    'get_delegate_result': 4000,
+    'get_fanout_result': 8000,
+    'get_verified_result': 6000,
+    'watch_delegate': 4000,
+    'project_sync': 4000,
+    'check_delegate_status': 2000,
+    'check_fanout_status': 2000,
+    'check_verified_status': 2000,
 }
 TOOL_BUDGETS = ''.join(
     f'\n[mcp_servers.claude-local-delegate.tools.{tool}]\noutput_token_limit = {limit}\n'
     for tool, limit in OUTPUT_TOKEN_LIMITS.items())
+
+
+def upsert_table_value(text, table, key, value):
+    """Set one scalar without rewriting unrelated TOML or table-local options."""
+    header = '[' + table + ']'
+    match = re.search(r'(?m)^' + re.escape(header) + r'[ \t]*$', text)
+    assignment = f'{key} = {value}'
+    if not match:
+        return text.rstrip() + f'\n\n{header}\n{assignment}\n'
+    following = text[match.end():]
+    next_header = re.search(r'(?m)^\[', following)
+    end = len(text) if not next_header else match.end() + next_header.start()
+    body = text[match.end():end]
+    current = re.search(r'(?m)^[ \t]*' + re.escape(key) + r'[ \t]*=.*$', body)
+    if current:
+        body = body[:current.start()] + assignment + body[current.end():]
+    else:
+        body = body.rstrip() + '\n' + assignment + '\n'
+    return text[:match.end()] + body + text[end:]
 
 
 def main():
@@ -52,23 +72,44 @@ def main():
         raise SystemExit('Existing MCP entry points elsewhere; refusing to overwrite it.')
     changes = {}
     if not existing:
-        changes[config] = old.rstrip() + '\n' + block
+        updated_config = old.rstrip() + '\n' + block
+    else:
+        updated_config = old
+        for tool, limit in OUTPUT_TOKEN_LIMITS.items():
+            updated_config = upsert_table_value(
+                updated_config,
+                f'mcp_servers.claude-local-delegate.tools.{tool}',
+                'output_token_limit', limit)
+    if updated_config != old:
+        changes[config] = updated_config
     marker = '<!-- claude-local-delegate shared supervision -->'
-    rules = (f'\n\n{marker}\n'
+    end_marker = '<!-- /claude-local-delegate shared supervision -->'
+    rules = (f'{marker}\n'
              '# Shared local delegation and coordination\n\n'
-             'For supervising sessions: architecture and final review stay on the main model; '
-             'delegate routine work to the local model through claude-local-delegate. '
-             'Before project work, read the shared protocol below and call project_sync, '
-             'then task_claim. Start only your active reservations; pass task_id to delegates. '
-             'Sync at checkpoints and respect other supervisors\' reserved paths.\n\n'
-             f'Shared protocol: {repo / "COORDINATION.md"}\n'
-             f'Task briefing: {repo / "TASK_DESIGN.md"}\n\n'
+             'For supervising sessions, read the compact brief, then call project_sync and '
+             'task_claim. Keep architecture and final review on the main model. Delegate only '
+             'focused mechanical work; normally wait with '
+             'get_delegate_result(wait_seconds=120) instead of polling.\n\n'
+             f'Compact brief: {repo / "ARCHITECT_BRIEF.md"}\n'
+             f'Conflict/recovery reference: {repo / "COORDINATION.md"}\n'
+             f'Detailed task-design reference: {repo / "TASK_DESIGN.md"}\n\n'
              'If running as local-worker or local-checker, execute only the assigned task. '
-             'You are the delegated worker, not a supervisor. Never recursively delegate.\n')
+             'You are the delegated worker, not a supervisor. Never recursively delegate.\n'
+             f'{end_marker}\n')
     for target in (home / '.codex/AGENTS.md', home / '.claude/CLAUDE.md'):
         text = target.read_text() if target.exists() else ''
-        if marker not in text:
-            changes[target] = text.rstrip() + rules
+        if marker in text:
+            start = text.index(marker)
+            end = text.find(end_marker, start)
+            # Older installer versions always appended their unterminated managed
+            # block at EOF, so replacing that suffix is safe and makes future
+            # updates exactly bounded by begin/end markers.
+            end = len(text) if end < 0 else end + len(end_marker)
+            updated = text[:start].rstrip() + '\n\n' + rules + text[end:].lstrip('\n')
+        else:
+            updated = text.rstrip() + '\n\n' + rules
+        if updated != text:
+            changes[target] = updated
     link = home / '.codex/local-delegate-agents'
     agents = home / '.claude/agents'
     if link.exists() or link.is_symlink():

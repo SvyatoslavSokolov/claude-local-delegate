@@ -14,16 +14,29 @@ Parent-side tools: `delegate_to_local`, `check_delegate_status`,
 `get_verified_result`, `fan_out_to_local`,
 `check_fanout_status`, `get_fanout_result`.
 
+For the low-context supervisor path, read [ARCHITECT_BRIEF.md](ARCHITECT_BRIEF.md)
+instead of loading the full coordination and task-design references on every turn.
+`project_sync` returns every unfinished task, three compact completed-task digests,
+and 20 events by default. Generate aggregate timing, token, context, result-size,
+and tool-use statistics from local session history with:
+
+```bash
+python3 contrib/history_stats.py --pretty
+```
+
+The analyzer streams transcripts and prints aggregates only; it does not include
+prompts, answers, transcript paths, or credentials in its output.
+
 ## 0.8 — cheaper results, enforced least-privilege, and spawn provenance
 
 v0.8.0 makes supervision cheaper and the defaults honest. The headline changes:
 
-- **Result compaction.** `get_delegate_result` returns the first 4 + last 40
+- **Result compaction.** `get_delegate_result` returns the first 4 + last 15
   lines of the agent's final answer plus a `sha256` of the full text, instead of
   the whole thing. `full: true` returns everything; `max_lines` sets the tail.
   `get_fanout_result` compacts **each** item to its last 15 lines the same way,
   with the same params. Defaults come from `CLAUDE_LOCAL_DELEGATE_RESULT_LINES`
-  (40) and `CLAUDE_LOCAL_DELEGATE_FANOUT_LINES` (15). Nothing on disk is
+  (15) and `CLAUDE_LOCAL_DELEGATE_FANOUT_LINES` (15). Nothing on disk is
   truncated — the transcript is intact and `full: true` still returns all of it.
 - **Real least-privilege for read-only delegates.** A delegation whose
   `allowed_tools` are only read-only (Read, Grep, Glob, NotebookRead, TodoWrite)
@@ -78,7 +91,7 @@ v0.8.0 makes supervision cheaper and the defaults honest. The headline changes:
 v0.7 lets both Claude Code and Codex share one local backend, coordinated in
 [COORDINATION.md](COORDINATION.md). Your **main sessions** still start as plain
 `claude` or `codex` — nothing about launching them changes. A single MCP
-registration (added via `python3 contrib/install_codex.py --apply`) reuses the
+registration (added via `python3 contrib/install_codex.py --apply` (needs Python 3.11+ for `tomllib`)) reuses the
 existing local vLLM profile **for child processes only**, so workers and
 checkers run on the local model even when their parent is Codex. No second
 model profile or duplicated secrets. The installer also writes per-tool
@@ -172,9 +185,14 @@ it, including your main model.
 
 `delegate_to_local` spawns the subprocess in the background (detached, its
 own session) and returns a `run_id` immediately — it does not block the
-calling session for however long the local model takes. Poll
-`check_delegate_status(run_id)` for progress (with a log tail), then
-`get_delegate_result(run_id)` once it's done.
+calling session for however long the local model takes. For the normal
+unattended path, call
+`get_delegate_result(run_id, wait_seconds=900)` immediately after spawning (900 is the Claude Code ceiling; Codex allows 220 -- the tool description always states the live maximum). The
+server waits inside that one MCP call and returns the compact final answer when
+the agent settles. Repeat only if the wait expires. Use
+`check_delegate_status(run_id)` or `watch_delegate(run_id)` when you actually
+need to inspect progress or diagnose drift; every routine poll otherwise creates
+another parent-model turn with the accumulated context.
 
 Because the call returns immediately, firing several `delegate_to_local`
 calls back-to-back runs them **genuinely in parallel** — the only limit is
@@ -213,12 +231,12 @@ unreachable by `SendMessage`. So when a run drifts, stop it and re-delegate a
 sharper task rather than trying to steer it live. `SendMessage` is reliable only
 for answering an agent that is **`blocked`** on its own question.
 
-- **Every delegation is spawned with a supervision preamble** (`announce_plan`,
-  on by default): the agent must post a numbered plan as its first message,
+- **A delegation can be spawned with a supervision preamble** (`announce_plan`,
+  off by default): when enabled, the agent must post a numbered plan as its first message,
   then one plain sentence of intent before each step and one of outcome after —
   no pasted code, no file dumps. A mid-run message is treated as a
-  course-correction. Turn it off per call with `announce_plan: false` for a
-  trivial one-shot.
+  course-correction. Enable it only when you intend to watch a risky or long run;
+  the normal summary-only path avoids these extra narration turns.
 - **`watch_delegate(run_id)`** — the token-cheap view: the agent's *original
   task* + its plain-text narration (plan + per-step sentences) with **all tool
   output, file contents and code stripped**, plus output tokens burned so far.
@@ -363,8 +381,9 @@ summarization). You can also nudge it explicitly, or add a rule to your
 ```
 For mechanical, high-volume, or low-risk work (boilerplate, drafts,
 summaries, simple refactors), use delegate_to_local instead of doing it
-yourself. Poll with check_delegate_status and read the answer with
-get_delegate_result. You can start several delegations back-to-back to run
+yourself. After spawning, call get_delegate_result with the maximum wait_seconds the tool description reports (900 in Claude Code, 220 in Codex) so the
+server waits and returns the compact answer in one parent turn. Use status or
+watch calls only to diagnose progress. You can start several delegations back-to-back to run
 them in parallel. Keep architecture decisions and anything security-
 sensitive in this session. Always review a delegated result before treating
 it as final -- a delegated run can produce plausible-looking but subtly
@@ -409,7 +428,7 @@ correct both times. The gap was elsewhere:
 | `permission_mode` | no | `dontAsk` if read-only, else `bypassPermissions` | Native `--permission-mode`. A read-only allowlist defaults to `dontAsk` so `--allowedTools` is actually enforced (bypass **ignores** the allowlist — anthropics/claude-code#12232); anything wider defaults to `bypassPermissions` so the unattended agent runs its full granted toolset (Bash included) without prompting and parking. Narrow with `acceptEdits` (Bash gated) / `default` (all prompts) / `auto` (classifier-gated). |
 | `disallowed_tools` | no | — | Comma-separated tools to strip (e.g. `Bash`) — forces the agent onto a path it can finish when a user-level hook blocks a tool it would reach for. |
 | `agent` | no | `local-worker` | Subagent persona (system prompt). `""` = no persona. |
-| `announce_plan` | no | `true` | Prepend the supervision preamble: agent posts a numbered plan first, then one plain sentence before/after each step (what `watch_delegate` surfaces). `false` for a trivial one-shot. |
+| `announce_plan` | no | `false` | Prepend the supervision preamble only for a run you intend to watch: agent posts a numbered plan first, then one plain sentence before/after each step. |
 
 Returns the agent's **native id** (the id you see in `claude agents`).
 
@@ -432,14 +451,17 @@ full session id. When the state is `blocked`, the agent's last words (its
 question) are printed so you can answer with the native `SendMessage` tool.
 Cheap: reads `claude agents --json`, does not touch the model.
 
-**`get_delegate_result`** — `{run_id, full?, max_lines?}` → the agent's final
+**`get_delegate_result`** — `{run_id, full?, max_lines?, wait_seconds?}` → the agent's final
 answer, read from its **native transcript** (`~/.claude/projects/<dir>/<sessionId>.jsonl`).
-Compacted by default: the first 4 + last 40 lines plus a `sha256` of the full
+Compacted by default: the first 4 + last 15 lines plus a `sha256` of the full
 text (so a long answer can't flood the parent's context); `full: true` returns
 everything and `max_lines` overrides the tail size
-(`CLAUDE_LOCAL_DELEGATE_RESULT_LINES`, default 40). Nothing on disk is
-truncated — the transcript is intact. Errors while the agent is still
-`working`/`blocked` — call `check_delegate_status` first. **Review the output
+(`CLAUDE_LOCAL_DELEGATE_RESULT_LINES`, default 15). Nothing on disk is
+truncated — the transcript is intact. `wait_seconds` waits server-side (up to
+220 seconds) and returns the compact final in the same tool call. If the wait
+expires, it returns one compact status snapshot and leaves the agent running.
+Without `wait_seconds`, it errors while the agent is still `working`; use
+`check_delegate_status` only when you need a progress diagnosis. **Review the output
 before trusting it** — see the A/B test above for why a local-model agent can
 look right while being subtly wrong.
 

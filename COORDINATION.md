@@ -38,9 +38,13 @@ and returns an explicit UNVERIFIED PASS. Pass `always_verify: true` to force it.
    Prefer separate task reservations for separate writing workers. A write
    fan-out under one reservation does NOT isolate siblings from each other.
    Never delegate overlapping writes. Read-only fan-outs are appropriate.
-6. Poll check_delegate_status/watch_delegate; for verified loops call
-   check_verified_status (polling advances the loop). Review the final result,
-   diff and relevant checks. Then task_update(status="done", note=concise evidence).
+6. For an ordinary run, call `get_delegate_result(wait_seconds=120)` and let that
+   single MCP call wait and return the compact final answer. If it times out, call
+   it again; use `check_delegate_status`/`watch_delegate` only when you need to
+   inspect progress or diagnose drift. This avoids spending one main-model turn
+   per routine poll. Verified loops still use `check_verified_status` because
+   polling advances their state machine. Review the final result, diff and
+   relevant checks. Then task_update(status="done", note=concise evidence).
 
 ## Checkpoints, conflicts and handoffs
 

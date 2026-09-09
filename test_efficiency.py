@@ -36,6 +36,10 @@ class EfficiencyTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.s = load_server(self.tmp.name)
 
+    def test_parent_tool_schema_stays_compact(self):
+        encoded = json.dumps(self.s.PARENT_TOOLS, separators=(',', ':'))
+        self.assertLess(len(encoded), 12000)
+
     # ---- compaction ---------------------------------------------------------
     def test_compact_keeps_short_text_whole(self):
         body, trimmed = self.s._compact('one\ntwo', 40, 'compacted', 'ask for full')
@@ -62,6 +66,28 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(self.s._result_max_lines({'max_lines': 5}, 40), 5)
         self.assertEqual(self.s._result_max_lines({}, 40), 40)
         self.assertEqual(self.s._result_max_lines({'max_lines': 'junk'}, 40), 40)
+
+    def test_result_wait_seconds_is_bounded(self):
+        self.assertEqual(self.s._result_wait_seconds({}), 0)
+        self.assertEqual(self.s._result_wait_seconds({'wait_seconds': -1}), 0)
+        self.assertEqual(self.s._result_wait_seconds({'wait_seconds': '45'}), 45)
+        self.assertEqual(
+            self.s._result_wait_seconds({'wait_seconds': 9999}),
+            self.s.MAX_RESULT_WAIT_SECONDS,
+        )
+
+    def test_get_result_waits_server_side_then_returns_final(self):
+        path = transcript(os.path.join(self.tmp.name, 'wait.jsonl'), ['compact final'])
+        working = {'id': 'abc12345', 'state': 'working', 'sessionId': 'session-x'}
+        done = {'id': 'abc12345', 'state': 'done', 'sessionId': 'session-x'}
+        with patch.object(self.s, '_resolve_agent', side_effect=[(working, None), (done, None)]) as resolve, \
+             patch.object(self.s, '_find_transcript', return_value=path), \
+             patch.object(self.s.time, 'sleep') as sleep:
+            result = self.s.get_result({'run_id': 'abc12345', 'wait_seconds': 10})
+        self.assertFalse(result['isError'])
+        self.assertIn('compact final', result['content'][0]['text'])
+        self.assertEqual(resolve.call_count, 2)
+        sleep.assert_called_once()
 
     # ---- one pass, memoised -------------------------------------------------
     def test_transcript_is_read_once_and_cached(self):
