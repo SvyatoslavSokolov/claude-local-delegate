@@ -50,8 +50,9 @@ nontrivial delegation whose briefing needs detailed acceptance criteria.
 Historical baseline (704 known local sessions, 579 readable; regenerate with
 `python3 contrib/history_stats.py --pretty`, schema 2 counts one API response
 once): median duration 804s, 19 model calls, 25k output tokens (~69% of it
-thinking), 67k peak context; p95 peak context 154k. Every call carries ~31k
-tokens of fixed system/tool overhead (prefix-cached, but it still fills context). The delegate
+thinking), 67k peak context; p95 peak context 154k. That history carried ~20-31k
+tokens of fixed system/tool overhead per call; spawns now pass `--tools` with only
+the granted built-ins, which measured ~3.7k. Grant only the tools a task needs. The delegate
 profile is capped at 262,144 context tokens, covering 97.2% of this history before
 compaction while limiting KV-cache outliers. Every delegated task carries a report contract asking for at most 30 lines of
 substance (changes, verification actually run, assumptions), so the default

@@ -456,6 +456,12 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     # the tool list and the agent would start with no prompt (observed: blocked,
     # empty transcript). Put the task first, then the variadic flags.
     cmd.append(effective_task)
+    # --allowedTools only gates permissions; every built-in tool schema is still
+    # sent on every call. --tools removes the rest of the built-in set: measured
+    # fixed input 17.3k -> 7.5k tokens per call. MCP tools are unaffected.
+    builtin = sorted({t.split("(", 1)[0] for t in tools if not t.startswith("mcp__")})
+    if builtin and not os.environ.get("CLAUDE_LOCAL_DELEGATE_FULL_TOOLSET"):
+        cmd += ["--tools", ",".join(builtin)]
     if tools:
         cmd += ["--allowedTools", *tools]
     if disallowed:
