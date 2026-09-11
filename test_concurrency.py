@@ -16,7 +16,7 @@ def claim_at_once(db, project, key, start, out):
 
 
 class ProcessTests(unittest.TestCase):
-    def test_independent_servers_cannot_claim_same_write_scope(self):
+    def test_independent_servers_claim_same_write_scope_all_active(self):
         with tempfile.TemporaryDirectory() as project:
             ctx = multiprocessing.get_context('spawn')
             gate, out = ctx.Event(), ctx.Queue()
@@ -28,8 +28,10 @@ class ProcessTests(unittest.TestCase):
                     p.start()
                 gate.set()
                 statuses = [out.get(timeout=10) for _ in processes]
-                self.assertEqual(statuses.count('active'), 1, statuses)
-                self.assertEqual(statuses.count('waiting'), 5, statuses)
+                # Overlapping writes are no longer arbitrated into a queue: every
+                # concurrent claim succeeds as active. Overlap is surfaced by
+                # project_sync, never enforced at claim time.
+                self.assertEqual(statuses.count('active'), 6, statuses)
                 for p in processes:
                     p.join(10)
                     self.assertEqual(p.exitcode, 0)

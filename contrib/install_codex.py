@@ -23,6 +23,7 @@ OUTPUT_TOKEN_LIMITS = {
     'check_fanout_status': 2000,
     'check_verified_status': 2000,
 }
+MCP_TOOL_TIMEOUT_SECONDS = 1200
 TOOL_BUDGETS = ''.join(
     f'\n[mcp_servers.claude-local-delegate.tools.{tool}]\noutput_token_limit = {limit}\n'
     for tool, limit in OUTPUT_TOKEN_LIMITS.items())
@@ -64,7 +65,7 @@ def main():
              'command = "python3"\n'
              f'args = [{json.dumps(str(repo / "server.py"))}]\n'
              'startup_timeout_sec = 20\n'
-             'tool_timeout_sec = 240\n'
+             f'tool_timeout_sec = {MCP_TOOL_TIMEOUT_SECONDS}\n'
              '\n[mcp_servers.claude-local-delegate.env]\n'
              f'CLAUDE_LOCAL_DELEGATE_SETTINGS = {json.dumps(str(settings))}\n'
              + TOOL_BUDGETS)
@@ -74,7 +75,8 @@ def main():
     if not existing:
         updated_config = old.rstrip() + '\n' + block
     else:
-        updated_config = old
+        updated_config = upsert_table_value(
+            old, f'mcp_servers.{name}', 'tool_timeout_sec', MCP_TOOL_TIMEOUT_SECONDS)
         for tool, limit in OUTPUT_TOKEN_LIMITS.items():
             updated_config = upsert_table_value(
                 updated_config,
@@ -87,9 +89,12 @@ def main():
     rules = (f'{marker}\n'
              '# Shared local delegation and coordination\n\n'
              'For supervising sessions, read the compact brief, then call project_sync and '
-             'task_claim. Keep architecture and final review on the main model. Delegate only '
-             'focused mechanical work; normally wait with '
-             'get_delegate_result(wait_seconds=120) instead of polling.\n\n'
+             'task_claim. For every substantive project action, delegate the research, edits, '
+             'and checks to one focused local worker first. Do not duplicate its work while it '
+             'runs. Wait with get_delegate_result(wait_seconds=900), repeating only after a '
+             'timeout. Conserve main-model tokens: keep only task framing, architecture, and a '
+             'concise final review on the main model; request full results only when the compact '
+             'result or diff is insufficient.\n\n'
              f'Compact brief: {repo / "ARCHITECT_BRIEF.md"}\n'
              f'Conflict/recovery reference: {repo / "COORDINATION.md"}\n'
              f'Detailed task-design reference: {repo / "TASK_DESIGN.md"}\n\n'

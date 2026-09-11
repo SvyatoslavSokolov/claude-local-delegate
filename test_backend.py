@@ -15,6 +15,8 @@ class BackendTests(unittest.TestCase):
             settings.write_text(json.dumps({'env': {'ANTHROPIC_BASE_URL': 'http://localhost:4000',
                                                     'ANTHROPIC_MODEL': 'local-test', 'ANTHROPIC_API_KEY': 'test-only'}}))
             with patch.object(server, '_default_settings_path', return_value=str(settings)), \
+                 patch.object(server, 'STATE_DIR', tmp), \
+                 patch.object(server, 'PROVENANCE_PATH', str(Path(tmp) / 'provenance.json')), \
                  patch.dict(os.environ, {'CLAUDE_CODE_OAUTH_TOKEN': 'cloud', 'ANTHROPIC_AUTH_TOKEN': 'cloud'}), \
                  patch.object(server.subprocess, 'run') as run:
                 run.return_value.stdout = b'backgrounded abc12345'

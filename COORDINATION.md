@@ -4,9 +4,11 @@ These instructions are for the supervising session. A delegated local-worker or
 local-checker executes its assigned task; it must not follow supervisor delegation
 rules or recursively delegate.
 
-Keep architecture, task boundaries, acceptance criteria and final review on the
-main model. Delegate routine implementation, extraction, searches and checks to
-the local backend via claude-local-delegate. Read TASK_DESIGN.md before briefing
+Keep only task framing, architecture, acceptance criteria and concise final review
+on the main model. Delegate all substantive research, implementation, edits and
+checks to the local backend first, and do not duplicate that work while it runs.
+Prefer one focused worker unless tasks are truly independent, and request full
+results only when the compact answer or diff is insufficient. Read TASK_DESIGN.md before briefing
 nontrivial work. Give exact paths, a small outcome and executable checks. Do not
 trust a worker's claimed model identity: `check_delegate_status` prints the
 backend recorded at spawn time, and `local_backend_info` shows the configured
@@ -23,22 +25,26 @@ and returns an explicit UNVERIFIED PASS. Pass `always_verify: true` to force it.
    notes before doing work, including work you intend to do yourself.
 2. Call task_claim with a stable descriptive task_key, summary, mode and paths.
    Use literal relative file/directory paths; a directory reserves its subtree.
-   Default scope `.` reserves the entire project. Read/read may overlap; write
-   conflicts with either mode. Shell/build/tests need write mode because they may
-   change files. Include files whose stable content the task depends on.
-3. Start only if the returned task is active AND owned by this session (the
-   session_id from project_sync). An existing task from another owner is not
-   yours. Reuse the same task_key on retries; do not invent a new key to bypass
-   duplicate detection. Similar wording is not semantic duplicate detection:
-   read the summaries and agree on boundaries.
-4. For waiting tasks inspect blockers, do independent work, or wait. Retry using
-   task_update(status="active"). No execution starts automatically. Dependencies
-   are task IDs and must be done before a dependent task becomes active.
+   Default scope `.` reserves the entire project. Shell/build/tests need write
+   mode because they may change files. Include files whose stable content the task
+   depends on. A claim is always active: paths and declared depends_on are
+   recorded and returned by project_sync (the raw reservations are visible so you
+   can coordinate), but they never block, so a stale or "blocked" record cannot
+   hold follow-on work.
+3. Start a task once it is owned by this session (the session_id from
+   project_sync). An existing task from another owner is not yours. Reuse the
+   same task_key on retries; do not invent a new key to bypass duplicate
+   detection. Similar wording is not semantic duplicate detection: read the
+   summaries and agree on boundaries.
+4. Nothing waits on blockers or dependencies. If project_sync shows another
+   session's reservation touches the same paths, or a dependency is not done,
+   that record is visible only -- start your follow-on work anyway and reconcile
+   in review. There is no task_update(status="active") gate to retry.
 5. Pass task_id to delegate_to_local, fan_out_to_local or delegate_verified.
    Prefer separate task reservations for separate writing workers. A write
    fan-out under one reservation does NOT isolate siblings from each other.
-   Never delegate overlapping writes. Read-only fan-outs are appropriate.
-6. For an ordinary run, call `get_delegate_result(wait_seconds=120)` and let that
+   Read-only fan-outs are appropriate.
+6. For an ordinary run, call `get_delegate_result(wait_seconds=900)` and let that
    single MCP call wait and return the compact final answer. If it times out, call
    it again; use `check_delegate_status`/`watch_delegate` only when you need to
    inspect progress or diagnose drift. This avoids spending one main-model turn
@@ -60,13 +66,15 @@ pass after_event to avoid rereading notes. Post project_note for interface chang
 questions, handoff requests and blockers. Include task_id when relevant.
 
 Messages are a shared mailbox read on sync: they do not interrupt or wake another
-Codex/Claude session. A pause request is cooperative. If a conflict matters,
-stop starting work, stop your writing delegates and wait for their settled state.
-task_update(status="paused") retains paths; it does not suspend child processes.
-Use waiting to release a reservation only when all children have settled.
+Codex/Claude session. A pause request is cooperative. project_sync shows each
+session's reservation and its paths but does not compute or enforce overlap:
+a "conflicting" or "blocked" record does not stop your follow-on work, so proceed
+and reconcile in review rather than waiting.
+task_update(status="paused") keeps the task and its paths; it does not suspend child processes.
+Use status "waiting" only if you deliberately want to park a task; nothing forces it.
 Never stop another supervisor's worker without agreeing with that supervisor.
 
-Never automatically release stale reservations: a disconnected supervisor can
+Never automatically take over stale reservations: a disconnected supervisor can
 have live workers. Session IDs are printed by project_sync/initialize. To recover
 a disconnected supervisor, restart its MCP with CLAUDE_LOCAL_DELEGATE_SESSION_ID
 set to that exact ID only after confirming the old MCP process is gone; never

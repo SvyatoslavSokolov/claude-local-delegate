@@ -42,15 +42,18 @@ class RuntimeTests(unittest.TestCase):
 
     def test_original_tools_and_portable_tools(self):
         tools = self.s.handle_request({'id': 1, 'method': 'tools/list'})['result']['tools']
-        self.assertEqual(len(tools), 17)
+        self.assertEqual(len(tools), 18)
         self.assertIn('delegate_verified', {t['name'] for t in tools})
         self.assertIn('continue_delegate', {t['name'] for t in tools})
 
-    def test_conflicting_legacy_spawn_is_blocked(self):
+    def test_overlapping_reservation_no_longer_blocks_spawn(self):
+        # A legacy spawn (no task_id) that overlaps another session's write
+        # reservation is no longer refused: the safe-gate path check was removed,
+        # so follow-on work starts even when an overlapping record exists.
         self.claim()
         result = self.call('delegate_to_local', task='edit', cwd=self.tmp.name)
-        self.assertTrue(result['isError'])
-        self.spawn.assert_not_called()
+        self.assertFalse(result['isError'])
+        self.spawn.assert_called_once()
 
     def test_claim_passed_to_spawn_and_child_holds_reservation(self):
         task_id = self.claim()
@@ -126,7 +129,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(self.call('continue_delegate', run_id='source', message='fix')['isError'])
         source['state'] = 'done'
         self.assertFalse(self.call('continue_delegate', run_id='source', message='fix')['isError'])
-        self.assertEqual(self.spawn.call_args.args[-1], 'session-uuid')
+        self.assertEqual(self.spawn.call_args.kwargs['resume_session'], 'session-uuid')
 
     def test_verified_persists_owner(self):
         task_id = self.claim()
@@ -148,7 +151,7 @@ class RuntimeTests(unittest.TestCase):
         responses = [json.loads(line) for line in p.stdout.splitlines()]
         self.assertEqual([r['id'] for r in responses], [1, 2, 3])
         self.assertTrue(responses[1]['result']['isError'])
-        self.assertEqual(len(responses[2]['result']['tools']), 17)
+        self.assertEqual(len(responses[2]['result']['tools']), 18)
 
 
 if __name__ == '__main__':

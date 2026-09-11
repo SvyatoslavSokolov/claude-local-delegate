@@ -54,21 +54,6 @@ class Board:
         body = {'task_id': t['id'], 'owner': t['owner'], 'kind': kind, 'text': text[:2000], 'at': time.time()}
         con.execute('INSERT INTO events(project,body) VALUES (?,?)', (t['project'], json.dumps(body)))
 
-    def _blockers(self, task, tasks):
-        blockers = []
-        by_id = {t['id']: t for t in tasks}
-        for dep in task['depends_on']:
-            if dep not in by_id or by_id[dep]['status'] != 'done':
-                blockers.append({'task_id': dep, 'reason': 'dependency not done'})
-        for other in tasks:
-            if other['id'] == task['id'] or other['status'] not in ('active', 'paused'):
-                continue
-            if task['mode'] == other['mode'] == 'read':
-                continue
-            if any(overlap(a, b) for a in task['paths'] for b in other['paths']):
-                blockers.append({'task_id': other['id'], 'owner': other['owner'], 'reason': 'overlapping paths'})
-        return blockers
-
     def claim(self, owner, args):
         project = str(Path(args['project']).expanduser().resolve())
         if not Path(project).is_dir():
@@ -97,15 +82,15 @@ class Board:
             tasks = self._all(con)
             for t in tasks:
                 if t['project'] == project and t['task_key'] == key:
-                    return {'created': False, 'task': t, 'note': 'Existing task: do not duplicate it. Use task_update to retry your waiting task.'}
+                    return {'created': False, 'task': t, 'note': 'Existing task: do not duplicate it.'}
             if any(d not in {t['id'] for t in tasks} for d in dependencies):
                 raise ValueError('unknown dependency')
+            # Dependencies and overlapping reservations are recorded for status
+            # reporting, but they never block: a claim always becomes active. The
+            # supervisor may start follow-on work immediately; nothing is parked.
             t = {'id': uuid.uuid4().hex, 'project': project, 'task_key': key, 'owner': owner,
                  'summary': args.get('summary', key)[:2000], 'mode': mode, 'paths': sorted(set(resolved)),
-                 'depends_on': dependencies, 'status': 'waiting', 'runs': [], 'note': '', 'created_at': time.time()}
-            t['blockers'] = self._blockers(t, tasks)
-            if not t['blockers']:
-                t['status'] = 'active'
+                 'depends_on': dependencies, 'status': 'active', 'runs': [], 'note': '', 'created_at': time.time()}
             self._save(con, t)
             self._event(con, t, 'claim')
             return {'created': True, 'task': t}
@@ -144,14 +129,10 @@ class Board:
                 raise ValueError('invalid status')
             if t['status'] in ('done', 'cancelled'):
                 raise ValueError('task is terminal; use a new task_key for additional work')
-            if status == 'paused' and t['status'] == 'waiting':
-                raise ValueError('waiting task must acquire its reservation before it can be paused')
             if status in ('done', 'cancelled', 'waiting') and not runs_settled(t['runs']):
-                raise ValueError('cannot release reservation: delegated work is still running or its state is unknown')
-            if status == 'active':
-                t['blockers'] = self._blockers(t, tasks)
-                if t['blockers']:
-                    return {'task': t, 'blocked': True}
+                raise ValueError('cannot finalize the task: delegated work is still running or its state is unknown')
+            # No gate: a status update never re-checks dependencies or overlapping
+            # reservations, so a stale/blocked record cannot hold follow-on work.
             t['status'] = status
             note = args.get('note', t['note'])
             if takeover:
@@ -171,11 +152,6 @@ class Board:
             relevant = [t for t in tasks if overlap(project, t['project'])]
             for t in relevant:
                 t['stale'] = time.time() - t['updated_at'] > 900
-                if t['status'] == 'waiting':
-                    t['blockers'] = self._blockers(t, tasks)
-                    # Nothing starts by itself, but the supervisor should not have
-                    # to re-derive which of its parked tasks are now startable.
-                    t['ready'] = not t['blockers']
             active = [t for t in relevant if t['status'] not in ('done', 'cancelled')]
             completed = [t for t in relevant if t['status'] in ('done', 'cancelled')]
             recent = completed[-completed_limit:] if completed_limit else []
@@ -201,7 +177,7 @@ class Board:
                     'task_counts': counts, 'completed_returned': len(recent),
                     'events': events, 'has_more_events': has_more,
                     'next_event': rows[-1]['id'] if rows else cursor,
-                    'note': 'Reservations are cooperative. Stale does not mean safe to release. Paused tasks retain their paths.'}
+                    'note': 'Reservations are cooperative. Stale does not mean safe to take over. Paused tasks retain their paths.'}
 
     def note(self, owner, args):
         project = str(Path(args['project']).expanduser().resolve())
@@ -223,22 +199,9 @@ class Board:
                 if writes and t['mode'] != 'write':
                     raise ValueError('shell/write delegation needs a write reservation')
                 return t
-            for t in tasks:
-                if t['status'] not in ('active', 'paused') or not (writes or t['mode'] == 'write'):
-                    continue
-                hit = next((p for p in t['paths'] if overlap(cwd, p)), None)
-                if hit is None:
-                    continue
-                # Name the blocker. "project has reserved work" alone sent a user hunting
-                # through the board by hand for the one task that was in their way.
-                mine = t['owner'] == owner
-                raise ValueError(
-                    f"blocked by reservation {t['task_key']!r} (id {t['id']}, "
-                    f"{'yours' if mine else 'owned by ' + t['owner']}, mode {t['mode']}, "
-                    f"status {t['status']}) on path {hit!r}. "
-                    + ('Pass its task_id to delegate under it, or claim a task with '
-                       'non-overlapping paths.' if mine else
-                       'Ask that session to release it, or use project_note to request a handoff.'))
+            # No path gate: another session's reservation no longer blocks this
+            # spawn. Overlap is visible in project_sync, never enforced here, so a
+            # stale or blocking record can't stop follow-on work.
             return None
 
     def owner_for_run(self, run_id):
@@ -264,12 +227,12 @@ TOOLS = [
            {'project': STRING, 'after_event': {'type': 'integer', 'minimum': 0},
             'completed_limit': {'type': 'integer', 'minimum': 0, 'maximum': 20, 'description': 'Recent terminal task digests to return; default 3.'},
             'event_limit': {'type': 'integer', 'minimum': 0, 'maximum': 50, 'description': 'Incremental events to return; default 20.'}}, ['project']),
-    schema('task_claim', 'Atomically reserve a unique task and literal file/directory paths. Read/read may overlap; writes exclude reads and writes. Conflicts/dependencies create waiting tasks. Only active tasks may start.',
+    schema('task_claim', 'Atomically reserve a unique task and literal file/directory paths for status reporting. A claim is always active: overlapping paths and declared depends_on are recorded but never block, so follow-on work may start immediately.',
            {'project': STRING, 'task_key': STRING, 'summary': STRING, 'paths': {'type': 'array', 'items': STRING},
             'mode': {'type': 'string', 'enum': ['read', 'write']}, 'depends_on': {'type': 'array', 'items': STRING}}, ['project', 'task_key']),
-    schema('task_update', 'Update your task. active retries waiting dependencies/locks; paused retains locks; waiting releases locks; done/cancelled release only after children settle. Record evidence in note. Nothing expires on its own, but a reservation whose owning session has gone away can be released with takeover=true: only to done or cancelled, only once it has been idle past the threshold, and only when it has no delegated work still running. The release is stamped into its note.',
+    schema('task_update', 'Update your task status. paused keeps the task and its paths; done/cancelled are accepted only once its delegated runs have settled. Status changes never re-check dependencies or overlapping paths, so a stale or blocking record cannot hold follow-on work. Record evidence in note. Nothing expires on its own, but a reservation whose owning session has gone away can be moved to done or cancelled with takeover=true: only once it has been idle past the threshold, and only when it has no delegated work still running. That change is stamped into its note.',
            {'task_id': STRING, 'status': {'type': 'string', 'enum': ['active', 'paused', 'waiting', 'done', 'cancelled']}, 'note': STRING,
-            'takeover': {'type': 'boolean', 'description': "Release another session's abandoned reservation. Refused unless it is idle past the threshold and has no running delegates."}}, ['task_id']),
+            'takeover': {'type': 'boolean', 'description': "Move another session's abandoned reservation to done or cancelled. Refused unless it is idle past the threshold and has no running delegates."}}, ['task_id']),
     schema('project_note', 'Post a short coordination note or handoff/pause request for the other supervisor. Delivered when they call project_sync, not a push notification or forced pause.',
            {'project': STRING, 'task_id': STRING, 'message': STRING}, ['project', 'message']),
 ]

@@ -30,7 +30,7 @@ def _pad_frac(match):
     digits = (match.group(1) + "000000")[:6]
     return "." + digits
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PEAK_THRESHOLDS = (32768, 65536, 131072, 262144)
 DURATION_THRESHOLDS = (120, 300, 600)
 PERCENTILES = (50, 75, 90, 95)
@@ -90,7 +90,12 @@ def stream_transcript(path, start_ts):
     Raises OSError/IOError if the file cannot be opened; the caller retries the
     next hardlinked copy or records it as unreadable.
     """
-    assistant_turns = 0
+    # Claude Code splits one API response across several "assistant" entries
+    # that share message.id and each repeat the same usage.  Keep only the
+    # last usage per id so tokens and "turns" (unique API responses) are not
+    # inflated; entries without an id count individually.
+    usage_by_id = {}
+    anon_turns = 0
     sum_input = sum_cread = sum_ccreate = sum_output = 0
     peak = 0
     final_chars = 0
@@ -98,6 +103,20 @@ def stream_transcript(path, start_ts):
     tool_calls = 0
     tools = Counter()
     max_ts = None
+
+    def add_usage(usage):
+        nonlocal sum_input, sum_cread, sum_ccreate, sum_output, peak
+        inp = usage.get("input_tokens") or 0
+        cr = usage.get("cache_read_input_tokens") or 0
+        cc = usage.get("cache_creation_input_tokens") or 0
+        out = usage.get("output_tokens") or 0
+        sum_input += inp
+        sum_cread += cr
+        sum_ccreate += cc
+        sum_output += out
+        pc = inp + cr + cc
+        if pc > peak:
+            peak = pc
 
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
@@ -115,24 +134,18 @@ def stream_transcript(path, start_ts):
                 max_ts = ts
             if event.get("type") != "assistant":
                 continue
-            assistant_turns += 1
             message = event.get("message")
             if not isinstance(message, dict):
                 message = {}
             usage = message.get("usage")
             if not isinstance(usage, dict):
                 usage = {}
-            inp = usage.get("input_tokens") or 0
-            cr = usage.get("cache_read_input_tokens") or 0
-            cc = usage.get("cache_creation_input_tokens") or 0
-            out = usage.get("output_tokens") or 0
-            sum_input += inp
-            sum_cread += cr
-            sum_ccreate += cc
-            sum_output += out
-            pc = inp + cr + cc
-            if pc > peak:
-                peak = pc
+            msg_id = message.get("id")
+            if msg_id:
+                usage_by_id[msg_id] = usage  # later entry repeats same usage
+            else:
+                anon_turns += 1
+                add_usage(usage)
             content = message.get("content")
             if isinstance(content, list):
                 texts = []
@@ -151,6 +164,10 @@ def stream_transcript(path, start_ts):
                     joined = "".join(texts)
                     final_chars = len(joined)
                     final_lines = joined.count("\n") + 1
+
+    for usage in usage_by_id.values():
+        add_usage(usage)
+    assistant_turns = len(usage_by_id) + anon_turns
 
     if max_ts is None:
         max_ts = float(os.path.getmtime(path))

@@ -24,20 +24,20 @@ class BoardTests(unittest.TestCase):
             args['depends_on'] = depends_on
         return self.board.claim(owner, args)
 
-    def test_write_write_conflict_including_directory_child(self):
+    def test_overlapping_writes_are_reported_not_blocked(self):
         a = self.claim('a', paths=['a.txt'])
         self.assertEqual(a['task']['status'], 'active')
-        # Direct write/write conflict on the same file.
+        # A direct write/write conflict on the same file no longer parks the second
+        # claim: it is active immediately and the overlap is left for project_sync to
+        # report, not enforced here.
         b = self.claim('b', paths=['a.txt'])
-        self.assertEqual(b['task']['status'], 'waiting')
-        self.assertTrue(any(blk['task_id'] == a['task']['id'] for blk in b['task']['blockers']))
+        self.assertEqual(b['task']['status'], 'active')
         # Directory-child: write on the parent directory vs a child file inside it.
         os.mkdir(os.path.join(self.project, 'src'))
         d = self.claim('d', paths=['src'])
         self.assertEqual(d['task']['status'], 'active')
         e = self.claim('e', paths=['src/child.txt'])
-        self.assertEqual(e['task']['status'], 'waiting')
-        self.assertTrue(any(blk['task_id'] == d['task']['id'] for blk in e['task']['blockers']))
+        self.assertEqual(e['task']['status'], 'active')
 
     def test_read_read_succeeds(self):
         a = self.claim('r1', mode='read', paths=['a.txt'])
@@ -52,33 +52,29 @@ class BoardTests(unittest.TestCase):
         self.assertFalse(b['created'])
         self.assertEqual(b['task']['id'], a['task']['id'])
 
-    def test_dependency_waits_then_active_after_done(self):
+    def test_dependency_is_recorded_but_not_blocking(self):
         a = self.claim('dep', paths=['x.txt'])
         self.assertEqual(a['task']['status'], 'active')
         b = self.claim('consumer', paths=['y.txt'], depends_on=[a['task']['id']])
-        self.assertEqual(b['task']['status'], 'waiting')
-        # Prerequisite still not done -> consumer remains blocked.
-        self.board.update('alice', {'task_id': b['task']['id'], 'status': 'active'}, self.settled)
-        self.assertEqual(b['task']['status'], 'waiting')
-        # Mark prerequisite done.
-        self.board.update('alice', {'task_id': a['task']['id'], 'status': 'done'}, self.settled)
-        # Now the consumer can go active.
-        result = self.board.update('alice', {'task_id': b['task']['id'], 'status': 'active'}, self.settled)
-        self.assertEqual(result['task']['status'], 'active')
+        # The dependency is recorded on the consumer, but it no longer parks it:
+        # the consumer is active immediately and follow-on work can start even
+        # though the prerequisite has not reached done.
+        self.assertEqual(b['task']['status'], 'active')
+        self.assertEqual(b['task']['depends_on'], [a['task']['id']])
 
     def test_wrong_owner_cannot_update(self):
         a = self.claim('own', owner='alice')
         with self.assertRaises(ValueError):
             self.board.update('bob', {'task_id': a['task']['id'], 'status': 'paused'}, self.settled)
 
-    def test_paused_retains_reservation(self):
+    def test_paused_retains_paths_but_does_not_block(self):
         a = self.claim('p1', paths=['a.txt'])
         self.assertEqual(a['task']['status'], 'active')
         self.board.update('alice', {'task_id': a['task']['id'], 'status': 'paused'}, self.settled)
-        # A paused task still holds its paths, so a conflicting write is blocked.
+        # A paused task still records its paths, but a conflicting write is no longer
+        # blocked: the second claim is active immediately.
         b = self.claim('p2', paths=['a.txt'])
-        self.assertEqual(b['task']['status'], 'waiting')
-        self.assertTrue(any(blk['task_id'] == a['task']['id'] for blk in b['task']['blockers']))
+        self.assertEqual(b['task']['status'], 'active')
 
     def test_child_not_settled_prevents_done(self):
         a = self.claim('c1', paths=['a.txt'])

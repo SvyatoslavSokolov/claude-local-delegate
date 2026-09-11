@@ -71,6 +71,8 @@ import sys
 import time
 import uuid
 
+import metrics
+
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "claude-local-delegate"
 SERVER_VERSION = "0.8.0"
@@ -122,6 +124,24 @@ STATE_DIR = os.environ.get(
 # by definition not ours and not local.
 PROVENANCE_PATH = os.path.join(STATE_DIR, "runs.json")
 PROVENANCE_KEEP = 500
+# Optional cheaper model used when the caller (or the complexity heuristic)
+# picks the "fast" profile: thinking is off and, if this is set, the spawn is
+# routed to it explicitly instead of the backend's default model. Empty -> the
+# fast profile still means "think", just without the model override.
+FAST_MODEL = os.environ.get("CLAUDE_LOCAL_DELEGATE_FAST_MODEL", "")
+
+
+def _fast_model():
+    """Thinking-off gateway route for profile=fast: the MCP env wins, else the
+    backend profile's env (it lives next to the gateway it names), else ''."""
+    if FAST_MODEL:
+        return FAST_MODEL
+    try:
+        from local_backend import profile as _backend_profile
+        return str(_backend_profile(_default_settings_path()).get(
+            "CLAUDE_LOCAL_DELEGATE_FAST_MODEL", "")).strip()
+    except (OSError, ValueError):
+        return ""
 # Tools that cannot change the machine. An allowlist of only these is a genuinely
 # read-only delegation -- and only then is `dontAsk` safe as the permission mode.
 READ_ONLY_TOOLS = frozenset({"Read", "Grep", "Glob", "NotebookRead", "TodoWrite"})
@@ -144,10 +164,10 @@ LOCAL_SERVER_MAX_CONCURRENCY = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_CON
 DEFAULT_RESULT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_RESULT_LINES", "30"))
 DEFAULT_FANOUT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_FANOUT_LINES", "15"))
 # A result call may wait inside the MCP process instead of making the paid
-# supervisor take one model turn per status poll. Keep this below Codex's
-# installer-written 240s tool timeout. Callers with a shorter client timeout can
-# request a smaller value if their client has a tighter timeout.
-MAX_RESULT_WAIT_SECONDS = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_RESULT_WAIT", "220"))
+# supervisor take one model turn per status poll. The installer gives this call
+# extra headroom with a 1200s client timeout. Callers with a shorter client
+# timeout can request a smaller value if needed.
+MAX_RESULT_WAIT_SECONDS = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_RESULT_WAIT", "900"))
 RESULT_WAIT_POLL_SECONDS = float(os.environ.get("CLAUDE_LOCAL_DELEGATE_RESULT_WAIT_POLL", "3"))
 # How many consecutive state-less roster reads still count as "still working"
 # before the wait gives up and reports what it actually saw.
@@ -335,7 +355,10 @@ def _default_agent():
 def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
                         disallowed_tools=None, agent=None, announce_plan=None,
                         report_contract=True,
-                        resume_session=None):
+                        resume_session=None,
+                        profile=None, spawn_model=None,
+                        complexity=None, est_minutes=None, blocks=None,
+                        task_id=None, task_key=None):
     """Spawn ONE native `claude --bg` agent on the local model.
 
     Returns (short_id, None) on success or (None, error_message).
@@ -394,16 +417,26 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     if report_contract:
         effective_task += REPORT_CONTRACT.format(max_lines=DEFAULT_RESULT_LINES)
 
-    from local_backend import environment, profile
+    from local_backend import environment, profile as _backend_profile  # 'profile' is taken by the param
     try:
         backend_env = environment(settings_path)
-        backend_model = profile(settings_path)["ANTHROPIC_MODEL"]
+        backend_model = _backend_profile(settings_path)["ANTHROPIC_MODEL"]
     except (OSError, ValueError) as exc:
         return None, f"Invalid local backend profile: {exc}"
 
+    # Fast profile + an explicit FAST_MODEL -> route the whole child (main and
+    # small/fast/default models) to that cheaper model, with thinking off.
+    # Otherwise the backend's default model is used, as before.
+    model = spawn_model or backend_model
+    if spawn_model:
+        for var in ("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
+            backend_env[var] = spawn_model
+
     cmd = [
         CLAUDE_BIN, "--settings", settings_path, "--bg",
-        "--model", backend_model,
+        "--model", model,
         "--name", name,
         "--permission-mode", pmode,
     ]
@@ -447,7 +480,7 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
         _record_provenance(short_id, {
             "at": time.time(),
             "backend": "local",
-            "model": backend_model,
+            "model": model,
             "base_url": backend_env.get("ANTHROPIC_BASE_URL", ""),
             "settings_path": settings_path,
             "settings_sha": _settings_fingerprint(settings_path),
@@ -456,6 +489,26 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
             "read_only": _is_read_only(allowed_tools),
             "cwd": cwd,
             "name": name,
+            "profile_requested": profile,
+            "profile_effective": profile,
+        })
+        # Planning metadata for the delegation metrics ledger (best-effort; it
+        # never breaks a spawn). The matching "rate" event is written by
+        # rate_delegate after the supervisor reviews the result.
+        metrics.append_event(STATE_DIR, {
+            "event": "spawn",
+            "run_id": short_id,
+            "task_id": task_id,
+            "task_key": task_key,
+            "name": name,
+            "complexity": complexity,
+            "est_minutes": est_minutes,
+            "blocks": blocks or [],
+            "profile": profile,
+            "model": model,
+            "prompt_chars": len(task),
+            "read_only": _is_read_only(allowed_tools),
+            "cwd": cwd,
         })
     if not short_id:
         return None, (
@@ -756,10 +809,24 @@ def start_delegate(args):
     disallowed_tools = args.get("disallowed_tools")
     agent = args.get("agent")  # None -> default persona; "" -> no persona; name -> that persona
     announce_plan = args.get("announce_plan")  # None -> DEFAULT_ANNOUNCE_PLAN
+    # Planning metadata + model routing. complexity/est_minutes/blocks feed the
+    # schedule/ETA report; profile (fast = thinking off) selects the model.
+    complexity = args.get("complexity")
+    est_minutes = args.get("est_minutes")
+    blocks = args.get("blocks")
+    task_id = args.get("task_id")
+    effective_profile = metrics.profile_for(complexity, args.get("profile"))
+    # Fast profile with a configured cheaper model -> route there explicitly.
+    spawn_model = _fast_model() if effective_profile == "fast" else None
+    if not spawn_model:
+        effective_profile = "think"  # no fast route configured: the ledger must say what really ran
 
+    _kw = {"profile": effective_profile, "spawn_model": spawn_model,
+           "complexity": complexity, "est_minutes": est_minutes,
+           "blocks": blocks, "task_id": task_id}
     short_id, err = _spawn_native_agent(
         task, allowed_tools, cwd, name, permission_mode, disallowed_tools, agent,
-        announce_plan,
+        announce_plan, **_kw,
     )
     if err:
         return _error_result(err)
@@ -777,7 +844,64 @@ def start_delegate(args):
                 f"To course-correct if it drifts: stop_delegate({short_id!r}), then "
                 f"delegate_to_local again with a sharper task (the stopped run stays "
                 f"readable via get_delegate_result). A running local agent will NOT read a "
-                f"mid-run SendMessage; use SendMessage only to answer it when it is `blocked`."
+                f"mid-run SendMessage; use SendMessage only to answer it when it is `blocked`.\n"
+                f"After review call rate_delegate(run_id, quality, worth_it)."
+            ),
+        }],
+        "isError": False,
+    }
+
+
+def rate_delegate(args):
+    run_id = args.get("run_id")
+    quality = args.get("quality")
+    worth_it = args.get("worth_it")
+    note = args.get("note")
+
+    if not run_id or not isinstance(run_id, str):
+        return _error_result("`run_id` is required and must be the agent id string.")
+    for label, value in (("quality", quality), ("worth_it", worth_it)):
+        if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= 100):
+            return _error_result(f"`{label}` is required and must be an integer from 0 to 100.")
+    if note is not None:
+        if not isinstance(note, str):
+            return _error_result("`note` must be a string.")
+        note = note[:500]
+
+    # Resolve the run's transcript (best-effort); stats are computed if present.
+    stats = None
+    agent, _err = _resolve_agent(run_id)
+    if agent:
+        session_id = agent.get("sessionId") or ""
+        transcript = _find_transcript(session_id) if session_id else None
+        if transcript:
+            try:
+                stats = metrics.transcript_stats(transcript)
+            except OSError:
+                stats = None
+
+    # Append the rate event to the ledger. If the transcript was missing we still
+    # record the scores, with stats null, so the supervision signal is not lost.
+    metrics.append_event(STATE_DIR, {
+        "event": "rate",
+        "run_id": run_id,
+        "quality": quality,
+        "worth_it": worth_it,
+        "note": note,
+        "stats": stats,
+    })
+
+    if stats:
+        detail = (f"{stats.get('duration_s')}s, {stats.get('output_tokens')} output tokens, "
+                  f"{stats.get('api_calls')} API calls")
+    else:
+        detail = "no transcript found"
+    return {
+        "content": [{
+            "type": "text",
+            "text": (
+                f"Recorded rate for run {run_id}: quality={quality}, worth_it={worth_it} "
+                f"({detail})."
             ),
         }],
         "isError": False,
@@ -1705,6 +1829,10 @@ PARENT_TOOLS = [
                 "disallowed_tools": {"type": "string", "description": "Comma-separated tools to remove. Default none."},
                 "agent": {"type": "string", "description": "Persona name; default local-worker; empty disables it."},
                 "announce_plan": {"type": "boolean", "description": f"Prepend a plan/step narration preamble for a run you intend to watch. Default {DEFAULT_ANNOUNCE_PLAN}; leave off for the normal summary-only path to avoid extra local turns."},
+                "complexity": {"type": "string", "enum": list(metrics.COMPLEXITIES), "description": "Expected size of the work. Feeds the schedule/ETA report; trivial/small -> fast profile, medium/large -> think (unless profile is set)."},
+                "est_minutes": {"type": "integer", "minimum": 0, "description": "Estimated wall-clock minutes for this run. Feeds the schedule/ETA report."},
+                "blocks": {"type": "array", "items": {"type": "string"}, "description": "Task keys (from task_claim) that this work blocks. Feeds the schedule/ETA report."},
+                "profile": {"type": "string", "enum": ["fast", "think"], "description": "Model profile. fast = thinking off (and the cheaper FAST_MODEL if configured); think = default. Explicit profile wins over the complexity heuristic."},
             },
             "required": ["task"],
         },
@@ -1739,6 +1867,25 @@ PARENT_TOOLS = [
                 "wait_seconds": {"type": "integer", "description": f"Server-side wait, default 0. Pass {MAX_RESULT_WAIT_SECONDS} (this client's max) on the normal path; most runs take minutes, so a smaller value just buys extra paid round-trips. On timeout returns one status snapshot."},
             },
             "required": ["run_id"],
+        },
+    },
+    {
+        "name": "rate_delegate",
+        "description": (
+            "After you have reviewed a delegate's result, record two 0-100 scores for "
+            "the delegation ledger (drives the later schedule/ETA and was-it-worth-it "
+            "analysis). Call once per run you actually relied on. Cheap: reads the run's "
+            "transcript only for stats and appends one ledger line."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "The agent id returned by delegate_to_local."},
+                "quality": {"type": "integer", "minimum": 0, "maximum": 100, "description": "0 = did not do what was asked, 50 = what you would have produced, 100 = far better than you."},
+                "worth_it": {"type": "integer", "minimum": 0, "maximum": 100, "description": "0 = doing it yourself would have been cheaper/faster in main-model tokens and time, 100 = delegation clearly paid off."},
+                "note": {"type": "string", "description": "Optional one-line note (truncated to 500 chars)."},
+            },
+            "required": ["run_id", "quality", "worth_it"],
         },
     },
     {
@@ -1871,6 +2018,7 @@ TOOL_HANDLERS = {
     "delegate_to_local": start_delegate,
     "check_delegate_status": check_status,
     "get_delegate_result": get_result,
+    "rate_delegate": rate_delegate,
     "watch_delegate": watch_delegate,
     "stop_delegate": stop_delegate,
     "fan_out_to_local": fan_out_to_local,

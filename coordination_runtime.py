@@ -12,7 +12,7 @@ from coordination import Board, TOOLS, STRING, schema
 # a status poll must stay cheap even while another supervisor is spawning.
 READ_ONLY_CALLS = frozenset({
     'project_sync', 'local_backend_info', 'check_delegate_status', 'watch_delegate',
-    'get_delegate_result', 'check_fanout_status', 'get_fanout_result',
+    'get_delegate_result', 'check_fanout_status', 'get_fanout_result', 'rate_delegate',
 })
 # Tools whose slow step is a `claude --bg` subprocess and which hold no
 # half-written state across it, so the lock may be released while it runs.
@@ -125,7 +125,7 @@ def install(server):
     original_spawn = server._spawn_native_agent
 
     def spawn(task, allowed_tools, cwd, name, permission_mode=None,
-              disallowed_tools=None, agent=None, announce_plan=None, resume_session=None):
+              disallowed_tools=None, agent=None, announce_plan=None, **spawn_kwargs):
         with locked():
             # Bash can write; allowlists are not filesystem isolation.
             granted = {t.strip() for t in (allowed_tools or server.DEFAULT_ALLOWED_TOOLS).split(',')}
@@ -162,6 +162,9 @@ def install(server):
                         + '\n'.join(reservation['paths']) + '\n'
                         'Do not modify outside this scope. If you need another path, STOP and report the dependency. '
                         'Do not delegate recursively.\n\n' + task)
+            # Keyword-forward everything else (report_contract, resume_session,
+            # profile/complexity/...) so it lands in the right parameter.
+            spawn_kwargs.setdefault('task_key', (reservation or {}).get('task_key'))
             ticket = take_ticket()
             try:
                 # Slow step, no shared state touched: let other supervisors read and
@@ -169,10 +172,10 @@ def install(server):
                 if release_on_spawn:
                     with unlocked():
                         run_id, error = original_spawn(task, allowed_tools, cwd, name, permission_mode,
-                                                       disallowed_tools, agent, announce_plan, resume_session)
+                                   disallowed_tools, agent, announce_plan, **spawn_kwargs)
                 else:
                     run_id, error = original_spawn(task, allowed_tools, cwd, name, permission_mode,
-                                                   disallowed_tools, agent, announce_plan, resume_session)
+                                   disallowed_tools, agent, announce_plan, **spawn_kwargs)
             finally:
                 drop_ticket(ticket)
             if run_id:
@@ -230,12 +233,6 @@ def install(server):
     def sync(args):
         data = board.sync(owner, args)
         data['pool'] = pool_snapshot()
-        ready = [t['id'] for t in data['tasks'] if t.get('status') == 'waiting' and t.get('ready')]
-        if ready:
-            data['startable_waiting_tasks'] = ready
-            data['note'] += (' Waiting tasks whose blockers cleared are listed in '
-                             'startable_waiting_tasks; nothing starts automatically -- '
-                             'call task_update(status="active") to take one.')
         return result(data)
 
     def backend_info(args):
@@ -262,7 +259,7 @@ def install(server):
     for tool in server.PARENT_TOOLS:
         if tool['name'] in ('delegate_to_local', 'fan_out_to_local', 'delegate_verified'):
             tool['inputSchema']['properties']['task_id'] = {
-                'type': 'string', 'description': 'Active task_claim reservation owned by this MCP session. Required when overlapping work is reserved.'}
+                'type': 'string', 'description': 'Active task_claim reservation owned by this MCP session. Pass it for bookkeeping; the task always starts, and overlapping reservations are visible in project_sync but never block it.'}
         if 'SendMessage' in tool['description']:
             tool['description'] += ' In Codex use stop_delegate, wait until settled, then continue_delegate with the reply; native SendMessage is Claude-only.'
 
@@ -277,9 +274,9 @@ def install(server):
             response['result']['serverInfo']['version'] = '0.8.0'
             response['result']['instructions'] = (
                 'Shared local vLLM delegation for Claude Code and Codex. Worker runtime: Claude CLI. '
-                'Before project work call project_sync then task_claim; start only active tasks. '
+                'Before project work call project_sync then task_claim; a claim is always active. '
                 'Pass task_id to delegation. Use task_update checkpoints and project_note for coordination. '
-                'Paused reservations retain paths. Stale does not mean released. '
+                'Reservations are visible in project_sync but never block; stale or blocking records do not hold follow-on work. '
                 'Native SendMessage is unavailable in Codex: stop, wait, continue_delegate instead. '
                 'Session identity: ' + owner)
             return response

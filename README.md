@@ -100,13 +100,16 @@ blocks into `~/.codex/config.toml`, so a Codex client caps each tool's output
 on its side too (the server-side compaction above is the first of the two).
 
 Both clients work off the **same task reservations** in
-`~/.claude-local-delegate/coordination.sqlite3`: claim a task before delegating
-and never overlap a write. Because Codex has no native `SendMessage`, it talks
-to a settled worker with the portable **`continue_delegate`** (fork/restart,
-transcript retained); Claude keeps native `SendMessage`. Coordination is
-**cooperative, not OS-enforced** — reservations are checked before spawning,
-not filesystem locks, so for strong isolation use separate worktrees and a
-single integration owner.
+`~/.claude-local-delegate/coordination.sqlite3`: claim a task before delegating.
+A claim is always active — overlapping paths and declared dependencies are
+recorded and returned by `project_sync` (the raw reservations are visible so you
+can coordinate), but they never block, so a stale or "blocked" record cannot stop
+follow-on work. Because Codex has no native
+`SendMessage`, it talks to a settled worker with the portable
+**`continue_delegate`** (fork/restart, transcript retained); Claude keeps native
+`SendMessage`. Coordination is **cooperative and reporting-only, not OS-enforced**
+— reservations are not filesystem locks, so for strong isolation use separate
+worktrees and a single integration owner.
 
 ## Why a native `claude --bg` agent instead of a `claude -p` black box
 
@@ -187,7 +190,7 @@ it, including your main model.
 own session) and returns a `run_id` immediately — it does not block the
 calling session for however long the local model takes. For the normal
 unattended path, call
-`get_delegate_result(run_id, wait_seconds=900)` immediately after spawning (900 is the Claude Code ceiling; Codex allows 220 -- the tool description always states the live maximum). The
+`get_delegate_result(run_id, wait_seconds=900)` immediately after spawning (900 is the ceiling in Claude Code and Codex). The
 server waits inside that one MCP call and returns the compact final answer when
 the agent settles. Repeat only if the wait expires. Use
 `check_delegate_status(run_id)` or `watch_delegate(run_id)` when you actually
@@ -379,13 +382,14 @@ summarization). You can also nudge it explicitly, or add a rule to your
 `CLAUDE.md`:
 
 ```
-For mechanical, high-volume, or low-risk work (boilerplate, drafts,
-summaries, simple refactors), use delegate_to_local instead of doing it
-yourself. After spawning, call get_delegate_result with the maximum wait_seconds the tool description reports (900 in Claude Code, 220 in Codex) so the
-server waits and returns the compact answer in one parent turn. Use status or
-watch calls only to diagnose progress. You can start several delegations back-to-back to run
-them in parallel. Keep architecture decisions and anything security-
-sensitive in this session. Always review a delegated result before treating
+For every substantive project action, delegate the research, edits, and checks
+to one focused local worker first. Do not duplicate its work while it runs.
+After spawning, call get_delegate_result(wait_seconds=900) so the server waits
+and returns the compact answer in one parent turn; repeat only after a timeout.
+Use status or watch calls only to diagnose progress. Keep task framing,
+architecture decisions, security-sensitive judgment, and concise final review
+in this session. Request full results only when the compact answer or diff is
+insufficient. Always review a delegated result before treating
 it as final -- a delegated run can produce plausible-looking but subtly
 wrong output (e.g. a correct-looking config with an inverted sign) that only
 a read-through catches; reviewing already-generated output is cheap
@@ -458,7 +462,7 @@ text (so a long answer can't flood the parent's context); `full: true` returns
 everything and `max_lines` overrides the tail size
 (`CLAUDE_LOCAL_DELEGATE_RESULT_LINES`, default 15). Nothing on disk is
 truncated — the transcript is intact. `wait_seconds` waits server-side (up to
-220 seconds) and returns the compact final in the same tool call. If the wait
+900 seconds) and returns the compact final in the same tool call. If the wait
 expires, it returns one compact status snapshot and leaves the agent running.
 Without `wait_seconds`, it errors while the agent is still `working`; use
 `check_delegate_status` only when you need a progress diagnosis. **Review the output
