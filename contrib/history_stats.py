@@ -35,6 +35,9 @@ PEAK_THRESHOLDS = (32768, 65536, 131072, 262144)
 DURATION_THRESHOLDS = (120, 300, 600)
 PERCENTILES = (50, 75, 90, 95)
 TOP_TOOLS = 12
+SEARCH_TOOLS = ("Grep", "Glob")
+SEARCH_CALL_THRESHOLDS = (10, 30)
+TOOL_CALL_THRESHOLD = 40
 
 
 def parse_timestamp(value):
@@ -175,9 +178,12 @@ def stream_transcript(path, start_ts):
     if duration < 0:
         duration = 0.0
 
+    search_calls = sum(tools[t] for t in SEARCH_TOOLS if t in tools)
+
     return {
         "duration_seconds": round(duration, 2),
         "turns": assistant_turns,
+        "search_calls": search_calls,
         "input_tokens": sum_input,
         "cache_read_input_tokens": sum_cread,
         "cache_creation_input_tokens": sum_ccreate,
@@ -255,6 +261,7 @@ def summarize(metric_list, tool_counter):
     final_chars = [m["final_chars"] for m in metric_list]
     final_lines = [m["final_lines"] for m in metric_list]
     tool_calls = [m["tool_calls"] for m in metric_list]
+    search_calls = [m["search_calls"] for m in metric_list]
 
     def threshold_counts(values, thresholds):
         result = {}
@@ -263,6 +270,9 @@ def summarize(metric_list, tool_counter):
             pct = round(100.0 * c / n, 2) if n else 0.0
             result["gt_%d" % t] = {"count": c, "percent": pct}
         return result
+
+    # Per-session distribution of Grep+Glob call counts (search churn).
+    search_distribution = dict(sorted(Counter(search_calls).items()))
 
     sums = {
         "input_tokens": sum(m["input_tokens"] for m in metric_list),
@@ -288,12 +298,19 @@ def summarize(metric_list, tool_counter):
             "final_chars": percentile_block(final_chars),
             "final_lines": percentile_block(final_lines),
             "tool_calls": percentile_block(tool_calls),
+            "search_calls": percentile_block(search_calls),
         },
         "sums": sums,
         "top_tools": top_tools,
         "thresholds": {
             "peak_context_tokens": threshold_counts(peak, PEAK_THRESHOLDS),
             "duration_seconds": threshold_counts(durations, DURATION_THRESHOLDS),
+            "search_calls": threshold_counts(search_calls, SEARCH_CALL_THRESHOLDS),
+            "tool_calls_gt_40": threshold_counts(tool_calls, (TOOL_CALL_THRESHOLD,)),
+        },
+        "search_churn": {
+            "per_session_distribution": search_distribution,
+            "total_search_calls": sum(search_calls),
         },
     }
 

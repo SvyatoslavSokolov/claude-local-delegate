@@ -38,8 +38,12 @@ on its own question — answer that. (If the parent session's
 permission-mode class differs from the delegate's — e.g. parent `auto`,
 delegate default `bypassPermissions` — that one message is held for a
 one-time user approval; approve it. The MCP tools below are never gated.)
-A **read-only** delegation (allowlist of `Read,Grep,Glob`) is spawned in
-`dontAsk` instead, where the allowlist is enforced rather than advisory.
+A **read-only** delegation (allowlist of only read-only tools — e.g. the
+`Read,Grep,Glob,WebSearch,WebFetch,LSP,NotebookRead` subset, or any subset of
+`server.READ_ONLY_TOOLS`) is spawned in `dontAsk` instead, where the allowlist
+is enforced rather than advisory. The full **default** tool set is a writer
+(includes `Edit`/`Write`/`Bash`), so it runs in `bypassPermissions` and needs a
+write reservation; pass the read-only subset for a lookup-only run.
 
 ## Watch: `watch_delegate(run_id)`
 

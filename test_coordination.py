@@ -106,6 +106,17 @@ class BoardTests(unittest.TestCase):
         self.assertEqual(len(data['events']), 3)
         self.assertTrue(data['has_more_events'])
 
+    def test_sync_does_not_leak_parent_or_sibling_repositories(self):
+        child = os.path.join(self.project, 'repo')
+        sibling = os.path.join(self.project, 'other')
+        os.makedirs(child)
+        os.makedirs(sibling)
+        self.board.claim('owner', {'project': self.project, 'task_key': 'parent', 'paths': ['.']})
+        self.board.claim('owner', {'project': child, 'task_key': 'child', 'paths': ['.']})
+        self.board.claim('owner', {'project': sibling, 'task_key': 'sibling', 'paths': ['.']})
+        data = self.board.sync('reader', {'project': child, 'completed_limit': 0, 'event_limit': 0})
+        self.assertEqual([task['task_key'] for task in data['tasks']], ['child'])
+
 
 if __name__ == '__main__':
     unittest.main()

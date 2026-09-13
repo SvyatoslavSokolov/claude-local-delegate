@@ -127,9 +127,11 @@ def install(server):
     def spawn(task, allowed_tools, cwd, name, permission_mode=None,
               disallowed_tools=None, agent=None, announce_plan=None, **spawn_kwargs):
         with locked():
-            # Bash can write; allowlists are not filesystem isolation.
-            granted = {t.strip() for t in (allowed_tools or server.DEFAULT_ALLOWED_TOOLS).split(',')}
-            writes = not granted.issubset({'Read', 'Grep', 'Glob'})
+            # A writer is anything that is NOT the server's authoritative
+            # read-only set (Bash can write; WebSearch/WebFetch/LSP/NotebookRead
+            # cannot). Allowlists are not filesystem isolation, so a writer
+            # needs a write reservation.
+            writes = not server._is_read_only(allowed_tools)
             try:
                 reservation = board.authorize(owner, current_task, cwd, writes)
             except ValueError as exc:

@@ -149,7 +149,13 @@ class Board:
         event_limit = max(0, min(50, int(args.get('event_limit', 20))))
         with self.transaction() as con:
             tasks = self._all(con)
-            relevant = [t for t in tasks if overlap(project, t['project'])]
+            # A supervisor's board view is repository-local. The old ancestor /
+            # descendant overlap made a sync from one repository include every
+            # task under ~/.claude (and vice versa), producing 200k+ tool output
+            # and causing local models to retry sync instead of delegating. Path
+            # overlap remains useful for claim conflict metadata; it must not
+            # leak unrelated repositories into the active context.
+            relevant = [t for t in tasks if t['project'] == project]
             for t in relevant:
                 t['stale'] = time.time() - t['updated_at'] > 900
             active = [t for t in relevant if t['status'] not in ('done', 'cancelled')]

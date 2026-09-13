@@ -25,9 +25,28 @@ def transcript(path, assistant_texts, prompt='do the thing'):
     for text in assistant_texts:
         events.append({'type': 'assistant', 'message': {
             'content': [{'type': 'text', 'text': text}],
+            'stop_reason': 'end_turn',
             'usage': {'input_tokens': 10, 'cache_read_input_tokens': 5, 'output_tokens': 7}}})
     Path(path).write_text(''.join(json.dumps(e) + '\n' for e in events))
     return path
+
+
+def raw_transcript(path, lines):
+    """Write arbitrary JSONL lines (str or dict) verbatim."""
+    out = []
+    for line in lines:
+        out.append(line if isinstance(line, str) else json.dumps(line))
+    Path(path).write_text('\n'.join(out) + '\n')
+    return path
+
+
+def _asst(content, stop_reason='end_turn'):
+    return {'type': 'assistant', 'message': {'content': content, 'stop_reason': stop_reason}}
+
+
+def _tool_result_user(tool_use_id='tu_1'):
+    return {'type': 'user', 'message': {'content': [
+        {'type': 'tool_result', 'tool_use_id': tool_use_id, 'content': 'ok'}]}}
 
 
 class EfficiencyTests(unittest.TestCase):
@@ -77,7 +96,13 @@ class EfficiencyTests(unittest.TestCase):
         )
 
     def test_get_result_waits_server_side_then_returns_final(self):
-        path = transcript(os.path.join(self.tmp.name, 'wait.jsonl'), ['compact final'])
+        # No terminal proof until the roster settles: the agent is mid-tool
+        # (tool_use, no stop_reason), so the stale-roster fallback must NOT fire.
+        path = raw_transcript(os.path.join(self.tmp.name, 'wait.jsonl'), [
+            _asst([{'type': 'text', 'text': 'interim note'}], stop_reason=None),
+            _asst([{'type': 'tool_use', 'name': 'Bash', 'input': {'command': 'ls'}}],
+                  stop_reason='tool_use'),
+        ])
         working = {'id': 'abc12345', 'state': 'working', 'sessionId': 'session-x'}
         done = {'id': 'abc12345', 'state': 'done', 'sessionId': 'session-x'}
         with patch.object(self.s, '_resolve_agent', side_effect=[(working, None), (done, None)]) as resolve, \
@@ -85,9 +110,133 @@ class EfficiencyTests(unittest.TestCase):
              patch.object(self.s.time, 'sleep') as sleep:
             result = self.s.get_result({'run_id': 'abc12345', 'wait_seconds': 10})
         self.assertFalse(result['isError'])
-        self.assertIn('compact final', result['content'][0]['text'])
+        self.assertIn('interim note', result['content'][0]['text'])
+        self.assertNotIn('stale', result['content'][0]['text'])
         self.assertEqual(resolve.call_count, 2)
         sleep.assert_called_once()
+
+    # ---- stale-roster terminal inference ------------------------------------
+    def _terminal_jsonl(self, name):
+        return raw_transcript(os.path.join(self.tmp.name, name), [
+            {'type': 'user', 'message': {'content': [{'type': 'text', 'text': 'task'}]}},
+            _asst([{'type': 'thinking', 'text': 'hmm'},
+                   {'type': 'text', 'text': 'the proven final answer'}]),
+            {'type': 'agent-name', 'name': 'w1'},
+            {'type': 'agent-setting', 'setting': 'x'},
+            {'type': 'mode', 'value': 'bypassPermissions'},
+            {'type': 'cost-state', 'totalCostUSD': 0.01},
+        ])
+
+    def test_stale_roster_returns_proven_terminal_final(self):
+        # Roster flips to done after the wait window; the pre-sleep proof check
+        # must NOT fire while the transcript is still mid-tool.
+        path = raw_transcript(os.path.join(self.tmp.name, 'stale.jsonl'), [
+            _asst([{'type': 'tool_use', 'name': 'Bash', 'input': {}}], stop_reason='tool_use'),
+        ])
+        terminal = self._terminal_jsonl('stale_done.jsonl')
+        working = {'id': 'abc12345', 'state': 'working', 'sessionId': 'session-x'}
+        done = {'id': 'abc12345', 'state': 'done', 'sessionId': 'session-x'}
+        with patch.object(self.s, '_resolve_agent', side_effect=[(working, None), (done, None)]), \
+             patch.object(self.s, '_find_transcript', side_effect=[path, terminal]), \
+             patch.object(self.s.time, 'sleep') as sleep:
+            result = self.s.get_result({'run_id': 'abc12345', 'wait_seconds': 5})
+        self.assertFalse(result['isError'])
+        self.assertIn('the proven final answer', result['content'][0]['text'])
+        self.assertNotIn('stale', result['content'][0]['text'])  # roster settled normally
+        self.assertEqual(sleep.call_count, 1)
+
+    def test_working_roster_with_proven_transcript_returns_immediately(self):
+        # The run-8004cdaa shape: roster never settles, but the transcript proves
+        # termination -> return the inferred final without any sleep.
+        path = self._terminal_jsonl('immediate.jsonl')
+        working = {'id': 'abc12345', 'state': 'working', 'sessionId': 'session-x'}
+        with patch.object(self.s, '_resolve_agent', return_value=(working, None)) as resolve, \
+             patch.object(self.s, '_find_transcript', return_value=path), \
+             patch.object(self.s.time, 'sleep') as sleep:
+            result = self.s.get_result({'run_id': 'abc12345', 'wait_seconds': 5})
+        self.assertFalse(result['isError'])
+        self.assertIn('the proven final answer', result['content'][0]['text'])
+        self.assertIn('stale', result['content'][0]['text'])
+        sleep.assert_not_called()
+        self.assertEqual(resolve.call_count, 1)
+
+    def test_wait_zero_returns_proven_final_without_sleeping(self):
+        path = self._terminal_jsonl('z.jsonl')
+        working = {'id': 'abc12345', 'state': 'working', 'sessionId': 'session-x'}
+        with patch.object(self.s, '_resolve_agent', return_value=(working, None)), \
+             patch.object(self.s, '_find_transcript', return_value=path), \
+             patch.object(self.s.time, 'sleep') as sleep:
+            result = self.s.get_result({'run_id': 'abc12345', 'wait_seconds': 0})
+        self.assertFalse(result['isError'])
+        self.assertIn('the proven final answer', result['content'][0]['text'])
+        sleep.assert_not_called()
+
+    def test_tool_use_tail_is_not_terminal(self):
+        path = raw_transcript(os.path.join(self.tmp.name, 'tu.jsonl'), [
+            _asst([{'type': 'text', 'text': 'almost done'}]),
+            _asst([{'type': 'tool_use', 'name': 'Read', 'input': {'path': '/x'}}],
+                  stop_reason='tool_use'),
+        ])
+        self.assertIsNone(self.s._terminal_final_text(path))
+
+    def test_later_user_or_tool_result_invalidates(self):
+        path = raw_transcript(os.path.join(self.tmp.name, 'inv.jsonl'), [
+            _asst([{'type': 'text', 'text': 'final?'}]),
+            _tool_result_user(),
+        ])
+        self.assertIsNone(self.s._terminal_final_text(path))
+
+    def test_thinking_only_is_not_terminal(self):
+        path = raw_transcript(os.path.join(self.tmp.name, 'th.jsonl'), [
+            _asst([{'type': 'thinking', 'text': 'pondering...'}]),
+        ])
+        self.assertIsNone(self.s._terminal_final_text(path))
+
+    def test_malformed_tail_cannot_prove_termination(self):
+        # A truncated final line (partial JSON) is skipped by _iter_events, so
+        # the last MEANINGFUL event becomes the earlier tool_use -> no proof.
+        path = raw_transcript(os.path.join(self.tmp.name, 'mal.jsonl'), [
+            _asst([{'type': 'tool_use', 'name': 'Bash', 'input': {}}], stop_reason='tool_use'),
+            '{"type":"assistant","message":{"content":[{"typ',  # truncated mid-line
+        ])
+        self.assertIsNone(self.s._terminal_final_text(path))
+
+    def test_unproven_working_with_wait_zero_keeps_still_working_error(self):
+        path = raw_transcript(os.path.join(self.tmp.name, 'unp.jsonl'), [
+            _asst([{'type': 'tool_use', 'name': 'Bash', 'input': {}}], stop_reason='tool_use'),
+        ])
+        working = {'id': 'abc12345', 'state': 'working', 'sessionId': 'session-x'}
+        with patch.object(self.s, '_resolve_agent', return_value=(working, None)), \
+             patch.object(self.s, '_find_transcript', return_value=path), \
+             patch.object(self.s.time, 'sleep') as sleep:
+            result = self.s.get_result({'run_id': 'abc12345', 'wait_seconds': 0})
+        self.assertTrue(result['isError'])
+        self.assertIn('still working', result['content'][0]['text'])
+        sleep.assert_not_called()
+
+    def test_stop_delegate_skips_signal_when_transcript_proves_done(self):
+        path = self._terminal_jsonl('stop.jsonl')
+        working = {'id': 'abc12345', 'state': 'working', 'sessionId': 'session-x', 'pid': 98765}
+        with patch.object(self.s, '_resolve_agent', return_value=(working, None)), \
+             patch.object(self.s, '_find_transcript', return_value=path), \
+             patch.object(self.s.os, 'kill') as kill:
+            result = self.s.stop_delegate({'run_id': 'abc12345'})
+        self.assertFalse(result['isError'])
+        self.assertIn('stale', result['content'][0]['text'])
+        kill.assert_not_called()
+
+    def test_stop_delegate_still_signals_a_genuinely_running_agent(self):
+        path = raw_transcript(os.path.join(self.tmp.name, 'run.jsonl'), [
+            _asst([{'type': 'tool_use', 'name': 'Bash', 'input': {}}], stop_reason='tool_use'),
+        ])
+        working = {'id': 'abc12345', 'state': 'working', 'sessionId': 'session-x', 'pid': 98765}
+        with patch.object(self.s, '_resolve_agent', return_value=(working, None)), \
+             patch.object(self.s, '_find_transcript', return_value=path), \
+             patch.object(self.s.os, 'kill') as kill:
+            result = self.s.stop_delegate({'run_id': 'abc12345'})
+        self.assertFalse(result['isError'])
+        self.assertIn('Sent SIGINT', result['content'][0]['text'])
+        kill.assert_called_once()
 
     # ---- one pass, memoised -------------------------------------------------
     def test_transcript_is_read_once_and_cached(self):
