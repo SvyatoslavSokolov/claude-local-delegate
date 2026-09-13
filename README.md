@@ -14,6 +14,11 @@ Parent-side tools: `delegate_to_local`, `check_delegate_status`,
 `get_verified_result`, `fan_out_to_local`,
 `check_fanout_status`, `get_fanout_result`.
 
+Repository navigation is provided by the separately registered `code-nav` MCP
+([Docker/ROS setup](CODE_NAV_DOCKER_RU.md)). Keeping it separate is important:
+delegates are denied the recursive delegation MCP, but retain route, exact
+search, symbol-index, and environment-doctor tools. Bash remains available.
+
 For the low-context supervisor path, read [ARCHITECT_BRIEF.md](ARCHITECT_BRIEF.md)
 instead of loading the full coordination and task-design references on every turn.
 `project_sync` returns every unfinished task, three compact completed-task digests,
@@ -27,6 +32,46 @@ python3 contrib/history_stats.py --pretty
 The analyzer streams transcripts and prints aggregates only; it does not include
 prompts, answers, transcript paths, or credentials in its output.
 
+## 0.9 — capability-rich default tools for local delegates
+
+v0.9.0 widens the default built-in tool set granted to a delegated worker from the
+old read-only `Read,Grep,Glob` to a set that covers real coding work out of the
+box, and reworks the read-only classification to match.
+
+- **Default is now a capability-rich writer.** `DEFAULT_ALLOWED_TOOLS` is
+  `Read,Grep,Glob,Edit,Write,Bash,WebSearch,WebFetch,LSP,NotebookRead,NotebookEdit`
+  — navigation (including the built-in `LSP` tool for go-to-definition /
+  references / symbols, available when a language server is present), file
+  mutation, a shell, web for EXTERNAL facts, and notebook read/edit. The
+  subagent-spawning tools (`Agent` and the legacy `Task` spawner) are **never**
+  granted, even if a caller names them in `allowed_tools` (they are pruned from
+  the `--tools` schema list), on top of the existing
+  `mcp__claude-local-delegate` recursion guard — a delegated agent can no longer
+  grow unbounded delegation depth on its own.
+- **The full default is a WRITER, and that is documented, not hidden.** Because
+  the default can change code and run `Bash`, a full default delegation **needs
+  a write reservation** (a task with a write scope, see COORDINATION). Callers
+  that only need a lookup pass an explicit **read-only subset** instead:
+  `DEFAULT_READ_ONLY_TOOLS = Read,Grep,Glob,WebSearch,WebFetch,LSP,NotebookRead`
+  (no `Edit`/`Write`, no `Bash` — a shell can write, so it never belongs in a
+  read-only allowlist).
+- **Read-only classification now includes the semantic/web tools.**
+  `READ_ONLY_TOOLS` = Read, Grep, Glob, NotebookRead, TodoWrite, WebSearch,
+  WebFetch, LSP, plus the `Task*` bookkeeping family (task-list tracking, which
+  is **not** delegation — that is `Agent`/`Task`). An allowlist of only these is
+  still the gate that downgrades the spawn to the enforced-allowlist
+  `dontAsk` permission mode; `Bash`/`Edit`/`Write` still make it a writer
+  (`bypassPermissions`).
+- **Checker gets read-only web/LSP, still no edits.** `delegate_verified`'s
+  checker is now `DEFAULT_READ_ONLY_TOOLS + Bash` (can navigate, use LSP, fetch
+  external facts, and run checks via Bash) but has **no** `Edit`/`Write`; the
+  worker gets the full writer set.
+- **No hard folder limits, no numeric search budgets.** The wider set does not
+  add any tool denial or numeric cap; the local-worker persona's navigation
+  order is: repository-map exact anchors → `LSP` (go-to-definition/references/
+  symbols) → exact `Grep`, with `WebSearch`/`WebFetch`/MCP web only for external
+  facts, and Bash searches still subject to the same intent discipline.
+
 ## 0.8 — cheaper results, enforced least-privilege, and spawn provenance
 
 v0.8.0 makes supervision cheaper and the defaults honest. The headline changes:
@@ -39,8 +84,10 @@ v0.8.0 makes supervision cheaper and the defaults honest. The headline changes:
   (15) and `CLAUDE_LOCAL_DELEGATE_FANOUT_LINES` (15). Nothing on disk is
   truncated — the transcript is intact and `full: true` still returns all of it.
 - **Real least-privilege for read-only delegates.** A delegation whose
-  `allowed_tools` are only read-only (Read, Grep, Glob, NotebookRead, TodoWrite)
-  now spawns with `--permission-mode dontAsk` instead of `bypassPermissions`,
+  `allowed_tools` are only read-only (Read, Grep, Glob, NotebookRead, TodoWrite,
+  WebSearch, WebFetch, LSP, or the `Task*` family — the full set in
+  `server.READ_ONLY_TOOLS`) now spawns with `--permission-mode dontAsk` instead of
+  `bypassPermissions`,
   because `bypassPermissions` **ignores** `--allowedTools`
   (anthropics/claude-code#12232) — so the allowlist is finally enforced rather
   than advisory. Delegations that can write still default to `bypassPermissions`
@@ -150,20 +197,24 @@ on its first gated tool with no human present. So the spawner always passes a
 read-only**:
 
 - A delegation whose `allowed_tools` are only read-only (Read, Grep, Glob,
-  NotebookRead, TodoWrite) runs in `dontAsk` (override
+  NotebookRead, TodoWrite, WebSearch, WebFetch, LSP, or the `Task*` bookkeeping
+  family) runs in `dontAsk` (override
   `CLAUDE_LOCAL_DELEGATE_READONLY_PERMISSION_MODE`). This is where the
   `--allowedTools` list is actually **enforced**: `dontAsk` denies unlisted
   tools instead of prompting for them. That matters because
   `bypassPermissions` **ignores `--allowedTools`**
   (anthropics/claude-code#12232) — a "read-only" delegate spawned in bypass
   could still run anything it asked for, so the allowlist used to be advisory
-  rather than binding.
-- A delegation that can write (or that you widen with `Bash`) defaults to
-  `bypassPermissions` (override `CLAUDE_LOCAL_DELEGATE_PERMISSION_MODE`): an
-  unattended agent that prompts on its first gated tool would park forever, so
-  writers keep the full granted toolset unattended. This is an autonomous loop
-  with no approval gates — don't point one at secrets or anything you wouldn't
-  want an unattended agent doing on this machine.
+  rather than binding. WebSearch/WebFetch only touch the network and LSP is code
+  intelligence with no write path, so they are read-only; a set containing any
+  of `Bash`, `Edit`, or `Write` is not.
+- A delegation that can write — and the **full default does** (it includes
+  `Edit`, `Write`, and `Bash`) — defaults to `bypassPermissions` (override
+  `CLAUDE_LOCAL_DELEGATE_PERMISSION_MODE`): an unattended agent that prompts on
+  its first gated tool would park forever, so writers keep the full granted
+  toolset unattended. This is an autonomous loop with no approval gates — don't
+  point one at secrets or anything you wouldn't want an unattended agent doing
+  on this machine, and a full default delegation needs a write reservation.
 
 Narrow a specific delegation with `permission_mode: "acceptEdits"` (Bash gated),
 `"default"` (everything prompts), or `"auto"` (classifier-gated) when a task
@@ -426,10 +477,10 @@ correct both times. The gap was elsewhere:
 | Parameter | Required | Default | Description |
 |---|---|---|---|
 | `task` | yes | — | Self-contained task description. The agent starts with no memory of the parent conversation. |
-| `allowed_tools` | no | `Read,Grep,Glob` (read-only) | Comma-separated tools granted to the agent. Widen to `Read,Edit,Write` for tasks that write files. |
+| `allowed_tools` | no | capability-rich WRITER set (see below) | Comma-separated built-in tools granted to the agent; an explicit list always wins. The **default** is `Read,Grep,Glob,Edit,Write,Bash,WebSearch,WebFetch,LSP,NotebookRead,NotebookEdit` — navigation (incl. the built-in `LSP` for go-to-definition/references/symbols), mutation, a shell, web for external facts, and notebooks. The subagent-spawning `Agent`/`Task` tools are never granted (pruned even if named). For a **lookup-only** run pass the read-only subset `Read,Grep,Glob,WebSearch,WebFetch,LSP,NotebookRead` (no `Edit`/`Write`, no `Bash`). Because the full default writes, it needs a write reservation. |
 | `cwd` | no | server's cwd | Working directory for the agent. |
 | `name` | no | slug of the task | Display name shown in `claude agents`. |
-| `permission_mode` | no | `dontAsk` if read-only, else `bypassPermissions` | Native `--permission-mode`. A read-only allowlist defaults to `dontAsk` so `--allowedTools` is actually enforced (bypass **ignores** the allowlist — anthropics/claude-code#12232); anything wider defaults to `bypassPermissions` so the unattended agent runs its full granted toolset (Bash included) without prompting and parking. Narrow with `acceptEdits` (Bash gated) / `default` (all prompts) / `auto` (classifier-gated). |
+| `permission_mode` | no | `dontAsk` if read-only, else `bypassPermissions` | Native `--permission-mode`. A read-only allowlist (only Read/Grep/Glob/NotebookRead/TodoWrite/WebSearch/WebFetch/LSP/`Task*`) defaults to `dontAsk` so `--allowedTools` is actually enforced (bypass **ignores** the allowlist — anthropics/claude-code#12232); a set with `Bash`/`Edit`/`Write` (the full default) defaults to `bypassPermissions` so the unattended agent runs its full granted toolset without prompting and parking. Narrow with `acceptEdits` (Bash gated) / `default` (all prompts) / `auto` (classifier-gated). |
 | `disallowed_tools` | no | — | Comma-separated tools to strip (e.g. `Bash`) — forces the agent onto a path it can finish when a user-level hook blocks a tool it would reach for. |
 | `agent` | no | `local-worker` | Subagent persona (system prompt). `""` = no persona. |
 | `announce_plan` | no | `false` | Prepend the supervision preamble only for a run you intend to watch: agent posts a numbered plan first, then one plain sentence before/after each step. |
@@ -527,7 +578,7 @@ parent's polling cadence drives it.
 | :-- | :-- | :-- | :-- |
 | `task` | yes | — | Self-contained task for the worker. Exact paths, and what "done" means. |
 | `acceptance_criteria` | no | — | Explicit pass/fail conditions the checker must confirm (`pytest -q` green, `ruff check` passes, CLI prints X for input Y). **Strongly recommended** — without it the checker only derives its own best-guess checks and the gate is weak. |
-| `allowed_tools` | no | `Read,Grep,Glob,Edit,Write,Bash` | Tools for the **worker** (it must be able to change code). The checker's tools are fixed at `Read,Grep,Glob,Bash` — no Edit/Write. |
+| `allowed_tools` | no | full capability-rich writer set | Tools for the **worker** (it must be able to change code): `Read,Grep,Glob,Edit,Write,Bash,WebSearch,WebFetch,LSP,NotebookRead,NotebookEdit`. The **checker's** tools are fixed at the read-only set + `Bash` (`Read,Grep,Glob,WebSearch,WebFetch,LSP,NotebookRead,Bash`) — it can navigate, use LSP, fetch external facts, and run checks, but has **no** `Edit`/`Write`, by design, so a "fix" can only come from a fresh worker round. |
 | `cwd` | no | server's cwd | Working directory for both worker and checker. |
 | `always_verify` | no | `false` | Force the checker round even when there is nothing objective to verify (see "Conditional verification" below). |
 | `max_iterations` | no | `3` (`CLAUDE_LOCAL_DELEGATE_MAX_VERIFY_ITERS`) | Max work→check rounds, clamped 1..10. |

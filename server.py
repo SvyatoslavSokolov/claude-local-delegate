@@ -102,7 +102,48 @@ def _default_settings_path():
     if override:
         return override
     return SLIM_SETTINGS_PATH if os.path.isfile(SLIM_SETTINGS_PATH) else FALLBACK_SETTINGS_PATH
-DEFAULT_ALLOWED_TOOLS = "Read,Grep,Glob"
+# Capability-rich default for real coding: navigation (Read/Grep/Glob + LSP
+# when a language server is present), mutation (Edit/Write), a shell (Bash),
+# web for EXTERNAL facts (WebSearch/WebFetch), and notebook read/edit. The
+# subagent-spawning `Agent` tool is NEVER granted (it is the recursion vector a
+# delegated agent must not grow, on top of the mcp__claude-local-delegate
+# disallow below), and dangerous interactive tools (AskUserQuestion,
+# EnterPlanMode, ...) stay out by default. The set is a WRITER: a full default
+# delegation needs a write reservation (see README) and callers that only need
+# lookup pass an explicit read-only subset (DEFAULT_READ_ONLY_TOOLS).
+DEFAULT_ALLOWED_TOOLS = ("Read,Grep,Glob,Edit,Write,Bash,WebSearch,WebFetch,"
+                         "LSP,NotebookRead,NotebookEdit")
+# Intrinsically read-only built-ins: they change nothing on the machine, so a
+# delegation whose whole allowlist is these is safe to run in dontAsk (where
+# the allowlist is enforced) instead of bypassPermissions. WebSearch/WebFetch
+# touch only the network, LSP is code intelligence (goToDefinition,
+# findReferences, hover, symbols) with no write path, NotebookRead is a read,
+# and the Task* family is in-memory task-list bookkeeping (NOT delegation: the
+# thing that spawns subagents is the `Agent` tool, which is excluded).
+CODE_NAV_MCP_TOOLS = (
+    "mcp__code-nav__repository_route",
+    "mcp__code-nav__search_literal",
+    "mcp__code-nav__symbol_index",
+    "mcp__code-nav__code_nav_doctor",
+)
+READ_ONLY_TOOLS = frozenset({
+    "Read", "Grep", "Glob", "NotebookRead", "TodoWrite",
+    "WebSearch", "WebFetch", "LSP",
+    "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskOutput", "TaskStop",
+}) | frozenset(CODE_NAV_MCP_TOOLS)
+# The read-only subset callers pass for lookup-only delegations: no Edit/Write,
+# no Bash (a shell can write, so it never belongs in a read-only allowlist).
+DEFAULT_READ_ONLY_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch,LSP,NotebookRead"
+# The subagent-SPAWNING built-ins: `Agent` (the current name) and `Task` (the
+# legacy bare spawner, "Subagent type for Task tool subagents"). These -- and
+# only these -- are the recursion vector: a delegated agent that can spawn a
+# subagent can grow unbounded delegation depth on its own. The `Task*` family
+# (TaskCreate/TaskList/TaskGet/TaskUpdate/TaskStop/TaskOutput) is a DIFFERENT
+# tool -- the in-memory task-list bookkeeping -- which is read-only and stays
+# allowed (see READ_ONLY_TOOLS). Blocked from the --tools schema even if a
+# caller's allowlist names them; complements the mcp__claude-local-delegate
+# disallow below.
+DELEGATION_BLOCKED_TOOLS = frozenset({"Agent", "Task"})
 
 # Bookkeeping for fan_out batches ONLY -- a map of batch_id -> [agent ids].
 # This is not an "agent entity": the agents themselves are 100% native
@@ -142,9 +183,9 @@ def _fast_model():
             "CLAUDE_LOCAL_DELEGATE_FAST_MODEL", "")).strip()
     except (OSError, ValueError):
         return ""
-# Tools that cannot change the machine. An allowlist of only these is a genuinely
-# read-only delegation -- and only then is `dontAsk` safe as the permission mode.
-READ_ONLY_TOOLS = frozenset({"Read", "Grep", "Glob", "NotebookRead", "TodoWrite"})
+# READ_ONLY_TOOLS (above) is the authoritative set: an allowlist of only those
+# is a genuinely read-only delegation, and only then is `dontAsk` safe as the
+# permission mode.
 # bypassPermissions IGNORES --allowedTools (documented; anthropics/claude-code#12232),
 # so a "read-only" delegate spawned in bypass could still run anything it asked
 # for. dontAsk enforces the allowlist instead: unlisted tools are DENIED, not
@@ -197,11 +238,15 @@ DEFAULT_VERIFY_TIMEOUT = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_VERIFY_TIMEOU
 # no persona if the file is absent, same graceful-degrade rule as _default_agent.
 CHECKER_PERSONA = os.environ.get("CLAUDE_LOCAL_DELEGATE_CHECKER_AGENT", "local-checker")
 # The worker in a verify loop must be able to change code; the read-only default
-# would make every check fail. Callers can still narrow this per run.
-DEFAULT_VERIFY_WORKER_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
+# would make every check fail. It gets the full capability-rich writer set.
+# Callers can still narrow this per run.
+DEFAULT_VERIFY_WORKER_TOOLS = DEFAULT_ALLOWED_TOOLS
 # The checker must inspect + run things but must NOT edit -- no Edit/Write here,
-# by design, so a "fix" can only come from a fresh worker round.
-VERIFY_CHECKER_TOOLS = "Read,Grep,Glob,Bash"
+# by design, so a "fix" can only come from a fresh worker round. It is a
+# read-only, capability-rich set: it can navigate (Read/Grep/Glob + LSP), fetch
+# external facts (WebSearch/WebFetch), read notebooks, and run Bash -- but it
+# cannot change code.
+VERIFY_CHECKER_TOOLS = DEFAULT_READ_ONLY_TOOLS + ",Bash"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_LOCAL_DELEGATE_BIN", "claude")
 CLAUDE_CONFIG_DIR = os.environ.get(
@@ -391,6 +436,11 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
         )
 
     tools = [t.strip() for t in (allowed_tools or DEFAULT_ALLOWED_TOOLS).split(",") if t.strip()]
+    # dontAsk also gates MCP calls. These four primitives are read-only and
+    # live outside the recursively blocked delegation server.
+    for nav_tool in CODE_NAV_MCP_TOOLS:
+        if nav_tool not in tools:
+            tools.append(nav_tool)
     disallowed = [t.strip() for t in (disallowed_tools or "").split(",") if t.strip()]
     # Recursion guard (native analogue of the old ROLE=child): a delegated agent
     # is unattended, so strip the spawner MCP itself. It is registered at
@@ -459,7 +509,13 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     # --allowedTools only gates permissions; every built-in tool schema is still
     # sent on every call. --tools removes the rest of the built-in set: measured
     # fixed input 17.3k -> 7.5k tokens per call. MCP tools are unaffected.
-    builtin = sorted({t.split("(", 1)[0] for t in tools if not t.startswith("mcp__")})
+    # DELEGATION_BLOCKED_TOOLS is stripped from the built-in set even if a
+    # caller's allowlist names it: a delegated agent that can spawn subagents
+    # can grow unbounded delegation depth on its own. (MCP tools are unaffected.)
+    builtin = sorted({
+        base for base in (t.split("(", 1)[0] for t in tools if not t.startswith("mcp__"))
+        if base not in DELEGATION_BLOCKED_TOOLS
+    })
     if builtin and not os.environ.get("CLAUDE_LOCAL_DELEGATE_FULL_TOOLSET"):
         cmd += ["--tools", ",".join(builtin)]
     if tools:
@@ -621,6 +677,55 @@ def _last_assistant_text(transcript_path):
                 if isinstance(item, dict) and item.get("type") == "text" and item.get("text", "").strip():
                     last = item["text"].strip()
     return last
+
+
+# Event types that carry NO conversation content (roster bookkeeping appended
+# after the run ends: agent-name, agent-setting, mode, cost-state, ...). The
+# terminal-final inference may ignore them AFTER a proven final event, but never
+# anything else.
+_METADATA_ONLY_EVENT_TYPES = frozenset({
+    "agent-name", "agent-setting", "mode", "permission-mode", "cost-state",
+    "custom-title", "ai-title", "last-prompt", "queue-operation",
+    "file-history-snapshot", "file-history-delta", "attachment", "system",
+})
+
+
+def _terminal_final_text(transcript_path):
+    """Prove from the transcript that the run has TERMINATED, or None.
+
+    A terminal final is: the LAST meaningful conversation event is an assistant
+    message with stop_reason='end_turn', non-empty text content, and NO tool_use
+    in it. Meaningful = any 'user' or 'assistant' event (a user event after the
+    candidate invalidates it -- it would be a tool_result or follow-up turn);
+    every other type is metadata-only and ignored. Malformed JSON lines are
+    skipped by _iter_events, so a truncated tail cannot prove termination.
+    Used only as a fallback when the roster still says working/busy/unknown."""
+    last_meaningful = None
+    for e in _iter_events(transcript_path):
+        t = e.get("type")
+        if t not in ("user", "assistant"):
+            continue  # metadata-only event: does not affect the proof
+        last_meaningful = e
+    if last_meaningful is None or last_meaningful.get("type") != "assistant":
+        return None
+    msg = last_meaningful.get("message")
+    if not isinstance(msg, dict) or msg.get("stop_reason") != "end_turn":
+        return None
+    content = msg.get("content", [])
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        return None
+    text_parts = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "tool_use":
+            return None  # mid-tool: the model asked for more work
+        if kind == "text" and item.get("text", "").strip():
+            text_parts.append(item["text"].strip())
+    return "\n".join(text_parts) if text_parts else None
 
 
 def _first_user_text(transcript_path):
@@ -1045,6 +1150,31 @@ def get_result(args):
     # "keep waiting" only briefly: a genuinely unknown state should not silently
     # spend the caller's whole wait window.
     unknown_reads = 0
+    session_id = ""
+
+    def _inferred_final_reply(agent, state):
+        """Roster says working/busy/unknown but the transcript PROVES the run
+        terminated (end_turn + non-empty text + no tool_use, nothing meaningful
+        after). Return that final answer with a stale-roster note, else None."""
+        sid = agent.get("sessionId") or ""
+        tr = _find_transcript(sid) if sid else None
+        if not tr:
+            return None
+        proven = _terminal_final_text(tr)
+        if proven is None:
+            return None
+        body, _ = _compact(
+            proven, _result_max_lines(args, DEFAULT_RESULT_LINES),
+            "compacted", f"call get_delegate_result({handle!r}, full=true) for the whole text",
+        )
+        footer = (
+            f"\n\n-- native agent id {agent.get('id')}, session {sid}, roster "
+            f"state was '{state}' (stale). Final inferred from the transcript: the last "
+            "meaningful event is an end_turn assistant message with text and no tool_use. "
+            "Review it before treating it as final."
+        )
+        return {"content": [{"type": "text", "text": body + footer}], "isError": False}
+
     while True:
         agent, err = _resolve_agent(handle)
         if err:
@@ -1052,6 +1182,7 @@ def get_result(args):
         if agent is None:
             return _error_result(f"No background agent with id {handle} found in the roster.")
         state = agent.get("state") or agent.get("status") or "unknown"
+        session_id = agent.get("sessionId") or ""
         if state == "unknown":
             unknown_reads += 1
             if unknown_reads > MAX_UNKNOWN_STATE_READS:
@@ -1060,18 +1191,25 @@ def get_result(args):
             unknown_reads = 0
         if state not in ("working", "busy", "unknown") or time.monotonic() >= deadline:
             break
+        # The roster can lag the transcript: if it ALREADY proves termination,
+        # return the final now instead of sleeping on a stale 'working'.
+        inferred = _inferred_final_reply(agent, state)
+        if inferred is not None:
+            return inferred
         interval = max(0.05, RESULT_WAIT_POLL_SECONDS)
         time.sleep(min(interval, max(0.05, deadline - time.monotonic())))
-
-    session_id = agent.get("sessionId") or ""
 
     # A blocked agent needs supervisor input, so surface the actionable status
     # immediately instead of presenting its question as a final answer.
     if state == "blocked" and wait_seconds:
         return check_status({"run_id": handle})
 
-    # Still working? Don't hand back a partial answer.
+    # Still working? Don't hand back a partial answer -- unless the transcript
+    # already proves termination (the roster lags the transcript).
     if state in ("working", "busy", "unknown"):
+        inferred = _inferred_final_reply(agent, state)
+        if inferred is not None:
+            return inferred
         if wait_seconds:
             status = check_status({"run_id": handle})
             status_text = status.get("content", [{}])[0].get("text", "")
@@ -1209,6 +1347,18 @@ def stop_delegate(args):
             f"a new direction, call delegate_to_local again with a sharper task "
             f"(this agent's transcript stays readable via get_delegate_result)."
         )}], "isError": False}
+    # The roster can lag the transcript: if it still says working/busy but the
+    # transcript proves termination, do NOT signal -- report stale-roster instead.
+    if state in ("working", "busy"):
+        session_id = agent.get("sessionId") or ""
+        tr = _find_transcript(session_id) if session_id else None
+        if tr and _terminal_final_text(tr) is not None:
+            return {"content": [{"type": "text", "text": (
+                f"agent {handle}: roster says '{state}' but its transcript already "
+                "proves the run terminated (end_turn final text, no tool_use). Nothing "
+                "signalled -- the roster entry is stale. Read what it produced with "
+                f"get_delegate_result({handle!r})."
+            )}], "isError": False}
     if not pid:
         return _error_result(
             f"agent {handle} has no pid in the roster (state {state}). Use the "
@@ -1828,7 +1978,7 @@ PARENT_TOOLS = [
             "type": "object",
             "properties": {
                 "task": {"type": "string", "description": "Self-contained task; the agent has no conversation memory."},
-                "allowed_tools": {"type": "string", "description": f"Comma-separated tools; default '{DEFAULT_ALLOWED_TOOLS}'. Add write/Bash only when needed."},
+                "allowed_tools": {"type": "string", "description": f"Comma-separated built-in tools granted to the agent (explicit list always wins). Default '{DEFAULT_ALLOWED_TOOLS}' -- a capability-rich WRITER set: navigation (Read/Grep/Glob, LSP), Edit/Write, Bash, WebSearch/WebFetch, notebooks. The subagent-spawning Agent/Task tools are never granted. For a lookup-only run pass the read-only subset, e.g. '{DEFAULT_READ_ONLY_TOOLS}' (no Edit/Write, no Bash) -- but a FULL default run can write, so it needs a write reservation."},
                 "cwd": {"type": "string", "description": "Working directory for the agent. Defaults to this server's cwd."},
                 "name": {"type": "string", "description": "Optional display name for the agent (shown in `claude agents`). Defaults to a short slug of the task."},
                 "permission_mode": {"type": "string", "description": f"Native mode. Read-only defaults to '{READ_ONLY_PERMISSION_MODE}'; writers to unattended '{DEFAULT_PERMISSION_MODE}'."},
@@ -1935,7 +2085,7 @@ PARENT_TOOLS = [
                 "properties": {
                     "items": {"type": "array", "items": {"type": "string"}, "description": "Independent pieces of material, one per parallel agent."},
                     "shared_instruction": {"type": "string", "description": "The instruction applied to every item."},
-                    "allowed_tools": {"type": "string", "description": f"Same as delegate_to_local, applied to every item. Defaults to read-only ('{DEFAULT_ALLOWED_TOOLS}')."},
+                    "allowed_tools": {"type": "string", "description": f"Same as delegate_to_local, applied to every item. Defaults to the capability-rich WRITER set ('{DEFAULT_ALLOWED_TOOLS}'); for lookup-only fan-outs pass the read-only subset ('{DEFAULT_READ_ONLY_TOOLS}')."},
                     "cwd": {"type": "string", "description": "Working directory for every agent."},
                     "permission_mode": {"type": "string", "description": f"Same as delegate_to_local's permission_mode, applied to every agent. Defaults to '{DEFAULT_PERMISSION_MODE}'."},
                     "disallowed_tools": {"type": "string", "description": "Same as delegate_to_local's disallowed_tools, applied to every agent."},
@@ -1978,7 +2128,7 @@ PARENT_TOOLS = [
             "properties": {
                 "task": {"type": "string", "description": "Self-contained task with exact paths and completion conditions."},
                 "acceptance_criteria": {"type": "string", "description": "Explicit checks the checker must confirm."},
-                "allowed_tools": {"type": "string", "description": f"Worker tools; default '{DEFAULT_VERIFY_WORKER_TOOLS}'. Checker is read-only."},
+                "allowed_tools": {"type": "string", "description": f"Worker tools; default the full capability-rich writer set ('{DEFAULT_VERIFY_WORKER_TOOLS}'). The checker is read-only + Bash (no Edit/Write) by design: '{VERIFY_CHECKER_TOOLS}'."},
                 "cwd": {"type": "string", "description": "Working directory for both worker and checker. Defaults to this server's cwd."},
                 "always_verify": {"type": "boolean", "description": "Force checking even without criteria or disk changes."},
                 "max_iterations": {"type": "integer", "description": f"Max work->check rounds before giving up. Default {DEFAULT_MAX_VERIFY_ITERS}, clamped to 1..10."},
