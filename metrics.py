@@ -16,6 +16,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 # datetime.fromisoformat (Python 3.8) only accepts 0, 3 or 6 fractional-second
 # digits. Transcript timestamps vary in precision, so normalize any fractional
@@ -86,6 +87,46 @@ def append_event(state_dir, event):
         pass
 
 
+def prompt_specificity(text: str) -> float:
+    """Evaluate specificity of a task prompt (0.0 to 1.0).
+
+    Higher score means explicit targets, reproduction steps, and constraints.
+    """
+    if not text:
+        return 0.0
+    score = 0.0
+    # Mentions specific filenames or paths
+    if re.search(r"[\w\-\.\/]+\.(py|js|ts|json|md|c|cpp|rs|go|sh|ya?ml|html|css)", text):
+        score += 0.35
+    # Mentions verification tools/test frameworks
+    if re.search(r"\b(pytest|npm|cargo|pip|git|curl|python3?|gcc|make|test)\b", text, re.IGNORECASE):
+        score += 0.25
+    # Mentions code structures or symbols
+    if re.search(r"(```|def\s+\w+|class\s+\w+|function\s+\w+|import\s+\w+)", text):
+        score += 0.20
+    # Detailed length
+    if len(text.strip()) >= 120:
+        score += 0.20
+    elif len(text.strip()) >= 50:
+        score += 0.10
+    return round(min(1.0, score), 2)
+
+
+def calculate_roi(
+    total_input_tokens: int,
+    output_tokens: int,
+    tier1_input_per_m: float = 3.0,
+    tier1_output_per_m: float = 15.0,
+) -> Dict[str, Any]:
+    """Calculate token savings ratio and estimated USD saved by delegating to local tier 0."""
+    cost_if_tier1 = (total_input_tokens * tier1_input_per_m + output_tokens * tier1_output_per_m) / 1_000_000.0
+    tsr = round(total_input_tokens / max(1, total_input_tokens + output_tokens), 3)
+    return {
+        "usd_saved": round(cost_if_tier1, 4),
+        "token_savings_ratio": tsr,
+    }
+
+
 def transcript_stats(path):
     """Stream a Claude Code JSONL transcript and return aggregate stats.
 
@@ -101,10 +142,13 @@ def transcript_stats(path):
     anon = 0
     tool_use_ids = set()
     tool_use_no_id = 0
+    tool_breakdown = {}
+    tool_errors = 0
     thinking_chars = 0
     text_chars = 0
     first_ts = None
     last_ts = None
+    model_name = None
 
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
@@ -122,11 +166,28 @@ def transcript_stats(path):
                 if first_ts is None:
                     first_ts = ts
                 last_ts = ts
-            if event.get("type") != "assistant":
-                continue
+
+            etype = event.get("type")
             message = event.get("message")
             if not isinstance(message, dict):
                 continue
+
+            # Track model name if present
+            if not model_name and "model" in message:
+                model_name = message.get("model")
+
+            # Count tool errors from tool_result blocks in user messages
+            if etype == "user":
+                content = message.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_result":
+                            if block.get("is_error") is True:
+                                tool_errors += 1
+
+            if etype != "assistant":
+                continue
+
             mid = message.get("id")
             if mid is None:
                 anon += 1
@@ -153,10 +214,14 @@ def transcript_stats(path):
                             text_chars += len(txt)
                     elif btype == "tool_use":
                         bid = block.get("id")
+                        tname = block.get("name") or "unknown"
                         if bid is not None:
-                            tool_use_ids.add(bid)
+                            if bid not in tool_use_ids:
+                                tool_use_ids.add(bid)
+                                tool_breakdown[tname] = tool_breakdown.get(tname, 0) + 1
                         else:
                             tool_use_no_id += 1
+                            tool_breakdown[tname] = tool_breakdown.get(tname, 0) + 1
 
     output_tokens = 0
     total_input_tokens = 0
@@ -184,6 +249,10 @@ def transcript_stats(path):
         if duration_s < 0:
             duration_s = 0.0
 
+    total_tool_calls = len(tool_use_ids) + tool_use_no_id
+    decode_speed = round(output_tokens / duration_s, 2) if duration_s > 0 else 0.0
+    roi = calculate_roi(total_input_tokens, output_tokens)
+
     return {
         "api_calls": len(first_seen_order),
         "output_tokens": output_tokens,
@@ -193,8 +262,14 @@ def transcript_stats(path):
         "peak_context": peak_context,
         "thinking_chars": thinking_chars,
         "text_chars": text_chars,
-        "tool_calls": len(tool_use_ids) + tool_use_no_id,
+        "tool_calls": total_tool_calls,
+        "tool_breakdown": tool_breakdown,
+        "tool_errors": tool_errors,
+        "model": model_name or "local-model",
         "duration_s": round(duration_s, 2),
+        "decode_speed_tok_s": decode_speed,
+        "usd_saved": roi["usd_saved"],
+        "token_savings_ratio": roi["token_savings_ratio"],
     }
 
 

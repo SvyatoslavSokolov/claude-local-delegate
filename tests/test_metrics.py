@@ -86,8 +86,30 @@ class TranscriptStatsTests(unittest.TestCase):
         self.assertEqual(s["text_chars"], 60)
         # tool_use deduped by block id: t1 (repeated) + t2 = 2 unique.
         self.assertEqual(s["tool_calls"], 2)
+        # tool breakdown tracking
+        self.assertEqual(s["tool_breakdown"], {"Bash": 1, "Read": 1})
+        self.assertEqual(s["tool_errors"], 0)
         # duration = last ts - first ts = 30s.
         self.assertEqual(s["duration_s"], 30.0)
+        # decode speed: 17 tokens in 30s = 0.57 tok/s
+        self.assertEqual(s["decode_speed_tok_s"], 0.57)
+        # ROI calculations
+        self.assertIn("usd_saved", s)
+        self.assertIn("token_savings_ratio", s)
+
+    def test_prompt_specificity(self):
+        self.assertEqual(metrics.prompt_specificity(""), 0.0)
+        vague = metrics.prompt_specificity("make it better")
+        self.assertLess(vague, 0.4)
+        detailed = metrics.prompt_specificity(
+            "In file server.py, implement function def test_handler(): and verify with pytest tests/test_server.py"
+        )
+        self.assertGreater(detailed, 0.7)
+
+    def test_calculate_roi(self):
+        roi = metrics.calculate_roi(total_input_tokens=100000, output_tokens=10000)
+        self.assertGreater(roi["usd_saved"], 0.1)
+        self.assertGreater(roi["token_savings_ratio"], 0.8)
 
 
 class ProfileForTests(unittest.TestCase):

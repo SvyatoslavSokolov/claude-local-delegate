@@ -985,7 +985,9 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
             "blocks": blocks or [],
             "profile": profile,
             "model": model,
+            "arch_model": os.environ.get("SUPERVISOR_MODEL") or "claude-code",
             "prompt_chars": len(task),
+            "prompt_specificity": metrics.prompt_specificity(task),
             "read_only": _is_read_only(allowed_tools),
             "cwd": cwd,
         })
@@ -1471,6 +1473,7 @@ def rate_delegate(args):
     quality = args.get("quality")
     worth_it = args.get("worth_it")
     note = args.get("note")
+    evaluator = args.get("evaluator") or "architect_llm"
 
     if not run_id or not isinstance(run_id, str):
         return _error_result("`run_id` is required and must be the agent id string.")
@@ -1501,6 +1504,7 @@ def rate_delegate(args):
         "run_id": run_id,
         "quality": quality,
         "worth_it": worth_it,
+        "evaluator": str(evaluator)[:100],
         "note": note,
         "stats": stats,
     })
