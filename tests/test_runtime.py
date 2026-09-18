@@ -44,12 +44,14 @@ class RuntimeTests(unittest.TestCase):
 
     def test_original_tools_and_portable_tools(self):
         tools = self.s.handle_request({'id': 1, 'method': 'tools/list'})['result']['tools']
-        self.assertEqual(len(tools), 24)
+        self.assertEqual(len(tools), 27)
         self.assertIn('delegate_verified', {t['name'] for t in tools})
         self.assertIn('continue_delegate', {t['name'] for t in tools})
         self.assertIn('delegate_to_architect', {t['name'] for t in tools})
         self.assertIn('delegate_to_agy', {t['name'] for t in tools})
         self.assertIn('show_agent_tree', {t['name'] for t in tools})
+        self.assertIn('research_discover', {t['name'] for t in tools})
+        self.assertIn('research_paper', {t['name'] for t in tools})
 
     def test_overlapping_reservation_no_longer_blocks_spawn(self):
         # A legacy spawn (no task_id) that overlaps another session's write
@@ -171,7 +173,7 @@ class RuntimeTests(unittest.TestCase):
         responses = [json.loads(line) for line in p.stdout.splitlines()]
         self.assertEqual([r['id'] for r in responses], [1, 2, 3])
         self.assertTrue(responses[1]['result']['isError'])
-        self.assertEqual(len(responses[2]['result']['tools']), 24)
+        self.assertEqual(len(responses[2]['result']['tools']), 27)
 
 
 if __name__ == '__main__':

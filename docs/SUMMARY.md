@@ -81,6 +81,8 @@
   - **Назначение:** адаптер Antigravity (Antigravity CLI) — делегирование через `agy` (файл `agy_delegate.py`).
 - [`adapters/codex/`](../adapters/codex/)
   - **Назначение:** адаптер OpenAI Codex — установка и подключение (файл `install_codex.py`).
+- [`adapters/orx/`](../adapters/orx/)
+  - **Назначение:** адаптер OpenResearch (`orx`) — полнотекстовый и семантический поиск статей (arXiv, alphaXiv, OpenAlex, bioRxiv), чтение текстов (`orx_adapter.py`).
 
 ---
 

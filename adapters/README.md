@@ -12,6 +12,7 @@ is one self-contained integration:
 |---------|-----------|--------------|
 | `adapters/agy/` | Google Antigravity (`agy` CLI) | `AgyDelegateManager` in `agy_delegate.py` spawns, tracks, and collects results from `agy` tasks running headless (non-interactive) mode. |
 | `adapters/codex/` | OpenAI Codex CLI | `install_codex.py` — a reviewable, additive installer that registers the delegate tools into a Codex install (no credentials copied). |
+| `adapters/orx/` | OpenResearch (`orx` CLI) | `orx_adapter.py` — scientific paper search across arXiv/OpenAlex/bioRxiv, full-text retrieval, and research tools. |
 
 The subpackages are importable packages (`__init__.py` is present in each).
 

@@ -2952,6 +2952,43 @@ PARENT_TOOLS = [
             },
         },
     },
+    {
+        "name": "research_discover",
+        "description": "Discover scientific research papers across arXiv, alphaXiv, OpenAlex, or bioRxiv using OpenResearch (`orx`). Returns titles, authors, dates, abstracts, snippets, and paper IDs.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query: keywords, topic, method names, or semantic description."},
+                "mode": {"type": "string", "enum": ["keyword", "embedding", "openalex", "biorxiv"], "description": "Retrieval primitive (default: keyword for BM25 with snippets; embedding for semantic)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Maximum number of papers to return (default: 5)."},
+                "published_after": {"type": "string", "description": "Optional lower date bound YYYY-MM-DD."},
+                "published_before": {"type": "string", "description": "Optional upper date bound YYYY-MM-DD."},
+                "prioritize": {"type": "string", "enum": ["default", "recency", "historical", "popular"], "description": "Ranking priority."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "research_paper",
+        "description": "Fetch full text, structure, or metadata of an academic paper using OpenResearch (`orx`).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "paper_id": {"type": "string", "description": "arXiv ID (e.g. '2608.14707') or DOI."},
+                "full_text": {"type": "boolean", "description": "Fetch raw full text rather than structured summary (default: false)."},
+                "source": {"type": "string", "enum": ["alphaxiv", "openalex", "biorxiv"], "description": "Optional source override."},
+            },
+            "required": ["paper_id"],
+        },
+    },
+    {
+        "name": "research_status",
+        "description": "Check OpenResearch (`orx`) installation status, version, and supported literature primitives.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]
 
 
@@ -3063,6 +3100,99 @@ def show_agent_tree_handler(args):
         return _error_result(f"Failed to generate agent tree: {e}")
 
 
+def research_discover_handler(args):
+    query = args.get("query")
+    if not query or not isinstance(query, str):
+        return _error_result("`query` is required and must be a non-empty string.")
+    mode = args.get("mode", "keyword")
+    try:
+        limit = int(args.get("limit", 5))
+    except (TypeError, ValueError):
+        limit = 5
+    published_after = args.get("published_after")
+    published_before = args.get("published_before")
+    prioritize = args.get("prioritize")
+
+    try:
+        from adapters.orx import discover_papers
+        papers = discover_papers(
+            query=query,
+            mode=mode,
+            limit=limit,
+            published_after=published_after,
+            published_before=published_before,
+            prioritize=prioritize,
+        )
+        if not papers:
+            return {"content": [{"type": "text", "text": f"No papers found for query: {query}"}], "isError": False}
+
+        lines = [f"Found {len(papers)} research paper(s) via alphaXiv/OpenResearch [{mode}]:\n"]
+        for i, p in enumerate(papers, 1):
+            pid = p.get("id", "")
+            title = p.get("title", "Untitled").strip()
+            date = (p.get("publicationDate") or "")[:10]
+            abstract = (p.get("abstract") or "").strip()
+            if len(abstract) > 300:
+                abstract = abstract[:297] + "..."
+
+            lines.append(f"### {i}. [{title}](https://www.alphaxiv.org/abs/{pid})")
+            lines.append(f"- **ID:** `{pid}` | **Source:** {p.get('source', 'arXiv')} | **Date:** {date}")
+            if p.get("snippets"):
+                for s in p.get("snippets")[:1]:
+                    snippet = s.get("snippet", "").strip().replace("\n", " ")
+                    if len(snippet) > 200:
+                        snippet = snippet[:197] + "..."
+                    lines.append(f"- **Snippet:** *\"{snippet}\"*")
+            lines.append(f"- **Abstract:** {abstract}\n")
+
+        return {"content": [{"type": "text", "text": "\n".join(lines)}], "isError": False}
+    except Exception as e:
+        return _error_result(f"Research discovery failed: {e}")
+
+
+def research_paper_handler(args):
+    paper_id = args.get("paper_id")
+    if not paper_id:
+        return _error_result("`paper_id` is required (e.g. '2608.14707' or DOI).")
+    full_text = bool(args.get("full_text", False))
+    source = args.get("source")
+
+    try:
+        from adapters.orx import fetch_paper
+        content = fetch_paper(paper_id=str(paper_id), full_text=full_text, source=source)
+        return {"content": [{"type": "text", "text": content}], "isError": False}
+    except Exception as e:
+        return _error_result(f"Failed to fetch paper {paper_id}: {e}")
+
+
+def research_status_handler(args):
+    try:
+        from adapters.orx import find_orx_bin, orx_version
+        bin_path = find_orx_bin()
+        ver = orx_version()
+        if not bin_path:
+            return _error_result(
+                "OpenResearch CLI (`orx`) is NOT installed.\n"
+                "Install it via: curl -LsSf https://openresearch.sh/install.sh | sh"
+            )
+        return {
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"OpenResearch (`orx`) is ready for research operations.\n"
+                    f"- Binary: {bin_path}\n"
+                    f"- Version: {ver}\n"
+                    f"- Supported primitives: keyword (BM25), embedding (semantic), openalex, biorxiv\n"
+                    f"- Endpoints: alphaXiv, arXiv, OpenAlex, bioRxiv (no login required)\n"
+                    f"- Local dashboard: orx up (runs on http://127.0.0.1:4791)"
+                )
+            }],
+            "isError": False,
+        }
+    except Exception as e:
+        return _error_result(f"Failed to check research status: {e}")
+
+
 TOOL_HANDLERS = {
     "delegate_to_local": start_delegate,
     "delegate_to_architect": start_architect_delegate,
@@ -3082,6 +3212,9 @@ TOOL_HANDLERS = {
     "get_agy_result": get_agy_result,
     "stop_agy": stop_agy,
     "show_agent_tree": show_agent_tree_handler,
+    "research_discover": research_discover_handler,
+    "research_paper": research_paper_handler,
+    "research_status": research_status_handler,
 }
 TOOLS = PARENT_TOOLS
 
