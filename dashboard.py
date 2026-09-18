@@ -33,8 +33,8 @@ RUNS_JSON = os.path.join(STATE_DIR, "runs.json")
 METRICS_JSONL = os.path.join(STATE_DIR, "metrics.jsonl")
 
 
-def load_tasks() -> List[Dict[str, Any]]:
-    """Fetch tasks from coordination.sqlite3."""
+def load_tasks(runs_lookup: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Fetch tasks from coordination.sqlite3 and optionally enrich with run metrics."""
     if not os.path.isfile(DB_PATH):
         return []
     try:
@@ -45,7 +45,17 @@ def load_tasks() -> List[Dict[str, Any]]:
         tasks = []
         for r in rows:
             try:
-                tasks.append(json.loads(r[0]))
+                t = json.loads(r[0])
+                proj = t.get("project", "")
+                t["project_name"] = os.path.basename(proj.rstrip("/")) if proj else ""
+                if runs_lookup and t.get("runs") and len(t["runs"]) > 0:
+                    r_info = runs_lookup.get(t["runs"][0])
+                    if r_info:
+                        t["run_speed"] = r_info.get("decode_speed_tok_s")
+                        t["run_usd_saved"] = r_info.get("usd_saved")
+                        t["run_quality"] = r_info.get("quality")
+                        t["run_model"] = r_info.get("model")
+                tasks.append(t)
             except Exception:
                 pass
         conn.close()
@@ -85,6 +95,27 @@ def load_metrics_events() -> List[Dict[str, Any]]:
     return events
 
 
+_TRANSCRIPT_CACHE: Dict[str, Any] = {}
+
+
+def get_run_stats(run_id: str, rate_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Get stats from rate_meta or resolve on the fly from disk transcript."""
+    if rate_meta.get("stats"):
+        return rate_meta["stats"]
+    if run_id in _TRANSCRIPT_CACHE:
+        return _TRANSCRIPT_CACHE[run_id]
+
+    try:
+        matches = glob.glob(os.path.expanduser(f"~/.claude/projects/*/*{run_id}*.jsonl"))
+        if matches:
+            stats = metrics.transcript_stats(matches[0])
+            _TRANSCRIPT_CACHE[run_id] = stats
+            return stats
+    except Exception:
+        pass
+    return {}
+
+
 def compile_runs_summary() -> List[Dict[str, Any]]:
     """Merge runs metadata and rated events into a consolidated list."""
     runs_map = load_runs_map()
@@ -100,9 +131,26 @@ def compile_runs_summary() -> List[Dict[str, Any]]:
         r_meta = runs_map.get(rid, {})
         s_meta = spawns.get(rid, {})
         rate_meta = rates.get(rid, {})
-        stats = rate_meta.get("stats") or {}
+        stats = get_run_stats(rid, rate_meta)
 
         at_ts = r_meta.get("at") or s_meta.get("at") or rate_meta.get("at") or 0.0
+
+        dur = stats.get("duration_s")
+        out_tokens = stats.get("output_tokens")
+        in_tokens = stats.get("total_input_tokens")
+
+        # Backfill speed if missing from historical record
+        speed = stats.get("decode_speed_tok_s")
+        if speed is None and dur and dur > 0 and out_tokens and out_tokens > 0:
+            speed = round(out_tokens / dur, 1)
+
+        # Backfill USD saved if missing from historical record
+        usd_saved = stats.get("usd_saved") or 0.0
+        tsr = stats.get("token_savings_ratio") or 0.0
+        if usd_saved == 0.0 and (in_tokens or out_tokens):
+            roi = metrics.calculate_roi(in_tokens or 0, out_tokens or 0)
+            usd_saved = roi["usd_saved"]
+            tsr = roi["token_savings_ratio"]
 
         item = {
             "run_id": rid,
@@ -119,17 +167,17 @@ def compile_runs_summary() -> List[Dict[str, Any]]:
             "note": rate_meta.get("note") or "",
             "prompt_chars": s_meta.get("prompt_chars"),
             "prompt_specificity": s_meta.get("prompt_specificity"),
-            "duration_s": stats.get("duration_s"),
-            "output_tokens": stats.get("output_tokens"),
-            "total_input_tokens": stats.get("total_input_tokens"),
+            "duration_s": dur,
+            "output_tokens": out_tokens,
+            "total_input_tokens": in_tokens,
             "cached_input_tokens": stats.get("cached_input_tokens"),
             "api_calls": stats.get("api_calls"),
             "tool_calls": stats.get("tool_calls"),
             "tool_breakdown": stats.get("tool_breakdown") or {},
             "tool_errors": stats.get("tool_errors", 0),
-            "decode_speed_tok_s": stats.get("decode_speed_tok_s"),
-            "usd_saved": stats.get("usd_saved", 0.0),
-            "token_savings_ratio": stats.get("token_savings_ratio", 0.0),
+            "decode_speed_tok_s": speed,
+            "usd_saved": usd_saved,
+            "token_savings_ratio": tsr,
         }
         result.append(item)
 
@@ -139,8 +187,9 @@ def compile_runs_summary() -> List[Dict[str, Any]]:
 
 def compile_overview() -> Dict[str, Any]:
     """Compile high-level KPIs, cluster health, and tool aggregations."""
-    tasks = load_tasks()
     runs = compile_runs_summary()
+    runs_lookup = {r["run_id"]: r for r in runs}
+    tasks = load_tasks(runs_lookup=runs_lookup)
     telemetry = cluster_telemetry.check_cluster_overview()
 
     task_counts = {"active": 0, "done": 0, "waiting": 0, "blocked": 0, "cancelled": 0, "total": len(tasks)}
@@ -580,11 +629,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         const renderTaskCard = t => `
           <div class="task-card">
-            <div class="task-summary">${t.summary || t.task_key || t.id}</div>
-            <div class="task-meta">
-              <span>${t.runs && t.runs.length ? 'Run: ' + t.runs[0] : 'Pending'}</span>
-              <span>${t.mode || 'write'}</span>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+              <span class="badge badge-purple" style="font-size:0.7rem;">${t.project_name || 'project'}</span>
+              <span class="badge ${t.status === 'done' ? 'badge-green' : (t.status === 'active' ? 'badge-yellow' : '')}" style="font-size:0.7rem;">${t.status}</span>
             </div>
+            <div class="task-summary">${t.summary || t.task_key || t.id}</div>
+            <div class="task-meta" style="margin-top:6px;">
+              <span>${t.runs && t.runs.length ? 'Run: ' + t.runs[0] : 'Pending'}${t.run_model ? ' (' + t.run_model + ')' : ''}</span>
+              <span style="color:var(--green); font-weight:500;">${t.run_speed ? t.run_speed + ' t/s' : ''}${t.run_usd_saved ? ' • +$' + t.run_usd_saved : ''}</span>
+            </div>
+            ${t.run_quality !== null && t.run_quality !== undefined ? `<div style="margin-top:6px;"><span class="badge badge-green" style="font-size:0.72rem;">Quality: ${t.run_quality}/100</span></div>` : ''}
+            ${t.note ? `<div style="margin-top:6px; font-size:0.72rem; color:var(--text-muted); font-style:italic;">"${t.note.substring(0, 120)}..."</div>` : ''}
           </div>
         `;
 
@@ -665,7 +720,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/tasks":
-            self._send_json(load_tasks())
+            runs = compile_runs_summary()
+            runs_lookup = {r["run_id"]: r for r in runs}
+            self._send_json(load_tasks(runs_lookup=runs_lookup))
             return
 
         if path == "/api/telemetry":
