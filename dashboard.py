@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1422,8 +1423,48 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self.send_error(404, f"Not Found: {path}")
 
 
-def run_dashboard(host: str = "127.0.0.1", port: int = 8765):
-    server = HTTPServer((host, port), DashboardRequestHandler)
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def _find_pid_on_port(port: int) -> Optional[int]:
+    try:
+        res = subprocess.run(["fuser", f"{port}/tcp"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out = (res.stdout or res.stderr).strip()
+        if out:
+            pids = [int(p) for p in out.split() if p.isdigit()]
+            if pids:
+                return pids[0]
+    except Exception:
+        pass
+    return None
+
+
+def run_dashboard(host: str = "127.0.0.1", port: int = 8765, force: bool = False):
+    try:
+        server = ReusableHTTPServer((host, port), DashboardRequestHandler)
+    except OSError as exc:
+        if exc.errno == 98:  # Address already in use
+            pid = _find_pid_on_port(port)
+            if force and pid:
+                print(f"[*] Port {port} occupied by PID {pid}. Terminating stale process...")
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    time.sleep(0.5)
+                    server = ReusableHTTPServer((host, port), DashboardRequestHandler)
+                except Exception as kerr:
+                    print(f"[!] Could not terminate PID {pid}: {kerr}")
+                    sys.exit(1)
+            else:
+                pid_hint = f" (PID {pid})" if pid else ""
+                print(f"[!] Port {port} is already in use{pid_hint}.")
+                print(f"    Run with --force to automatically kill the old instance:")
+                print(f"    python3 dashboard.py --force")
+                sys.exit(1)
+        else:
+            raise
+
     print(f"[*] Claude Local Delegate Dashboard running at: http://{host}:{port}/")
     print("    Press Ctrl+C to stop.")
     try:
@@ -1437,6 +1478,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the delegation metrics web dashboard.")
     parser.add_argument("--host", default="127.0.0.1", help="Host interface (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765, help="Port (default: 8765)")
+    parser.add_argument("--force", "-f", action="store_true", help="Force kill any stale process holding the port")
     args = parser.parse_args()
 
-    run_dashboard(host=args.host, port=args.port)
+    run_dashboard(host=args.host, port=args.port, force=args.force)
+
