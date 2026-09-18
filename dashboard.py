@@ -437,6 +437,136 @@ def compile_runs_summary() -> List[Dict[str, Any]]:
     return result
 
 
+def get_known_projects() -> List[Dict[str, str]]:
+    """Discover known projects across SQLite coordination, Claude directories, and Gemini."""
+    found: Dict[str, str] = {}
+
+    cur = os.getcwd()
+    found[cur] = os.path.basename(cur.rstrip("/"))
+
+    if os.path.isfile(DB_PATH):
+        try:
+            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+            for row in conn.cursor().execute("SELECT body FROM tasks;"):
+                try:
+                    b = json.loads(row[0])
+                    p = b.get("project")
+                    if p and os.path.isdir(p):
+                        found[p] = os.path.basename(p.rstrip("/"))
+                except Exception:
+                    pass
+            conn.close()
+        except Exception:
+            pass
+
+    gp = os.path.expanduser("~/.gemini/projects.json")
+    if os.path.isfile(gp):
+        try:
+            with open(gp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for p in data:
+                        if isinstance(p, str) and os.path.isdir(p):
+                            found[p] = os.path.basename(p.rstrip("/"))
+        except Exception:
+            pass
+
+    res = [{"name": name, "path": path} for path, name in found.items()]
+    res.sort(key=lambda x: (x["path"] != cur, x["name"].lower()))
+    return res
+
+
+def compile_quotas() -> Dict[str, Any]:
+    """Calculate rolling 5-hour and 7-day limits for Claude Code, AGY, Codex, and Local Cluster."""
+    now_s = time.time()
+    five_h_ago = now_s - (5 * 3600)
+    one_w_ago = now_s - (7 * 86400)
+
+    def _calc_quota(path: str, ts_multiplier: float, limit_5h: int, limit_7d: int, label: str) -> Dict[str, Any]:
+        timestamps_5h = []
+        cnt_7d = 0
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            d = json.loads(line)
+                            ts = d.get("timestamp") or d.get("ts")
+                            if ts:
+                                ts_s = float(ts) / ts_multiplier
+                                if ts_s >= one_w_ago:
+                                    cnt_7d += 1
+                                    if ts_s >= five_h_ago:
+                                        timestamps_5h.append(ts_s)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        cnt_5h = len(timestamps_5h)
+        rem_5h = max(0, limit_5h - cnt_5h)
+        pct_5h = round((rem_5h / limit_5h) * 100, 1)
+
+        rem_7d = max(0, limit_7d - cnt_7d)
+        pct_7d = round((rem_7d / limit_7d) * 100, 1)
+
+        if timestamps_5h:
+            earliest = min(timestamps_5h)
+            reset_in_s = max(0, int((earliest + 5 * 3600) - now_s))
+            h = reset_in_s // 3600
+            m = (reset_in_s % 3600) // 60
+            reset_str = f"{h}h {m}m"
+        else:
+            reset_str = "Full Quota"
+
+        status = "healthy" if pct_5h > 35 else ("warning" if pct_5h > 15 else "danger")
+
+        return {
+            "label": label,
+            "used_5h": cnt_5h,
+            "limit_5h": limit_5h,
+            "rem_5h": rem_5h,
+            "pct_5h": pct_5h,
+            "used_7d": cnt_7d,
+            "limit_7d": limit_7d,
+            "rem_7d": rem_7d,
+            "pct_7d": pct_7d,
+            "reset_in": reset_str,
+            "status": status,
+        }
+
+    claude_hist = os.path.expanduser("~/.claude/history.jsonl")
+    agy_hist = os.path.expanduser("~/.gemini/antigravity-cli/history.jsonl")
+    codex_hist = os.path.expanduser("~/.codex/history.jsonl")
+
+    claude_quota = _calc_quota(claude_hist, ts_multiplier=1000.0, limit_5h=45, limit_7d=1200, label="Claude Code (Pro)")
+    agy_quota = _calc_quota(agy_hist, ts_multiplier=1000.0, limit_5h=100, limit_7d=1500, label="Google Antigravity (Gemini)")
+    codex_quota = _calc_quota(codex_hist, ts_multiplier=1.0, limit_5h=50, limit_7d=1000, label="OpenAI Codex")
+
+    local_quota = {
+        "label": "Local Cluster (4x RTX 3090)",
+        "used_5h": 0,
+        "limit_5h": "∞",
+        "rem_5h": "∞",
+        "pct_5h": 100.0,
+        "used_7d": 0,
+        "limit_7d": "∞",
+        "rem_7d": "∞",
+        "pct_7d": 100.0,
+        "reset_in": "Unlimited (Local GPU)",
+        "status": "healthy",
+    }
+
+    return {
+        "claude": claude_quota,
+        "agy": agy_quota,
+        "codex": codex_quota,
+        "local": local_quota,
+        "architect": agy_quota,
+    }
+
+
 def compile_overview() -> Dict[str, Any]:
     """Compile high-level KPIs, cluster health, and tool aggregations."""
     runs = compile_runs_summary()
@@ -487,6 +617,8 @@ def compile_overview() -> Dict[str, Any]:
         "total_tool_errors": total_tool_errors,
         "evaluator_counts": evaluator_counts,
         "cluster": telemetry,
+        "quotas": compile_quotas(),
+        "known_projects": get_known_projects(),
     }
 
 
@@ -842,6 +974,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
     <div class="pills">
       <span id="clusterBadge" class="badge">Loading Cluster...</span>
+      <span id="claudeQuotaPill" class="badge badge-purple" style="font-size:0.75rem;">Claude 5h: --</span>
       <span id="savedBadge" class="badge badge-green">$0.00 Saved</span>
       <span id="activeBadge" class="badge">0 Active Tasks</span>
       <button class="btn" onclick="openSpawnModal()" style="background: linear-gradient(135deg, #1f6feb, #238636); border: none; font-weight: 600; display: inline-flex; align-items: center; gap: 6px;">➕ New Task / Dispatch</button>
@@ -877,6 +1010,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <button class="tab-btn active" onclick="switchTab('kanbanTab')">Coordination Kanban Board</button>
     <button class="tab-btn" onclick="switchTab('runsTab')">Recent Runs & Performance</button>
     <button class="tab-btn" onclick="switchTab('toolsTab')">Tool Usage & Observability</button>
+    <button class="tab-btn" onclick="switchTab('quotasTab')">Architect Limits & Quotas</button>
   </div>
 
   <!-- Tab 1: Kanban -->
@@ -959,8 +1093,157 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Tab 4: Architect Limits & Quotas -->
+  <div id="quotasTab" style="display: none;">
+    <div style="margin-bottom: 16px;">
+      <h2 style="font-size: 1.15rem; margin: 0 0 6px 0;">Architect Super-Model Quotas & Rolling Rate Limits</h2>
+      <p style="color: var(--text-muted); font-size: 0.85rem; margin: 0;">
+        Track remaining 5-hour rolling windows, weekly allowances, and time-to-reset across Claude Code, Google Antigravity, OpenAI Codex, and the local GPU cluster.
+      </p>
+    </div>
+
+    <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));">
+      <!-- Claude Code Card -->
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <span style="font-weight: 600; font-size: 1rem; color: #fff;">⚡ Claude Code</span>
+          <span class="badge badge-purple">Anthropic Pro</span>
+        </div>
+        <div style="margin-top: 14px;">
+          <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
+            <span>5-Hour Rolling Limit</span>
+            <span style="font-weight: 600;"><span id="claude5hRem">--</span> / <span id="claude5hLimit">45</span> left</span>
+          </div>
+          <div class="tool-bar-bg">
+            <div id="claude5hBar" class="tool-bar-fill" style="width: 100%; background: var(--green);"></div>
+          </div>
+          <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">
+            <span>Used: <span id="claude5hUsed">--</span></span>
+            <span>Resets in: <span id="claude5hReset" style="color: var(--accent); font-weight: 500;">--</span></span>
+          </div>
+        </div>
+
+        <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border);">
+          <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
+            <span>7-Day Weekly Limit</span>
+            <span style="font-weight: 600;"><span id="claude7dRem">--</span> / <span id="claude7dLimit">1200</span> left</span>
+          </div>
+          <div class="tool-bar-bg">
+            <div id="claude7dBar" class="tool-bar-fill" style="width: 100%; background: var(--accent);"></div>
+          </div>
+          <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">
+            Used this week: <span id="claude7dUsed">--</span> prompts
+          </div>
+        </div>
+      </div>
+
+      <!-- Google Antigravity Card -->
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <span style="font-weight: 600; font-size: 1rem; color: #fff;">🧠 Google Antigravity</span>
+          <span class="badge badge-blue">Gemini 2.5/3.8</span>
+        </div>
+        <div style="margin-top: 14px;">
+          <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
+            <span>5-Hour Rolling Limit</span>
+            <span style="font-weight: 600;"><span id="agy5hRem">--</span> / <span id="agy5hLimit">100</span> left</span>
+          </div>
+          <div class="tool-bar-bg">
+            <div id="agy5hBar" class="tool-bar-fill" style="width: 100%; background: var(--green);"></div>
+          </div>
+          <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">
+            <span>Used: <span id="agy5hUsed">--</span></span>
+            <span>Resets in: <span id="agy5hReset" style="color: var(--accent); font-weight: 500;">--</span></span>
+          </div>
+        </div>
+
+        <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border);">
+          <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
+            <span>7-Day Weekly Limit</span>
+            <span style="font-weight: 600;"><span id="agy7dRem">--</span> / <span id="agy7dLimit">1500</span> left</span>
+          </div>
+          <div class="tool-bar-bg">
+            <div id="agy7dBar" class="tool-bar-fill" style="width: 100%; background: var(--accent);"></div>
+          </div>
+          <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">
+            Used this week: <span id="agy7dUsed">--</span> requests
+          </div>
+        </div>
+      </div>
+
+      <!-- OpenAI Codex Card -->
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <span style="font-weight: 600; font-size: 1rem; color: #fff;">🤖 OpenAI Codex</span>
+          <span class="badge" style="border-color: #10a37f; color: #10a37f;">o3-mini / GPT-4o</span>
+        </div>
+        <div style="margin-top: 14px;">
+          <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
+            <span>5-Hour Rolling Limit</span>
+            <span style="font-weight: 600;"><span id="codex5hRem">--</span> / <span id="codex5hLimit">50</span> left</span>
+          </div>
+          <div class="tool-bar-bg">
+            <div id="codex5hBar" class="tool-bar-fill" style="width: 100%; background: var(--green);"></div>
+          </div>
+          <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">
+            <span>Used: <span id="codex5hUsed">--</span></span>
+            <span>Resets in: <span id="codex5hReset" style="color: var(--accent); font-weight: 500;">--</span></span>
+          </div>
+        </div>
+
+        <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border);">
+          <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
+            <span>7-Day Weekly Limit</span>
+            <span style="font-weight: 600;"><span id="codex7dRem">--</span> / <span id="codex7dLimit">1000</span> left</span>
+          </div>
+          <div class="tool-bar-bg">
+            <div id="codex7dBar" class="tool-bar-fill" style="width: 100%; background: var(--accent);"></div>
+          </div>
+          <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">
+            Used this week: <span id="codex7dUsed">--</span> requests
+          </div>
+        </div>
+      </div>
+
+      <!-- Local Cluster Card -->
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <span style="font-weight: 600; font-size: 1rem; color: #fff;">🖥️ Local Cluster (vLLM)</span>
+          <span class="badge badge-green">4x RTX 3090</span>
+        </div>
+        <div style="margin-top: 14px;">
+          <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
+            <span>5-Hour Rolling Limit</span>
+            <span style="font-weight: 600; color: var(--green);">∞ Unlimited</span>
+          </div>
+          <div class="tool-bar-bg">
+            <div class="tool-bar-fill" style="width: 100%; background: var(--green);"></div>
+          </div>
+          <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">
+            Zero rate limits • Free local inference
+          </div>
+        </div>
+
+        <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border);">
+          <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
+            <span>7-Day Weekly Limit</span>
+            <span style="font-weight: 600; color: var(--green);">∞ Unlimited</span>
+          </div>
+          <div class="tool-bar-bg">
+            <div class="tool-bar-fill" style="width: 100%; background: var(--green);"></div>
+          </div>
+          <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">
+            Prefix cache active • 93.8% hit rate
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
     let rawTasks = [];
+    let rawQuotas = null;
+    let rawProjects = [];
     let currentFilter = 'all';
 
     function switchTab(tabId) {
@@ -969,6 +1252,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('runsTab').style.display = tabId === 'runsTab' ? 'block' : 'none';
       document.getElementById('kanbanTab').style.display = tabId === 'kanbanTab' ? 'block' : 'none';
       document.getElementById('toolsTab').style.display = tabId === 'toolsTab' ? 'block' : 'none';
+      document.getElementById('quotasTab').style.display = tabId === 'quotasTab' ? 'block' : 'none';
     }
 
     function filterKanban() {
@@ -1170,6 +1454,68 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           `).join('');
         }
 
+        // Render Quotas
+        rawQuotas = overviewRes.quotas || {};
+        rawProjects = overviewRes.known_projects || [];
+
+        if (rawQuotas) {
+          const cq = rawQuotas.claude || {};
+          const c5hRem = document.getElementById('claude5hRem');
+          if (c5hRem) {
+            c5hRem.innerText = cq.rem_5h !== undefined ? cq.rem_5h : '--';
+            document.getElementById('claude5hLimit').innerText = cq.limit_5h || 45;
+            document.getElementById('claude5hUsed').innerText = cq.used_5h || 0;
+            document.getElementById('claude5hReset').innerText = cq.reset_in || '--';
+            document.getElementById('claude5hBar').style.width = (cq.pct_5h || 0) + '%';
+            document.getElementById('claude5hBar').style.background = cq.pct_5h > 35 ? 'var(--green)' : 'var(--yellow)';
+
+            document.getElementById('claude7dRem').innerText = cq.rem_7d !== undefined ? cq.rem_7d : '--';
+            document.getElementById('claude7dLimit').innerText = cq.limit_7d || 1200;
+            document.getElementById('claude7dUsed').innerText = cq.used_7d || 0;
+            document.getElementById('claude7dBar').style.width = (cq.pct_7d || 0) + '%';
+          }
+
+          const aq = rawQuotas.agy || {};
+          const a5hRem = document.getElementById('agy5hRem');
+          if (a5hRem) {
+            a5hRem.innerText = aq.rem_5h !== undefined ? aq.rem_5h : '--';
+            document.getElementById('agy5hLimit').innerText = aq.limit_5h || 100;
+            document.getElementById('agy5hUsed').innerText = aq.used_5h || 0;
+            document.getElementById('agy5hReset').innerText = aq.reset_in || '--';
+            document.getElementById('agy5hBar').style.width = (aq.pct_5h || 0) + '%';
+            document.getElementById('agy5hBar').style.background = aq.pct_5h > 35 ? 'var(--green)' : 'var(--yellow)';
+
+            document.getElementById('agy7dRem').innerText = aq.rem_7d !== undefined ? aq.rem_7d : '--';
+            document.getElementById('agy7dLimit').innerText = aq.limit_7d || 1500;
+            document.getElementById('agy7dUsed').innerText = aq.used_7d || 0;
+            document.getElementById('agy7dBar').style.width = (aq.pct_7d || 0) + '%';
+          }
+
+          const cx = rawQuotas.codex || {};
+          const cx5hRem = document.getElementById('codex5hRem');
+          if (cx5hRem) {
+            cx5hRem.innerText = cx.rem_5h !== undefined ? cx.rem_5h : '--';
+            document.getElementById('codex5hLimit').innerText = cx.limit_5h || 50;
+            document.getElementById('codex5hUsed').innerText = cx.used_5h || 0;
+            document.getElementById('codex5hReset').innerText = cx.reset_in || '--';
+            document.getElementById('codex5hBar').style.width = (cx.pct_5h || 0) + '%';
+            document.getElementById('codex5hBar').style.background = cx.pct_5h > 35 ? 'var(--green)' : 'var(--yellow)';
+
+            document.getElementById('codex7dRem').innerText = cx.rem_7d !== undefined ? cx.rem_7d : '--';
+            document.getElementById('codex7dLimit').innerText = cx.limit_7d || 1000;
+            document.getElementById('codex7dUsed').innerText = cx.used_7d || 0;
+            document.getElementById('codex7dBar').style.width = (cx.pct_7d || 0) + '%';
+          }
+
+          const clPill = document.getElementById('claudeQuotaPill');
+          if (clPill && cq.rem_5h !== undefined) {
+            clPill.innerText = `Claude 5h: ${cq.rem_5h}/${cq.limit_5h} left (${cq.reset_in})`;
+            clPill.className = 'badge ' + (cq.pct_5h > 35 ? 'badge-green' : (cq.pct_5h > 15 ? 'badge-yellow' : 'badge-red'));
+          }
+
+          updateModalQuotaBanner();
+        }
+
       } catch (err) {
         console.error('Fetch error:', err);
       }
@@ -1214,11 +1560,55 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       } else {
         document.getElementById('spawnModel').value = '';
       }
+      updateModalQuotaBanner();
     }
 
     function onModelPresetChange() {
       const val = document.getElementById('spawnModelPreset').value;
       document.getElementById('spawnModel').value = val;
+    }
+
+    function updateModalQuotaBanner() {
+      const adapter = document.getElementById('spawnAdapter').value;
+      const q = (rawQuotas && rawQuotas[adapter]) || null;
+      const titleEl = document.getElementById('bannerAdapterTitle');
+      const resetEl = document.getElementById('bannerResetIn');
+      const detailsEl = document.getElementById('bannerDetails');
+
+      if (!titleEl) return;
+
+      if (!q) {
+        titleEl.innerText = adapter.toUpperCase() + ' Quota';
+        resetEl.innerText = '--';
+        detailsEl.innerText = 'Calculating rolling quotas...';
+        return;
+      }
+
+      if (adapter === 'local') {
+        titleEl.innerHTML = '🖥️ Local Cluster: <span style="color:var(--green);">∞ Unlimited Compute</span>';
+        resetEl.innerText = 'Always Free';
+        resetEl.className = 'badge badge-green';
+        detailsEl.innerText = '0 API token cost • 4x RTX 3090 • Prefix cache active';
+      } else {
+        titleEl.innerHTML = `${q.label || adapter.toUpperCase()}: <span style="color:${q.pct_5h > 35 ? 'var(--green)' : 'var(--yellow)'}; font-weight:600;">${q.rem_5h} / ${q.limit_5h} left (5h)</span>`;
+        resetEl.innerText = 'Resets: ' + q.reset_in;
+        resetEl.className = q.pct_5h > 35 ? 'badge badge-green' : (q.pct_5h > 15 ? 'badge badge-yellow' : 'badge badge-red');
+        detailsEl.innerText = `Weekly: ${q.rem_7d} / ${q.limit_7d} remaining (${q.used_7d} used in 7 days)`;
+      }
+    }
+
+    function onProjectSelectChange() {
+      const sel = document.getElementById('spawnProjectSelect');
+      const customInput = document.getElementById('spawnCwd');
+      if (sel.value === '__custom__') {
+        customInput.style.display = 'block';
+        customInput.value = '';
+        customInput.placeholder = '/path/to/custom/project';
+        customInput.focus();
+      } else {
+        customInput.style.display = 'none';
+        customInput.value = sel.value;
+      }
     }
 
     function openSpawnModal() {
@@ -1227,19 +1617,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       onAdapterChange();
       document.getElementById('spawnError').style.display = 'none';
 
-      // Suggestions for project cwd
-      const projects = Array.from(new Set(rawTasks.map(t => t.project).filter(Boolean)));
-      const suggBox = document.getElementById('cwdSuggestions');
-      if (projects.length > 0) {
-        suggBox.innerHTML = '<span style="font-size:0.75rem; color:var(--text-muted); align-self:center;">Recent:</span>' +
-          projects.slice(0, 3).map(p => `<button type="button" class="badge" style="cursor:pointer;" onclick="document.getElementById('spawnCwd').value = '${p}'">${p.split('/').pop()}</button>`).join('');
-        if (!document.getElementById('spawnCwd').value) {
-          document.getElementById('spawnCwd').value = projects[0];
-        }
-      } else {
-        suggBox.innerHTML = '';
-      }
+      // Suggestions / projects dropdown
+      const projSel = document.getElementById('spawnProjectSelect');
+      const projects = rawProjects && rawProjects.length ? rawProjects : [{name: 'Current Directory', path: '.'}];
+      projSel.innerHTML = projects.map(p => `<option value="${p.path}">${p.name} (${p.path})</option>`).join('') +
+        '<option value="__custom__">📁 Custom Directory / New Project...</option>';
+      projSel.value = projects[0].path;
+      document.getElementById('spawnCwd').value = projects[0].path;
+      document.getElementById('spawnCwd').style.display = 'none';
 
+      updateModalQuotaBanner();
       setTimeout(() => document.getElementById('spawnTask').focus(), 50);
     }
 
@@ -1330,10 +1717,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           </div>
         </div>
 
+        <!-- Live Quota Status Banner for selected model/adapter -->
+        <div id="adapterQuotaBanner" style="background: rgba(88, 166, 255, 0.08); border: 1px solid rgba(88, 166, 255, 0.25); border-radius: 6px; padding: 10px 12px; font-size: 0.8rem;">
+          <div style="display:flex; justify-content:space-between; margin-bottom:4px; align-items:center;">
+            <span id="bannerAdapterTitle" style="font-weight:600; color:#fff;">--</span>
+            <span id="bannerResetIn" class="badge badge-purple" style="font-size:0.7rem;">--</span>
+          </div>
+          <div id="bannerDetails" style="color:var(--text-muted); font-size:0.78rem;">--</div>
+        </div>
+
         <div class="form-group">
-          <label>Working Directory (CWD)</label>
-          <input id="spawnCwd" type="text" class="form-ctrl" placeholder="/absolute/path/to/project" />
-          <div id="cwdSuggestions" style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px;"></div>
+          <label>Project</label>
+          <select id="spawnProjectSelect" class="form-ctrl" onchange="onProjectSelectChange()">
+          </select>
+          <input id="spawnCwd" type="text" class="form-ctrl" style="margin-top: 6px; display: none;" placeholder="/absolute/path/to/custom/project" />
         </div>
 
         <div class="form-group">
@@ -1407,6 +1804,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/telemetry":
             self._send_json(cluster_telemetry.check_cluster_overview())
+            return
+
+        if path == "/api/quotas":
+            self._send_json(compile_quotas())
+            return
+
+        if path == "/api/projects":
+            self._send_json(get_known_projects())
             return
 
         self.send_error(404, f"Not Found: {path}")

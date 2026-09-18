@@ -42,6 +42,39 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("spawnModel", html)
         self.assertIn("submitSpawn", html)
         self.assertIn("/api/task/spawn", html)
+        self.assertIn("quotasTab", html)
+        self.assertIn("adapterQuotaBanner", html)
+        self.assertIn("spawnProjectSelect", html)
+        self.assertIn("claudeQuotaPill", html)
+
+    def test_compile_quotas_structure(self):
+        quotas = dashboard.compile_quotas()
+        self.assertIsInstance(quotas, dict)
+        for key in ("claude", "agy", "codex", "local"):
+            self.assertIn(key, quotas)
+            q = quotas[key]
+            self.assertIn("label", q)
+            self.assertIn("used_5h", q)
+            self.assertIn("rem_5h", q)
+            self.assertIn("used_7d", q)
+            self.assertIn("rem_7d", q)
+            self.assertIn("reset_in", q)
+
+    def test_get_known_projects(self):
+        projects = dashboard.get_known_projects()
+        self.assertIsInstance(projects, list)
+        self.assertGreater(len(projects), 0)
+        for p in projects:
+            self.assertIn("name", p)
+            self.assertIn("path", p)
+
+    def test_compile_overview_includes_quotas_and_projects(self):
+        with patch("cluster_telemetry.check_cluster_overview") as mock_cl:
+            mock_cl.return_value = {"overall_healthy": True, "vllm": {"running_requests": 0}}
+            overview = dashboard.compile_overview()
+            self.assertIn("quotas", overview)
+            self.assertIn("known_projects", overview)
+            self.assertIn("claude", overview["quotas"])
 
     def test_update_and_cleanup_tasks(self):
         import tempfile
