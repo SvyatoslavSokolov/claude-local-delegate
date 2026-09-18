@@ -2,11 +2,12 @@
 """Web GUI Dashboard for Claude Local Delegate & Multi-Agent Cluster.
 
 Real-time browser observability for:
-1. Active & past task board (Kanban / Tree from coordination.sqlite3).
+1. Active & past task board (Kanban / Tree from coordination.sqlite3) with interactive controls.
 2. Live 4x RTX 3090 GPU cluster telemetry (vLLM & LiteLLM).
 3. Quality & Worth-It score matrices, evaluator attribution, and token savings ROI.
 4. Tool usage breakdown and error frequency.
 5. Task & Run inspector with transcripts and prompts.
+6. Task state transitions: Pause, Resume, Mark Done, Move to Trash, and Bulk Stale Cleanup.
 
 Stdlib only (http.server, sqlite3, json). Zero external build/runtime dependencies.
 """
@@ -21,7 +22,7 @@ import sys
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import cluster_telemetry
@@ -47,7 +48,7 @@ def load_tasks(runs_lookup: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
             try:
                 t = json.loads(r[0])
                 proj = t.get("project", "")
-                t["project_name"] = os.path.basename(proj.rstrip("/")) if proj else ""
+                t["project_name"] = os.path.basename(proj.rstrip("/")) if proj else "global"
                 if runs_lookup and t.get("runs") and len(t["runs"]) > 0:
                     r_info = runs_lookup.get(t["runs"][0])
                     if r_info:
@@ -62,6 +63,89 @@ def load_tasks(runs_lookup: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
         return tasks
     except Exception:
         return []
+
+
+def update_task_status(task_id: str, new_status: str, note: str = "") -> Tuple[bool, Optional[str]]:
+    """Update status of a single task in coordination.sqlite3."""
+    if new_status not in ("active", "paused", "waiting", "done", "cancelled"):
+        return False, f"Invalid status: {new_status}"
+    if not os.path.isfile(DB_PATH):
+        return False, "Database not found"
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("BEGIN IMMEDIATE;")
+        c.execute("SELECT rowid, body FROM tasks WHERE id = ?;", (task_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            return False, "Task not found"
+        rowid, body_str = row
+        body = json.loads(body_str)
+        old_status = body.get("status")
+        body["status"] = new_status
+        body["updated_at"] = time.time()
+        if note:
+            body["note"] = f"{body.get('note', '')} [{new_status.upper()}: {note}]".strip()
+        c.execute("UPDATE tasks SET body = ? WHERE rowid = ?;", (json.dumps(body), rowid))
+        event_payload = {
+            "task_id": task_id,
+            "owner": "dashboard",
+            "kind": "status_change",
+            "text": f"Status updated from {old_status} to {new_status} via Dashboard",
+            "at": time.time(),
+        }
+        c.execute("INSERT INTO events (project, body) VALUES (?, ?);", (body.get("project", ""), json.dumps(event_payload)))
+        conn.commit()
+        conn.close()
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def cleanup_stale_tasks(max_age_hours: float = 2.0, target_status: str = "done") -> int:
+    """Find active/waiting/paused tasks older than max_age_hours and mark them target_status."""
+    if target_status not in ("done", "cancelled"):
+        target_status = "done"
+    if not os.path.isfile(DB_PATH):
+        return 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("BEGIN IMMEDIATE;")
+        c.execute("SELECT rowid, id, body FROM tasks;")
+        rows = c.fetchall()
+        now = time.time()
+        cutoff = now - (max_age_hours * 3600)
+        updated_count = 0
+        for rowid, tid, body_str in rows:
+            try:
+                body = json.loads(body_str)
+                st = body.get("status")
+                if st in ("active", "waiting", "paused"):
+                    created = body.get("created_at") or 0.0
+                    updated = body.get("updated_at") or created
+                    if updated < cutoff:
+                        body["status"] = target_status
+                        body["updated_at"] = now
+                        body["note"] = f"{body.get('note', '')} [AUTO-CLEANUP: Marked {target_status} by dashboard]".strip()
+                        c.execute("UPDATE tasks SET body = ? WHERE rowid = ?;", (json.dumps(body), rowid))
+                        event_payload = {
+                            "task_id": tid,
+                            "owner": "dashboard",
+                            "kind": "status_change",
+                            "text": f"Auto-cleaned from {st} to {target_status} via Dashboard",
+                            "at": now,
+                        }
+                        c.execute("INSERT INTO events (project, body) VALUES (?, ?);", (body.get("project", ""), json.dumps(event_payload)))
+                        updated_count += 1
+            except Exception:
+                pass
+        conn.commit()
+        conn.close()
+        return updated_count
+    except Exception:
+        return 0
 
 
 def load_runs_map() -> Dict[str, Any]:
@@ -192,7 +276,7 @@ def compile_overview() -> Dict[str, Any]:
     tasks = load_tasks(runs_lookup=runs_lookup)
     telemetry = cluster_telemetry.check_cluster_overview()
 
-    task_counts = {"active": 0, "done": 0, "waiting": 0, "blocked": 0, "cancelled": 0, "total": len(tasks)}
+    task_counts = {"active": 0, "done": 0, "waiting": 0, "paused": 0, "cancelled": 0, "total": len(tasks)}
     for t in tasks:
         st = t.get("status", "unknown")
         task_counts[st] = task_counts.get(st, 0) + 1
@@ -212,7 +296,6 @@ def compile_overview() -> Dict[str, Any]:
 
     for r in runs:
         for tname, cnt in r.get("tool_breakdown", {}).items():
-            # Simplify Serena/mcp prefixes for readability in chart
             short_name = re.sub(r"^mcp__(?:serena|code-nav)__", "", tname)
             tools_agg[short_name] = tools_agg.get(short_name, 0) + cnt
         total_tool_errors += r.get("tool_errors", 0)
@@ -315,8 +398,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       font-size: 0.85rem;
       cursor: pointer;
       font-weight: 500;
+      transition: opacity 0.15s ease;
     }
-    .btn:hover { background: #2ea043; }
+    .btn:hover { opacity: 0.9; }
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -345,15 +429,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       font-size: 0.78rem;
       color: var(--text-muted);
       margin-top: 4px;
-    }
-    .section-title {
-      font-size: 1.1rem;
-      font-weight: 600;
-      margin: 24px 0 12px 0;
-      color: #f0f6fc;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
     }
     .tabs {
       display: flex;
@@ -397,9 +472,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: #21262d; }
     .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    
+    .kanban-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 14px;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .select-ctrl {
+      background: #21262d;
+      border: 1px solid var(--border);
+      color: #f0f6fc;
+      border-radius: 6px;
+      padding: 5px 10px;
+      font-size: 0.82rem;
+      outline: none;
+    }
     .kanban-cols {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
       gap: 16px;
     }
     .kanban-col {
@@ -407,7 +504,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 12px;
-      max-height: 600px;
+      max-height: 700px;
       overflow-y: auto;
     }
     .kanban-header {
@@ -424,6 +521,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       border-radius: 6px;
       padding: 12px;
       margin-bottom: 10px;
+      transition: transform 0.1s ease;
     }
     .task-summary {
       font-size: 0.88rem;
@@ -437,6 +535,33 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       display: flex;
       justify-content: space-between;
     }
+    .task-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid rgba(48, 54, 61, 0.6);
+      flex-wrap: wrap;
+    }
+    .task-act-btn {
+      background: #21262d;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 4px;
+      font-size: 0.72rem;
+      padding: 3px 8px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.15s ease;
+    }
+    .task-act-btn:hover { background: #30363d; color: #fff; }
+    .task-act-green:hover { background: rgba(63, 185, 80, 0.2); border-color: var(--green); color: var(--green); }
+    .task-act-red:hover { background: rgba(248, 81, 73, 0.2); border-color: var(--red); color: var(--red); }
+    .task-act-blue:hover { background: rgba(88, 166, 255, 0.2); border-color: var(--accent); color: var(--accent); }
+    .task-act-yellow:hover { background: rgba(210, 153, 34, 0.2); border-color: var(--yellow); color: var(--yellow); }
+
     .tool-bar {
       display: flex;
       align-items: center;
@@ -498,13 +623,60 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('runsTab')">Recent Runs & Performance</button>
-    <button class="tab-btn" onclick="switchTab('kanbanTab')">Coordination Kanban Board</button>
+    <button class="tab-btn active" onclick="switchTab('kanbanTab')">Coordination Kanban Board</button>
+    <button class="tab-btn" onclick="switchTab('runsTab')">Recent Runs & Performance</button>
     <button class="tab-btn" onclick="switchTab('toolsTab')">Tool Usage & Observability</button>
   </div>
 
-  <!-- Tab 1: Runs Table -->
-  <div id="runsTab">
+  <!-- Tab 1: Kanban -->
+  <div id="kanbanTab">
+    <div class="kanban-toolbar">
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <label style="font-size: 0.85rem; color: var(--text-muted);">Filter Project:</label>
+        <select id="projectFilter" class="select-ctrl" onchange="filterKanban()">
+          <option value="all">All Projects</option>
+        </select>
+      </div>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn" style="background: #21262d; border: 1px solid var(--border); font-size: 0.8rem;" onclick="cleanupStale('done')">
+          🧹 Archive Stale as Done
+        </button>
+        <button class="btn" style="background: rgba(248, 81, 73, 0.15); border: 1px solid rgba(248, 81, 73, 0.4); color: var(--red); font-size: 0.8rem;" onclick="cleanupStale('cancelled')">
+          🗑️ Move Stale to Trash
+        </button>
+      </div>
+    </div>
+
+    <div class="kanban-cols">
+      <div class="kanban-col">
+        <div class="kanban-header">
+          <span>ACTIVE (<span id="countActive">0</span>)</span>
+        </div>
+        <div id="tasksActive"></div>
+      </div>
+      <div class="kanban-col">
+        <div class="kanban-header">
+          <span>PAUSED / WAITING (<span id="countWaiting">0</span>)</span>
+        </div>
+        <div id="tasksWaiting"></div>
+      </div>
+      <div class="kanban-col">
+        <div class="kanban-header">
+          <span>DONE (<span id="countDone">0</span>)</span>
+        </div>
+        <div id="tasksDone"></div>
+      </div>
+      <div class="kanban-col">
+        <div class="kanban-header">
+          <span>TRASH / CANCELLED (<span id="countCancelled">0</span>)</span>
+        </div>
+        <div id="tasksCancelled"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab 2: Runs Table -->
+  <div id="runsTab" style="display: none;">
     <table>
       <thead>
         <tr>
@@ -525,30 +697,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </table>
   </div>
 
-  <!-- Tab 2: Kanban -->
-  <div id="kanbanTab" style="display: none;">
-    <div class="kanban-cols">
-      <div class="kanban-col">
-        <div class="kanban-header">
-          <span>ACTIVE (<span id="countActive">0</span>)</span>
-        </div>
-        <div id="tasksActive"></div>
-      </div>
-      <div class="kanban-col">
-        <div class="kanban-header">
-          <span>WAITING / BLOCKED (<span id="countWaiting">0</span>)</span>
-        </div>
-        <div id="tasksWaiting"></div>
-      </div>
-      <div class="kanban-col">
-        <div class="kanban-header">
-          <span>DONE (<span id="countDone">0</span>)</span>
-        </div>
-        <div id="tasksDone"></div>
-      </div>
-    </div>
-  </div>
-
   <!-- Tab 3: Tools Breakdown -->
   <div id="toolsTab" style="display: none;">
     <div class="card" style="max-width: 600px; margin: 0 auto;">
@@ -558,12 +706,129 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <script>
+    let rawTasks = [];
+    let currentFilter = 'all';
+
     function switchTab(tabId) {
       document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
       event.target.classList.add('active');
       document.getElementById('runsTab').style.display = tabId === 'runsTab' ? 'block' : 'none';
       document.getElementById('kanbanTab').style.display = tabId === 'kanbanTab' ? 'block' : 'none';
       document.getElementById('toolsTab').style.display = tabId === 'toolsTab' ? 'block' : 'none';
+    }
+
+    function filterKanban() {
+      currentFilter = document.getElementById('projectFilter').value;
+      renderKanban();
+    }
+
+    function renderKanban() {
+      let filtered = rawTasks;
+      if (currentFilter !== 'all') {
+        filtered = rawTasks.filter(t => t.project_name === currentFilter);
+      }
+
+      const activeTasks = filtered.filter(t => t.status === 'active');
+      const waitingTasks = filtered.filter(t => t.status === 'waiting' || t.status === 'paused');
+      const doneTasks = filtered.filter(t => t.status === 'done');
+      const cancelledTasks = filtered.filter(t => t.status === 'cancelled');
+
+      document.getElementById('countActive').innerText = activeTasks.length;
+      document.getElementById('countWaiting').innerText = waitingTasks.length;
+      document.getElementById('countDone').innerText = doneTasks.length;
+      document.getElementById('countCancelled').innerText = cancelledTasks.length;
+
+      const renderTaskCard = t => {
+        let actionBtns = '';
+        if (t.status === 'active') {
+          actionBtns = `
+            <button class="task-act-btn task-act-yellow" onclick="updateTask('${t.id}', 'paused')">⏸️ Pause</button>
+            <button class="task-act-btn task-act-green" onclick="updateTask('${t.id}', 'done')">✅ Done</button>
+            <button class="task-act-btn task-act-red" onclick="updateTask('${t.id}', 'cancelled')">🗑️ Trash</button>
+          `;
+        } else if (t.status === 'paused' || t.status === 'waiting') {
+          actionBtns = `
+            <button class="task-act-btn task-act-blue" onclick="updateTask('${t.id}', 'active')">▶️ Resume</button>
+            <button class="task-act-btn task-act-green" onclick="updateTask('${t.id}', 'done')">✅ Done</button>
+            <button class="task-act-btn task-act-red" onclick="updateTask('${t.id}', 'cancelled')">🗑️ Trash</button>
+          `;
+        } else if (t.status === 'done') {
+          actionBtns = `
+            <button class="task-act-btn task-act-blue" onclick="updateTask('${t.id}', 'active')">🔄 Reopen</button>
+            <button class="task-act-btn task-act-red" onclick="updateTask('${t.id}', 'cancelled')">🗑️ Trash</button>
+          `;
+        } else if (t.status === 'cancelled') {
+          actionBtns = `
+            <button class="task-act-btn task-act-blue" onclick="updateTask('${t.id}', 'active')">🔄 Reopen</button>
+            <button class="task-act-btn task-act-green" onclick="updateTask('${t.id}', 'done')">✅ Move to Done</button>
+          `;
+        }
+
+        return `
+          <div class="task-card">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+              <span class="badge badge-purple" style="font-size:0.7rem;">${t.project_name || 'project'}</span>
+              <span class="badge ${t.status === 'done' ? 'badge-green' : (t.status === 'active' ? 'badge-yellow' : (t.status === 'cancelled' ? 'badge-red' : ''))}" style="font-size:0.7rem;">${t.status}</span>
+            </div>
+            <div class="task-summary">${t.summary || t.task_key || t.id}</div>
+            <div class="task-meta" style="margin-top:6px;">
+              <span>${t.runs && t.runs.length ? 'Run: ' + t.runs[0] : 'Pending'}${t.run_model ? ' (' + t.run_model + ')' : ''}</span>
+              <span style="color:var(--green); font-weight:500;">${t.run_speed ? t.run_speed + ' t/s' : ''}${t.run_usd_saved ? ' • +$' + t.run_usd_saved : ''}</span>
+            </div>
+            ${t.run_quality !== null && t.run_quality !== undefined ? `<div style="margin-top:6px;"><span class="badge badge-green" style="font-size:0.72rem;">Quality: ${t.run_quality}/100</span></div>` : ''}
+            ${t.note ? `<div style="margin-top:6px; font-size:0.72rem; color:var(--text-muted); font-style:italic;">"${t.note.substring(0, 100)}..."</div>` : ''}
+            <div class="task-actions">
+              ${actionBtns}
+            </div>
+          </div>
+        `;
+      };
+
+      document.getElementById('tasksActive').innerHTML = activeTasks.slice(0, 15).map(renderTaskCard).join('') || '<div style="color:var(--text-muted);font-size:0.8rem;text-align:center;padding:20px 0;">No active tasks</div>';
+      document.getElementById('tasksWaiting').innerHTML = waitingTasks.slice(0, 15).map(renderTaskCard).join('') || '<div style="color:var(--text-muted);font-size:0.8rem;text-align:center;padding:20px 0;">None</div>';
+      document.getElementById('tasksDone').innerHTML = doneTasks.slice(0, 15).map(renderTaskCard).join('') || '<div style="color:var(--text-muted);font-size:0.8rem;text-align:center;padding:20px 0;">None</div>';
+      document.getElementById('tasksCancelled').innerHTML = cancelledTasks.slice(0, 15).map(renderTaskCard).join('') || '<div style="color:var(--text-muted);font-size:0.8rem;text-align:center;padding:20px 0;">None</div>';
+    }
+
+    async function updateTask(taskId, newStatus) {
+      try {
+        const resp = await fetch('/api/task/update', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({task_id: taskId, status: newStatus})
+        });
+        const res = await resp.json();
+        if (res.ok) {
+          fetchData();
+        } else {
+          alert('Error updating task: ' + (res.error || 'unknown error'));
+        }
+      } catch (err) {
+        alert('Network error: ' + err);
+      }
+    }
+
+    async function cleanupStale(targetStatus) {
+      const label = targetStatus === 'done' ? 'DONE' : 'TRASH / CANCELLED';
+      if (!confirm(`Are you sure you want to move all old stale active/waiting tasks to ${label}?`)) {
+        return;
+      }
+      try {
+        const resp = await fetch('/api/tasks/cleanup-stale', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({max_age_hours: 2, target_status: targetStatus})
+        });
+        const res = await resp.json();
+        if (res.ok) {
+          alert(`Successfully cleaned up ${res.cleaned_count} task(s)!`);
+          fetchData();
+        } else {
+          alert('Cleanup failed: ' + (res.error || 'unknown error'));
+        }
+      } catch (err) {
+        alert('Network error: ' + err);
+      }
     }
 
     async function fetchData() {
@@ -573,6 +838,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           fetch('/api/runs').then(r => r.json()),
           fetch('/api/tasks').then(r => r.json())
         ]);
+
+        rawTasks = tasksRes;
+
+        // Populate projects dropdown
+        const projects = Array.from(new Set(rawTasks.map(t => t.project_name).filter(Boolean))).sort();
+        const sel = document.getElementById('projectFilter');
+        const curr = sel.value;
+        sel.innerHTML = '<option value="all">All Projects (' + rawTasks.length + ')</option>' +
+          projects.map(p => `<option value="${p}">${p}</option>`).join('');
+        sel.value = curr || 'all';
 
         // Render Overview Cards
         const cl = overviewRes.cluster || {};
@@ -611,41 +886,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <td>${r.duration_s ? r.duration_s + 's' : '-'}</td>
               <td>${r.output_tokens ? r.output_tokens.toLocaleString() + ' / ' + (r.total_input_tokens || 0).toLocaleString() : '-'}</td>
               <td>${r.decode_speed_tok_s ? r.decode_speed_tok_s + ' t/s' : '-'}</td>
-              <td>${r.quality !== null ? '<span class="badge badge-green">' + r.quality + '</span>' : '-'}</td>
+              <td>${r.quality !== null && r.quality !== undefined ? '<span class="badge badge-green">' + r.quality + '</span>' : '-'}</td>
               <td>${r.evaluator ? '<span class="badge badge-purple">' + r.evaluator + '</span>' : '-'}</td>
               <td style="color: var(--green); font-weight: 500;">${r.usd_saved ? '+$' + r.usd_saved : '-'}</td>
             </tr>
           `).join('');
         }
 
-        // Render Kanban
-        const activeTasks = tasksRes.filter(t => t.status === 'active');
-        const waitingTasks = tasksRes.filter(t => t.status === 'waiting' || t.status === 'blocked');
-        const doneTasks = tasksRes.filter(t => t.status === 'done');
-
-        document.getElementById('countActive').innerText = activeTasks.length;
-        document.getElementById('countWaiting').innerText = waitingTasks.length;
-        document.getElementById('countDone').innerText = doneTasks.length;
-
-        const renderTaskCard = t => `
-          <div class="task-card">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-              <span class="badge badge-purple" style="font-size:0.7rem;">${t.project_name || 'project'}</span>
-              <span class="badge ${t.status === 'done' ? 'badge-green' : (t.status === 'active' ? 'badge-yellow' : '')}" style="font-size:0.7rem;">${t.status}</span>
-            </div>
-            <div class="task-summary">${t.summary || t.task_key || t.id}</div>
-            <div class="task-meta" style="margin-top:6px;">
-              <span>${t.runs && t.runs.length ? 'Run: ' + t.runs[0] : 'Pending'}${t.run_model ? ' (' + t.run_model + ')' : ''}</span>
-              <span style="color:var(--green); font-weight:500;">${t.run_speed ? t.run_speed + ' t/s' : ''}${t.run_usd_saved ? ' • +$' + t.run_usd_saved : ''}</span>
-            </div>
-            ${t.run_quality !== null && t.run_quality !== undefined ? `<div style="margin-top:6px;"><span class="badge badge-green" style="font-size:0.72rem;">Quality: ${t.run_quality}/100</span></div>` : ''}
-            ${t.note ? `<div style="margin-top:6px; font-size:0.72rem; color:var(--text-muted); font-style:italic;">"${t.note.substring(0, 120)}..."</div>` : ''}
-          </div>
-        `;
-
-        document.getElementById('tasksActive').innerHTML = activeTasks.slice(0, 10).map(renderTaskCard).join('') || '<div style="color:var(--text-muted);font-size:0.8rem;">No active tasks</div>';
-        document.getElementById('tasksWaiting').innerHTML = waitingTasks.slice(0, 10).map(renderTaskCard).join('') || '<div style="color:var(--text-muted);font-size:0.8rem;">None</div>';
-        document.getElementById('tasksDone').innerHTML = doneTasks.slice(0, 10).map(renderTaskCard).join('') || '<div style="color:var(--text-muted);font-size:0.8rem;">None</div>';
+        renderKanban();
 
         // Render Tools Breakdown
         const toolsList = document.getElementById('toolsBreakdownList');
@@ -727,6 +975,40 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/telemetry":
             self._send_json(cluster_telemetry.check_cluster_overview())
+            return
+
+        self.send_error(404, f"Not Found: {path}")
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = {}
+
+        if path == "/api/task/update":
+            task_id = payload.get("task_id")
+            status = payload.get("status")
+            note = payload.get("note", "")
+            if not task_id or not status:
+                self._send_json({"ok": False, "error": "task_id and status required"}, status=400)
+                return
+            ok, err = update_task_status(task_id, status, note)
+            if not ok:
+                self._send_json({"ok": False, "error": err}, status=400)
+                return
+            self._send_json({"ok": True, "task_id": task_id, "new_status": status})
+            return
+
+        if path == "/api/tasks/cleanup-stale":
+            max_age_hours = float(payload.get("max_age_hours", 2.0))
+            target_status = payload.get("target_status", "done")
+            count = cleanup_stale_tasks(max_age_hours=max_age_hours, target_status=target_status)
+            self._send_json({"ok": True, "cleaned_count": count})
             return
 
         self.send_error(404, f"Not Found: {path}")
