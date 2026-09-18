@@ -32,16 +32,17 @@ read-only tools. Bash remains available.
 | File | What it is |
 |---|---|
 | [README.md](README.md) | This file — overview, install, usage, safety. |
-| [README_INSTALL_RU.md](README_INSTALL_RU.md) | **Russian** install walkthrough, step by step, in order. |
-| [REQUIREMENTS.md](REQUIREMENTS.md) | The contract: runtime deps, the repository-structure rules, and the analytics quality bar. |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | How the pieces fit, why the layout is flat (not a package), the delegation lifecycle, state on disk. |
-| [docs/ANALYTICS.md](docs/ANALYTICS.md) | The "improve the pipeline" loop: `contrib/report.py`, the flat pandas CSV, thresholds. |
-| [ARCHITECT_BRIEF.md](ARCHITECT_BRIEF.md) | Low-context supervisor path (read this instead of the full references on every turn). |
-| [COORDINATION.md](COORDINATION.md) / [TASK_DESIGN.md](TASK_DESIGN.md) / [SUPERVISION.md](SUPERVISION.md) | Coordination, task-design, and supervision references. |
-| [MIGRATION_AND_USAGE_RU.md](MIGRATION_AND_USAGE_RU.md) | **Russian** migration to another machine + daily usage. |
-| [HARNESS_ARCHITECTURE.md](HARNESS_ARCHITECTURE.md) | **Normative standard**: tiered multi-agent orchestration, context-loss prevention, and deterministic oracle loops. |
+| [docs/SUMMARY.md](docs/SUMMARY.md) | **Comprehensive Documentation Index** — quick navigation for all project documents. |
+| [docs/README_INSTALL_RU.md](docs/README_INSTALL_RU.md) | **Russian** install walkthrough, step by step, in order. |
+| [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) | The contract: runtime deps, repository rules, analytics bar. |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture, delegation lifecycle, state on disk. |
+| [docs/HARNESS_ARCHITECTURE.md](docs/HARNESS_ARCHITECTURE.md) | **Normative standard**: 2-tier multi-agent orchestration, context-loss prevention, and deterministic oracle loops. |
+| [docs/ARCHITECT_BRIEF.md](docs/ARCHITECT_BRIEF.md) | Low-context supervisor path (read this instead of the full references on every turn). |
+| [docs/COORDINATION.md](docs/COORDINATION.md) / [docs/TASK_DESIGN.md](docs/TASK_DESIGN.md) / [docs/SUPERVISION.md](docs/SUPERVISION.md) | Coordination, task-design, and supervision references. |
+| [docs/MIGRATION_AND_USAGE_RU.md](docs/MIGRATION_AND_USAGE_RU.md) | **Russian** migration to another machine + daily usage. |
+| [docs/ANALYTICS.md](docs/ANALYTICS.md) | The "improve the pipeline" loop: `contrib/report.py`, metrics, thresholds. |
 
-For the low-context supervisor path, read [ARCHITECT_BRIEF.md](ARCHITECT_BRIEF.md)
+For the low-context supervisor path, read [docs/ARCHITECT_BRIEF.md](docs/ARCHITECT_BRIEF.md)
 instead of loading the full coordination and task-design references on every turn.
 `project_sync` returns every unfinished task for the exact requested repository,
 three compact completed-task digests,
