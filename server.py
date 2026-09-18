@@ -3224,6 +3224,11 @@ def handle_request(msg):
     msg_id = msg.get("id")
 
     if method == "initialize":
+        try:
+            from scripts.check_updates import notify_on_startup
+            notify_on_startup(background=True)
+        except Exception:
+            pass
         return _response(msg_id, {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}},

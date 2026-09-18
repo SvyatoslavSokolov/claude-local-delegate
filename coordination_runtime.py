@@ -228,7 +228,15 @@ def install(server):
 
     def backend_info(args):
         from local_backend import inspect
-        return result(inspect(server._default_settings_path()))
+        info = inspect(server._default_settings_path())
+        try:
+            from scripts.check_updates import load_cache
+            cached = load_cache(max_age_seconds=86400)
+            if cached:
+                info['ecosystem'] = cached
+        except Exception:
+            pass
+        return result(info)
 
     server.PARENT_TOOLS.append(schema('local_backend_info',
         'Inspect the explicit local settings and LiteLLM route without invoking a model or exposing keys. '
