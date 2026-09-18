@@ -505,11 +505,11 @@ def compile_quotas() -> Dict[str, Any]:
             except Exception:
                 pass
         cnt_5h = len(timestamps_5h)
-        rem_5h = max(0, limit_5h - cnt_5h)
-        pct_5h = round((rem_5h / limit_5h) * 100, 1)
+        rem_5h = max(0, limit_5h - cnt_5h) if limit_5h > 0 else 0
+        pct_5h = round((rem_5h / limit_5h) * 100, 1) if limit_5h > 0 else 0.0
 
-        rem_7d = max(0, limit_7d - cnt_7d)
-        pct_7d = round((rem_7d / limit_7d) * 100, 1)
+        rem_7d = max(0, limit_7d - cnt_7d) if limit_7d > 0 else 0
+        pct_7d = round((rem_7d / limit_7d) * 100, 1) if limit_7d > 0 else 0.0
 
         if timestamps_5h:
             earliest = min(timestamps_5h)
@@ -518,9 +518,9 @@ def compile_quotas() -> Dict[str, Any]:
             m = (reset_in_s % 3600) // 60
             reset_str = f"{h}h {m}m"
         else:
-            reset_str = "Full Quota"
+            reset_str = "Full Quota" if limit_5h > 0 else "--"
 
-        status = "healthy" if pct_5h > 35 else ("warning" if pct_5h > 15 else "danger")
+        status = "healthy" if (limit_5h > 0 and pct_5h > 35) else ("warning" if (limit_5h > 0 and pct_5h > 15) else ("healthy" if limit_5h == 0 else "danger"))
 
         return {
             "label": label,
@@ -540,9 +540,9 @@ def compile_quotas() -> Dict[str, Any]:
     agy_hist = os.path.expanduser("~/.gemini/antigravity-cli/history.jsonl")
     codex_hist = os.path.expanduser("~/.codex/history.jsonl")
 
-    claude_quota = _calc_quota(claude_hist, ts_multiplier=1000.0, limit_5h=45, limit_7d=1200, label="Claude Code (Pro)")
-    agy_quota = _calc_quota(agy_hist, ts_multiplier=1000.0, limit_5h=100, limit_7d=1500, label="Google Antigravity (Gemini)")
-    codex_quota = _calc_quota(codex_hist, ts_multiplier=1.0, limit_5h=50, limit_7d=1000, label="OpenAI Codex")
+    claude_quota = _calc_quota(claude_hist, ts_multiplier=1000.0, limit_5h=0, limit_7d=0, label="Claude Code (Pro)")
+    agy_quota = _calc_quota(agy_hist, ts_multiplier=1000.0, limit_5h=0, limit_7d=0, label="Google Antigravity (Gemini)")
+    codex_quota = _calc_quota(codex_hist, ts_multiplier=1.0, limit_5h=0, limit_7d=0, label="OpenAI Codex")
 
     local_quota = {
         "label": "Local Cluster (4x RTX 3090)",
@@ -1112,7 +1112,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div style="margin-top: 14px;">
           <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
             <span>5-Hour Rolling Limit</span>
-            <span style="font-weight: 600;"><span id="claude5hRem">--</span> / <span id="claude5hLimit">45</span> left</span>
+            <span style="font-weight: 600;"><span id="claude5hRem">0</span> / <span id="claude5hLimit">0</span> left</span>
           </div>
           <div class="tool-bar-bg">
             <div id="claude5hBar" class="tool-bar-fill" style="width: 100%; background: var(--green);"></div>
@@ -1126,7 +1126,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border);">
           <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
             <span>7-Day Weekly Limit</span>
-            <span style="font-weight: 600;"><span id="claude7dRem">--</span> / <span id="claude7dLimit">1200</span> left</span>
+            <span style="font-weight: 600;"><span id="claude7dRem">0</span> / <span id="claude7dLimit">0</span> left</span>
           </div>
           <div class="tool-bar-bg">
             <div id="claude7dBar" class="tool-bar-fill" style="width: 100%; background: var(--accent);"></div>
@@ -1146,7 +1146,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div style="margin-top: 14px;">
           <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
             <span>5-Hour Rolling Limit</span>
-            <span style="font-weight: 600;"><span id="agy5hRem">--</span> / <span id="agy5hLimit">100</span> left</span>
+            <span style="font-weight: 600;"><span id="agy5hRem">0</span> / <span id="agy5hLimit">0</span> left</span>
           </div>
           <div class="tool-bar-bg">
             <div id="agy5hBar" class="tool-bar-fill" style="width: 100%; background: var(--green);"></div>
@@ -1160,7 +1160,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border);">
           <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
             <span>7-Day Weekly Limit</span>
-            <span style="font-weight: 600;"><span id="agy7dRem">--</span> / <span id="agy7dLimit">1500</span> left</span>
+            <span style="font-weight: 600;"><span id="agy7dRem">0</span> / <span id="agy7dLimit">0</span> left</span>
           </div>
           <div class="tool-bar-bg">
             <div id="agy7dBar" class="tool-bar-fill" style="width: 100%; background: var(--accent);"></div>
@@ -1180,7 +1180,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div style="margin-top: 14px;">
           <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
             <span>5-Hour Rolling Limit</span>
-            <span style="font-weight: 600;"><span id="codex5hRem">--</span> / <span id="codex5hLimit">50</span> left</span>
+            <span style="font-weight: 600;"><span id="codex5hRem">0</span> / <span id="codex5hLimit">0</span> left</span>
           </div>
           <div class="tool-bar-bg">
             <div id="codex5hBar" class="tool-bar-fill" style="width: 100%; background: var(--green);"></div>
@@ -1194,7 +1194,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border);">
           <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
             <span>7-Day Weekly Limit</span>
-            <span style="font-weight: 600;"><span id="codex7dRem">--</span> / <span id="codex7dLimit">1000</span> left</span>
+            <span style="font-weight: 600;"><span id="codex7dRem">0</span> / <span id="codex7dLimit">0</span> left</span>
           </div>
           <div class="tool-bar-bg">
             <div id="codex7dBar" class="tool-bar-fill" style="width: 100%; background: var(--accent);"></div>
@@ -1462,15 +1462,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           const cq = rawQuotas.claude || {};
           const c5hRem = document.getElementById('claude5hRem');
           if (c5hRem) {
-            c5hRem.innerText = cq.rem_5h !== undefined ? cq.rem_5h : '--';
-            document.getElementById('claude5hLimit').innerText = cq.limit_5h || 45;
+            c5hRem.innerText = cq.rem_5h !== undefined ? cq.rem_5h : 0;
+            document.getElementById('claude5hLimit').innerText = cq.limit_5h !== undefined ? cq.limit_5h : 0;
             document.getElementById('claude5hUsed').innerText = cq.used_5h || 0;
             document.getElementById('claude5hReset').innerText = cq.reset_in || '--';
             document.getElementById('claude5hBar').style.width = (cq.pct_5h || 0) + '%';
             document.getElementById('claude5hBar').style.background = cq.pct_5h > 35 ? 'var(--green)' : 'var(--yellow)';
 
-            document.getElementById('claude7dRem').innerText = cq.rem_7d !== undefined ? cq.rem_7d : '--';
-            document.getElementById('claude7dLimit').innerText = cq.limit_7d || 1200;
+            document.getElementById('claude7dRem').innerText = cq.rem_7d !== undefined ? cq.rem_7d : 0;
+            document.getElementById('claude7dLimit').innerText = cq.limit_7d !== undefined ? cq.limit_7d : 0;
             document.getElementById('claude7dUsed').innerText = cq.used_7d || 0;
             document.getElementById('claude7dBar').style.width = (cq.pct_7d || 0) + '%';
           }
@@ -1478,15 +1478,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           const aq = rawQuotas.agy || {};
           const a5hRem = document.getElementById('agy5hRem');
           if (a5hRem) {
-            a5hRem.innerText = aq.rem_5h !== undefined ? aq.rem_5h : '--';
-            document.getElementById('agy5hLimit').innerText = aq.limit_5h || 100;
+            a5hRem.innerText = aq.rem_5h !== undefined ? aq.rem_5h : 0;
+            document.getElementById('agy5hLimit').innerText = aq.limit_5h !== undefined ? aq.limit_5h : 0;
             document.getElementById('agy5hUsed').innerText = aq.used_5h || 0;
             document.getElementById('agy5hReset').innerText = aq.reset_in || '--';
             document.getElementById('agy5hBar').style.width = (aq.pct_5h || 0) + '%';
             document.getElementById('agy5hBar').style.background = aq.pct_5h > 35 ? 'var(--green)' : 'var(--yellow)';
 
-            document.getElementById('agy7dRem').innerText = aq.rem_7d !== undefined ? aq.rem_7d : '--';
-            document.getElementById('agy7dLimit').innerText = aq.limit_7d || 1500;
+            document.getElementById('agy7dRem').innerText = aq.rem_7d !== undefined ? aq.rem_7d : 0;
+            document.getElementById('agy7dLimit').innerText = aq.limit_7d !== undefined ? aq.limit_7d : 0;
             document.getElementById('agy7dUsed').innerText = aq.used_7d || 0;
             document.getElementById('agy7dBar').style.width = (aq.pct_7d || 0) + '%';
           }
@@ -1494,15 +1494,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           const cx = rawQuotas.codex || {};
           const cx5hRem = document.getElementById('codex5hRem');
           if (cx5hRem) {
-            cx5hRem.innerText = cx.rem_5h !== undefined ? cx.rem_5h : '--';
-            document.getElementById('codex5hLimit').innerText = cx.limit_5h || 50;
+            cx5hRem.innerText = cx.rem_5h !== undefined ? cx.rem_5h : 0;
+            document.getElementById('codex5hLimit').innerText = cx.limit_5h !== undefined ? cx.limit_5h : 0;
             document.getElementById('codex5hUsed').innerText = cx.used_5h || 0;
             document.getElementById('codex5hReset').innerText = cx.reset_in || '--';
             document.getElementById('codex5hBar').style.width = (cx.pct_5h || 0) + '%';
             document.getElementById('codex5hBar').style.background = cx.pct_5h > 35 ? 'var(--green)' : 'var(--yellow)';
 
-            document.getElementById('codex7dRem').innerText = cx.rem_7d !== undefined ? cx.rem_7d : '--';
-            document.getElementById('codex7dLimit').innerText = cx.limit_7d || 1000;
+            document.getElementById('codex7dRem').innerText = cx.rem_7d !== undefined ? cx.rem_7d : 0;
+            document.getElementById('codex7dLimit').innerText = cx.limit_7d !== undefined ? cx.limit_7d : 0;
             document.getElementById('codex7dUsed').innerText = cx.used_7d || 0;
             document.getElementById('codex7dBar').style.width = (cx.pct_7d || 0) + '%';
           }
@@ -1510,7 +1510,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           const clPill = document.getElementById('claudeQuotaPill');
           if (clPill && cq.rem_5h !== undefined) {
             clPill.innerText = `Claude 5h: ${cq.rem_5h}/${cq.limit_5h} left (${cq.reset_in})`;
-            clPill.className = 'badge ' + (cq.pct_5h > 35 ? 'badge-green' : (cq.pct_5h > 15 ? 'badge-yellow' : 'badge-red'));
+            clPill.className = 'badge ' + (cq.limit_5h > 0 ? (cq.pct_5h > 35 ? 'badge-green' : (cq.pct_5h > 15 ? 'badge-yellow' : 'badge-red')) : 'badge-purple');
           }
 
           updateModalQuotaBanner();
@@ -1590,9 +1590,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         resetEl.className = 'badge badge-green';
         detailsEl.innerText = '0 API token cost • 4x RTX 3090 • Prefix cache active';
       } else {
-        titleEl.innerHTML = `${q.label || adapter.toUpperCase()}: <span style="color:${q.pct_5h > 35 ? 'var(--green)' : 'var(--yellow)'}; font-weight:600;">${q.rem_5h} / ${q.limit_5h} left (5h)</span>`;
+        const isGreen = q.limit_5h > 0 ? (q.pct_5h > 35) : true;
+        titleEl.innerHTML = `${q.label || adapter.toUpperCase()}: <span style="color:${isGreen ? 'var(--green)' : 'var(--yellow)'}; font-weight:600;">${q.rem_5h} / ${q.limit_5h} left (5h)</span>`;
         resetEl.innerText = 'Resets: ' + q.reset_in;
-        resetEl.className = q.pct_5h > 35 ? 'badge badge-green' : (q.pct_5h > 15 ? 'badge badge-yellow' : 'badge badge-red');
+        resetEl.className = q.limit_5h > 0 ? (q.pct_5h > 35 ? 'badge badge-green' : (q.pct_5h > 15 ? 'badge badge-yellow' : 'badge badge-red')) : 'badge badge-purple';
         detailsEl.innerText = `Weekly: ${q.rem_7d} / ${q.limit_7d} remaining (${q.used_7d} used in 7 days)`;
       }
     }

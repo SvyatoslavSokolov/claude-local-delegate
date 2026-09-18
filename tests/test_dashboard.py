@@ -59,6 +59,11 @@ class DashboardTests(unittest.TestCase):
             self.assertIn("used_7d", q)
             self.assertIn("rem_7d", q)
             self.assertIn("reset_in", q)
+            if key in ("claude", "agy", "codex"):
+                self.assertEqual(q["limit_5h"], 0)
+                self.assertEqual(q["limit_7d"], 0)
+                self.assertEqual(q["rem_5h"], 0)
+                self.assertEqual(q["rem_7d"], 0)
 
     def test_get_known_projects(self):
         projects = dashboard.get_known_projects()
