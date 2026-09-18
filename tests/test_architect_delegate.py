@@ -152,6 +152,34 @@ class ArchitectDelegationTests(unittest.TestCase):
         self.assertIsNone(resolved)
         self.assertIn("does not exist", err)
 
+    def test_slug_from_task_cleaning(self):
+        slug = self.s._slug_from_task("You are a tier 0 worker. Please refactor adapters in claude-local-delegate")
+        self.assertEqual(slug, "refactor adapters in claude-local-delegate")
+
+        slug_md = self.s._slug_from_task("# Task: Implement VHAL pipeline\nDetails below...")
+        self.assertEqual(slug_md, "Implement VHAL pipeline")
+
+        slug_ru = self.s._slug_from_task("## Задача: Проверить документацию и тесты")
+        self.assertEqual(slug_ru, "Проверить документацию и тесты")
+
+    def test_format_agent_name_prefixes(self):
+        name_worker = self.s._format_agent_name(task="Fix pytest failures", role="worker")
+        self.assertTrue(name_worker.startswith("⚡ [LOCAL]"))
+
+        name_fast = self.s._format_agent_name(task="Quick lint check", profile="fast")
+        self.assertTrue(name_fast.startswith("⚡ [FAST]"))
+
+        name_arch = self.s._format_agent_name(task="Decompose big refactor", role="architect")
+        self.assertTrue(name_arch.startswith("🧠 [ARCH]"))
+
+        # User custom name preservation
+        name_custom = self.s._format_agent_name(name="my-custom-task", role="worker")
+        self.assertEqual(name_custom, "⚡ [LOCAL] my-custom-task")
+
+        # Strip legacy gemini-architect-
+        name_legacy = self.s._format_agent_name(name="gemini-architect-my-plan", role="architect")
+        self.assertEqual(name_legacy, "🧠 [ARCH] my-plan")
+
 
 if __name__ == "__main__":
     unittest.main()

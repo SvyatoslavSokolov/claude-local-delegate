@@ -675,12 +675,73 @@ def _settings_fingerprint(path):
 
 # ---- native agent spawning ---------------------------------------------------
 
-def _slug_from_task(task, max_words=6):
+def _slug_from_task(task, max_words=7, max_len=45):
     """A short, safe display name for the background agent (so `claude agents`
     shows a label, not the whole prompt)."""
-    words = [w for w in task.replace("\n", " ").split() if w.strip()]
+    if not task:
+        return "delegate"
+
+    # Find the most informative headline/line
+    lines = [line.strip() for line in str(task).splitlines() if line.strip()]
+    target = lines[0] if lines else ""
+    for line in lines[:5]:
+        stripped = re.sub(r"^[#*>\-\s]+", "", line).strip()
+        if re.match(r"^(?:task|goal|objective|feature|bug|fix|refactor|test|задача|цель)[\s:]+", stripped, re.IGNORECASE):
+            target = re.sub(r"^(?:task|goal|objective|feature|bug|fix|refactor|test|задача|цель)[\s:]+", "", stripped, flags=re.IGNORECASE).strip()
+            break
+        elif line.startswith("#"):
+            target = stripped
+            break
+
+    clean = re.sub(r"^[#*>\-\s]+", "", target)
+    for _ in range(3):
+        clean = re.sub(
+            r"^(?:you are a (?:tier \d+ )?(?:local )?(?:worker|architect|agent|assistant)\.?"
+            r"|your task is to|please|kindly|i need you to|нужно|необходимо|пожалуйста)\s+",
+            "",
+            clean,
+            flags=re.IGNORECASE,
+        ).strip()
+
+    words = [w for w in clean.replace("\n", " ").split() if w.strip()]
     slug = " ".join(words[:max_words]).strip()
-    return (slug or "delegate").replace("'", "")
+    slug = (slug or "delegate").replace("'", "").replace('"', "").replace("`", "")
+    if len(slug) > max_len:
+        slug = slug[:max_len].rsplit(" ", 1)[0].strip()
+    return slug or "delegate"
+
+
+def _format_agent_name(name=None, task=None, role="worker", profile=None):
+    """Format a clear, readable display name for `claude agents` TUI.
+
+    Examples:
+      ⚡ [LOCAL] verify-docs-summary
+      ⚡ [FAST] run-unit-tests
+      🧠 [ARCH] design-adapter-architecture
+      🔀 [FANOUT 1/5] process-batch-chunk
+    """
+    if role == "architect":
+        tag = "🧠 [ARCH]"
+    elif profile == "fast":
+        tag = "⚡ [FAST]"
+    elif role == "checker":
+        tag = "🛡️ [CHECK]"
+    elif role == "verified_worker":
+        tag = "🧪 [VERIFY]"
+    else:
+        tag = "⚡ [LOCAL]"
+
+    if name:
+        name_clean = str(name).strip()
+        known_tags = ("⚡", "🧠", "🛡️", "🧪", "🔀", "[LOCAL]", "[ARCH]", "[FAST]", "[CHECK]", "[VERIFY]")
+        if any(name_clean.startswith(kt) for kt in known_tags):
+            return name_clean
+        if name_clean.startswith("gemini-architect-"):
+            name_clean = name_clean[len("gemini-architect-"):].strip()
+        return f"{tag} {name_clean}"
+
+    slug = _slug_from_task(task or "")
+    return f"{tag} {slug}"
 
 
 def _default_agent():
@@ -1294,7 +1355,6 @@ def start_delegate(args):
     cwd, cwd_err = _resolve_cwd(args.get("cwd"))
     if cwd_err:
         return _error_result(cwd_err)
-    name = args.get("name") or _slug_from_task(task)
     permission_mode = args.get("permission_mode")
     disallowed_tools = args.get("disallowed_tools")
     agent = args.get("agent")  # None -> default persona; "" -> no persona; name -> that persona
@@ -1310,6 +1370,8 @@ def start_delegate(args):
     spawn_model = _fast_model() if effective_profile == "fast" else None
     if not spawn_model:
         effective_profile = "think"  # no fast route configured: the ledger must say what really ran
+
+    name = _format_agent_name(name=args.get("name"), task=task, role="worker", profile=effective_profile)
 
     _kw = {"profile": effective_profile, "spawn_model": spawn_model,
            "complexity": complexity, "est_minutes": est_minutes,
@@ -1350,7 +1412,7 @@ def start_architect_delegate(args):
     cwd, cwd_err = _resolve_cwd(args.get("cwd"))
     if cwd_err:
         return _error_result(cwd_err)
-    name = args.get("name") or ("gemini-architect-" + _slug_from_task(task))
+    name = _format_agent_name(name=args.get("name"), task=task, role="architect")
     permission_mode = args.get("permission_mode")
     disallowed_tools = args.get("disallowed_tools")
     agent = args.get("agent") or "gemini-architect"
@@ -1988,7 +2050,8 @@ def fan_out_to_local(args):
     agent_ids = []
     for i, item in enumerate(items):
         task = f"{shared_instruction}\n\n--- item {i + 1}/{len(items)} ---\n\n{item}"
-        name = _slug_from_task(f"fanout {batch_tag} item {i + 1} " + item.splitlines()[0])
+        item_slug = _slug_from_task(item)
+        name = f"🔀 [FANOUT {i + 1}/{len(items)}] {item_slug}"
         short_id, err = _spawn_native_agent(
             task, allowed_tools, cwd, name, permission_mode, disallowed_tools, agent,
             announce_plan,
@@ -2212,9 +2275,10 @@ def _spawn_verify_worker(state):
     # NOT contain the vid or any long hex token: _parse_bg_id scans the spawn
     # output for a hex id and would grab an echoed --name instead of the real
     # agent id. Keep it plain-alpha.
+    spec_slug = _slug_from_task(state.get("spec", ""))
     return _spawn_native_agent(
         task, state["allowed_tools"], state["cwd"],
-        f"verified-worker-r{it}",
+        f"🧪 [VERIFY r{it}] {spec_slug}",
         permission_mode=None, disallowed_tools=None, agent=None, announce_plan=None,
     )
 
@@ -2258,9 +2322,10 @@ def _spawn_verify_checker(state, candidate):
         "and for a FAIL the smallest change that would fix it. Keep it to reasons, "
         "not a transcript dump -- but no fixed line count."
     )
+    spec_slug = _slug_from_task(state.get("spec", ""))
     return _spawn_native_agent(
         task, VERIFY_CHECKER_TOOLS, state["cwd"],
-        f"verified-checker-r{it}",  # plain-alpha: no vid / hex -- see _spawn_verify_worker
+        f"🛡️ [CHECK r{it}] {spec_slug}",  # plain prefix + spec slug: no vid / hex -- see _spawn_verify_worker
         permission_mode=None, disallowed_tools=None,
         agent=(CHECKER_PERSONA if _persona_exists(CHECKER_PERSONA) else ""),
         announce_plan=None, report_contract=False,
@@ -2631,7 +2696,7 @@ PARENT_TOOLS = [
                 "task": {"type": "string", "description": "Self-contained task; the agent has no conversation memory."},
                 "allowed_tools": {"type": "string", "description": "Comma-separated tools granted (default: full writer set). For lookup-only, pass read-only subset."},
                 "cwd": {"type": "string", "description": "Working directory for the agent. Defaults to this server's cwd."},
-                "name": {"type": "string", "description": "Optional display name for the agent (shown in `claude agents`). Defaults to a short slug of the task."},
+                "name": {"type": "string", "description": "Optional display name for the agent (shown in `claude agents`). Defaults to `⚡ [LOCAL] <slug>` or `⚡ [FAST] <slug>`."},
                 "permission_mode": {"type": "string", "description": f"Native mode. Read-only defaults to '{READ_ONLY_PERMISSION_MODE}'; writers to unattended '{DEFAULT_PERMISSION_MODE}'."},
                 "disallowed_tools": {"type": "string", "description": "Comma-separated tools to remove. Default none."},
                 "agent": {"type": "string", "description": "Persona name; default local-worker; empty disables it."},
@@ -2871,7 +2936,7 @@ PARENT_TOOLS = [
             "properties": {
                 "task": {"type": "string", "description": "High-level planning, exploration, or architecture task."},
                 "cwd": {"type": "string", "description": "Working directory. Defaults to current directory."},
-                "name": {"type": "string", "description": "Display name in claude agents (default: gemini-architect-<task>)."},
+                "name": {"type": "string", "description": "Display name in claude agents (default: `🧠 [ARCH] <slug>`)."},
                 "allowed_tools": {"type": "string", "description": "Comma-separated tools. By default includes full writer set + local worker delegation."},
             },
             "required": ["task"],
