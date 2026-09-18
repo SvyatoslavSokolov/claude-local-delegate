@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import urllib.request
+import urllib.error
 
 
 def profile(path):
@@ -41,3 +42,23 @@ def inspect(path):
             'requested_model': env['ANTHROPIC_MODEL'], 'routes': routes,
             'vllm_route_confirmed': bool(routes) and all(str(r['model']).startswith('hosted_vllm/') for r in routes),
             'note': 'Gateway configuration evidence; not per-request tracing or proof of the loaded weight files.'}
+
+
+def doctor_check(settings_path=None, timeout=5.0):
+    if settings_path is None:
+        settings_path = os.path.expanduser('~/.claude/vllm.delegate.settings.json')
+    base_url = None
+    model = None
+    try:
+        env = profile(settings_path)
+        base_url = env['ANTHROPIC_BASE_URL']
+        model = env['ANTHROPIC_MODEL']
+    except Exception as exc:
+        return {'ok': False, 'base_url': base_url, 'model': model,
+                'status': 'config-error', 'error': str(exc)}
+    try:
+        urllib.request.urlopen(base_url, timeout=timeout)
+    except Exception as exc:
+        return {'ok': False, 'base_url': base_url, 'model': model,
+                'status': 'unreachable', 'error': str(exc)}
+    return {'ok': True, 'base_url': base_url, 'model': model, 'status': 'ok', 'error': None}

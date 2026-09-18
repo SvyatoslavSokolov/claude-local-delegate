@@ -48,5 +48,69 @@ class BackendTests(unittest.TestCase):
             run.assert_not_called()
 
 
+class DoctorCheckTests(unittest.TestCase):
+    def _write(self, tmp, env):
+        p = Path(tmp) / 'settings.json'
+        p.write_text(json.dumps({'env': env}))
+        return p
+
+    def test_success_returns_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._write(tmp, {'ANTHROPIC_BASE_URL': 'http://localhost:4000',
+                                  'ANTHROPIC_MODEL': 'local-test',
+                                  'ANTHROPIC_API_KEY': 'test-only'})
+            with patch.object(local_backend.urllib.request, 'urlopen') as urlopen:
+                urlopen.return_value.__enter__ = lambda self: self
+                urlopen.return_value.__exit__ = lambda self, *a: None
+                result = local_backend.doctor_check(str(p), timeout=5.0)
+            self.assertTrue(result['ok'])
+            self.assertEqual(result['status'], 'ok')
+            self.assertEqual(result['base_url'], 'http://localhost:4000')
+            self.assertEqual(result['model'], 'local-test')
+            self.assertIsNone(result['error'])
+            urlopen.assert_called_once()
+            self.assertEqual(urlopen.call_args[1]['timeout'], 5.0)
+
+    def test_missing_key_reports_config_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._write(tmp, {'ANTHROPIC_MODEL': 'local-test'})
+            with patch.object(local_backend.urllib.request, 'urlopen') as urlopen:
+                result = local_backend.doctor_check(str(p))
+            self.assertFalse(result['ok'])
+            self.assertEqual(result['status'], 'config-error')
+            self.assertIn('ANTHROPIC_BASE_URL', result['error'])
+            self.assertIsNone(result['base_url'])
+            urlopen.assert_not_called()
+
+    def test_unreachable_reports_error(self):
+        import urllib.error
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self._write(tmp, {'ANTHROPIC_BASE_URL': 'http://localhost:4000',
+                                  'ANTHROPIC_MODEL': 'local-test',
+                                  'ANTHROPIC_API_KEY': 'test-only'})
+            with patch.object(local_backend.urllib.request, 'urlopen',
+                              side_effect=urllib.error.URLError('no route to host')) as urlopen:
+                result = local_backend.doctor_check(str(p), timeout=1.0)
+            self.assertFalse(result['ok'])
+            self.assertEqual(result['status'], 'unreachable')
+            self.assertEqual(result['base_url'], 'http://localhost:4000')
+            self.assertEqual(result['model'], 'local-test')
+            self.assertIn('no route to host', result['error'])
+            urlopen.assert_called_once()
+
+    def test_default_path_uses_expanduser(self):
+        default = os.path.expanduser('~/.claude/vllm.delegate.settings.json')
+        with patch.object(local_backend, 'profile') as prof, \
+             patch.object(local_backend.urllib.request, 'urlopen') as urlopen:
+            prof.return_value = {'ANTHROPIC_BASE_URL': 'http://localhost:4000',
+                                 'ANTHROPIC_MODEL': 'local-test',
+                                 'ANTHROPIC_API_KEY': 'test-only'}
+            urlopen.return_value.__enter__ = lambda self: self
+            urlopen.return_value.__exit__ = lambda self, *a: None
+            result = local_backend.doctor_check()
+        self.assertTrue(result['ok'])
+        prof.assert_called_once_with(default)
+
+
 if __name__ == '__main__':
     unittest.main()
