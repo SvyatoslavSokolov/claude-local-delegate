@@ -2961,10 +2961,104 @@ def _error_result(message):
 
 def show_agent_tree_handler(args):
     try:
-        from tree_monitor import format_tree_text
-        limit = args.get("limit_tasks", 5)
-        text = format_tree_text(limit_tasks=limit)
-        return {"content": [{"type": "text", "text": text}], "isError": False}
+        runs = _load_provenance()
+        raw_agents = _agents_json(include_completed=True) or []
+        live_agents = {a.get("id", ""): a for a in raw_agents if a.get("id")}
+
+        try:
+            agy_runs = _get_agy_mgr().list_runs()
+        except Exception:
+            agy_runs = []
+
+        lines = [
+            "=" * 80,
+            "  MULTI-AGENT LOCAL HARNESS MONITOR (Tier 1 Hypervisor -> Tier 0 Local Network)",
+            "=" * 80,
+        ]
+
+        vllm_active = sum(
+            1 for aid, a in live_agents.items()
+            if (a.get("state") in ("working", "running") or a.get("status") in ("working", "running"))
+            and runs.get(aid, {}).get("backend", "local") == "local"
+        )
+
+        lines.append(
+            f"Resources: [vLLM 4x 3090: {vllm_active}/8 active] | "
+            f"[Total Native Agents: {len(live_agents)}]"
+        )
+        lines.append("-" * 80)
+        lines.append("👑 TIER 1: HYPERVISOR & ARCHITECT (Claude Code / Antigravity / Codex)")
+
+        architects = []
+        workers_by_parent = {}
+        direct_workers = []
+
+        sorted_runs = sorted(runs.items(), key=lambda kv: kv[1].get("at", 0), reverse=True)
+        for rid, r in sorted_runs:
+            r_item = dict(r)
+            r_item["id"] = rid
+            parent = r.get("parent_id") or "supervisor"
+            role = r.get("role")
+            backend = r.get("backend")
+
+            if role == "architect" or backend == "gemini":
+                architects.append(r_item)
+            elif parent != "supervisor" and parent in runs:
+                workers_by_parent.setdefault(parent, []).append(r_item)
+            else:
+                direct_workers.append(r_item)
+
+        now = time.time()
+        for i, dw in enumerate(direct_workers[:8]):
+            wid = dw["id"]
+            live = live_agents.get(wid, {})
+            st = (live.get("state") or live.get("status") or "settled").upper()
+            icon = "🟢" if st in ("WORKING", "RUNNING") else ("🟡" if st == "BLOCKED" else "⚪")
+            elapsed = round(now - dw.get("at", now), 1)
+            model = dw.get("model", "Qwen-27B")
+            name = dw.get("name", "worker")
+            is_last = (i == len(direct_workers[:8]) - 1 and not architects and not agy_runs)
+            prefix = "  └──" if is_last else "  ├──"
+            lines.append(f"{prefix} {icon} 🔨 TIER 0: LOCAL WORKER [{wid}] ({model}) - {st} ({elapsed:.1f}s)")
+            lines.append(f"  │      Task: {name}")
+
+        for arch in architects[:3]:
+            aid = arch["id"]
+            live = live_agents.get(aid, {})
+            st = (live.get("state") or live.get("status") or "settled").upper()
+            icon = "🟢" if st in ("WORKING", "RUNNING") else ("🟡" if st == "BLOCKED" else "⚪")
+            elapsed = round(now - arch.get("at", now), 1)
+            model = arch.get("model", "architect")
+            name = arch.get("name", "architect")
+
+            lines.append(f"  ├── {icon} 🧠 SUB-ARCHITECT [{aid}] ({model}) - {st} ({elapsed:.1f}s)")
+            lines.append(f"  │      Name: {name}")
+
+            children = workers_by_parent.get(aid, [])
+            if children:
+                for j, ch in enumerate(children[:4]):
+                    cid = ch["id"]
+                    clive = live_agents.get(cid, {})
+                    cst = (clive.get("state") or clive.get("status") or "settled").upper()
+                    cicon = "🟢" if cst in ("WORKING", "RUNNING") else ("🟡" if cst == "BLOCKED" else "⚪")
+                    celapsed = round(now - ch.get("at", now), 1)
+                    cmodel = ch.get("model", "Qwen-27B")
+                    cname = ch.get("name", "worker")
+                    pipe = "  │      └──" if j == len(children) - 1 else "  │      ├──"
+                    lines.append(f"{pipe} {cicon} 🔨 TIER 0: WORKER [{cid}] ({cmodel}) - {cst} ({celapsed:.1f}s)")
+                    lines.append(f"  │             Task: {cname}")
+
+        for a in agy_runs[:3]:
+            st = a.get("status", "unknown").upper()
+            rid = a.get("run_id", "")
+            model = a.get("model", "gemini")
+            elapsed = a.get("elapsed_seconds") or (
+                round(time.time() - a.get("start_time", time.time()), 1) if st == "RUNNING" else a.get("agy_duration", 0)
+            )
+            icon = "🟢" if st == "RUNNING" else "⚪"
+            lines.append(f"  ├── {icon} 🚀 AGY RUN [{rid}] ({model}) - {st} ({elapsed:.1f}s)")
+
+        return {"content": [{"type": "text", "text": "\n".join(lines)}], "isError": False}
     except Exception as e:
         return _error_result(f"Failed to generate agent tree: {e}")
 

@@ -273,12 +273,8 @@ The Architect session runs with the persona `~/.claude/agents/gemini-architect.m
 
 ### Single Pane of Glass: Live Tree Monitor
 Inspect the entire multi-agent tree from a single point of entry:
-- **From Claude Code (MCP tool):** Call `show_agent_tree()` to get a real-time snapshot.
-- **From terminal (live watch mode):**
-  ```bash
-  python3 tree_monitor.py --watch
-  ```
-- **From scripts:** `python3 tree_monitor.py --json`
+- **From Claude Code / Antigravity (MCP tool):** Call `show_agent_tree()` to get a real-time snapshot of the hierarchy.
+- **WebGUI:** A dedicated multi-agent WebGUI dashboard is planned to visualize execution status, cluster GPU load, and task trees.
 
 ```text
 👑 TIER 2: CLAUDE SUPERVISOR (Opus / Main Session)
