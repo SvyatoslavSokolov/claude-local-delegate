@@ -2627,12 +2627,17 @@ def start_agy_delegate(args):
     conv_id = args.get("conversation_id")
     try:
         meta = _get_agy_mgr().spawn(task=task, cwd=cwd, model=model, effort=effort, conversation_id=conv_id)
+        time.sleep(0.4)
+        st = _get_agy_mgr().check_status(meta["run_id"])
+        cid = st.get("conversation_id")
+        attach_text = f"Connect / view interactive session:\n  agy --conversation {cid}" if cid else "Connect / view interactive session:\n  agy -c"
         return {
             "content": [{
                 "type": "text",
                 "text": (
                     f"Spawned Google Antigravity task. run_id: {meta['run_id']}\n"
                     f"Model: {meta['model']}, PID: {meta['pid']}\n"
+                    f"{attach_text}\n\n"
                     f"Call get_agy_result('{meta['run_id']}', wait_seconds=300) to wait and get the result."
                 )
             }],
@@ -2664,7 +2669,7 @@ def get_agy_result(args):
             f"AGY COMPLETED ({res.get('agy_duration', 0):.1f}s)\n"
             f"Conversation ID: {conv_id}\n"
             f"Transcript: {t_path}\n"
-            f"Inspect / Resume: agy --conversation {conv_id}\n"
+            f"Connect / Resume:\n  agy --conversation {conv_id}\n\n"
             f"Usage: {json.dumps(res.get('usage', {}))}\n\n"
             f"--- RESULT ---\n"
             f"{res.get('response', '')}"

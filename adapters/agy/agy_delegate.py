@@ -184,10 +184,27 @@ class AgyDelegateManager:
         if parsed_result is not None and "status" in parsed_result:
             alive = False
 
+        # Resolve conversation_id and attach_command early
+        conv_id = meta.get("conversation_id")
+        if not conv_id and parsed_result and parsed_result.get("conversation_id"):
+            conv_id = parsed_result.get("conversation_id")
+        if not conv_id:
+            try:
+                cache_file = Path.home() / ".gemini/antigravity-cli/cache/last_conversations.json"
+                if cache_file.exists():
+                    c_data = json.loads(cache_file.read_text(encoding="utf-8"))
+                    conv_id = c_data.get(meta.get("cwd"))
+            except Exception:
+                pass
+        if conv_id:
+            meta["conversation_id"] = conv_id
+            meta["attach_command"] = f"agy --conversation {conv_id}"
+
         if alive:
             elapsed = time.time() - meta["start_time"]
             meta["elapsed_seconds"] = round(elapsed, 2)
             meta["status"] = "running"
+            meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             return meta
 
         # Process has finished, record result
@@ -207,9 +224,10 @@ class AgyDelegateManager:
         if parsed_result and parsed_result.get("status") == "SUCCESS":
             meta["status"] = "completed"
             meta["response"] = parsed_result.get("response", "")
-            conv_id = parsed_result.get("conversation_id")
+            conv_id = parsed_result.get("conversation_id") or meta.get("conversation_id")
             meta["conversation_id"] = conv_id
             if conv_id:
+                meta["attach_command"] = f"agy --conversation {conv_id}"
                 t_path = Path.home() / ".gemini/antigravity-cli/brain" / conv_id / ".system_generated/logs/transcript.jsonl"
                 if t_path.exists():
                     meta["transcript_path"] = str(t_path)

@@ -64,7 +64,20 @@ def load_tasks(runs_lookup: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
                         t["run_speed"] = r_info.get("decode_speed_tok_s")
                         t["run_usd_saved"] = r_info.get("usd_saved")
                         t["run_quality"] = r_info.get("quality")
-                        t["run_model"] = r_info.get("model")
+                if t.get("adapter") == "agy" or (t.get("runs") and any(r.startswith("agy-") for r in t.get("runs", []))):
+                    agy_rid = next((r for r in t.get("runs", []) if r.startswith("agy-")), None)
+                    if agy_rid:
+                        agy_json = os.path.expanduser(f"~/.claude-local-delegate/agy_runs/{agy_rid}.json")
+                        if os.path.isfile(agy_json):
+                            try:
+                                with open(agy_json, "r", encoding="utf-8") as af:
+                                    ameta = json.load(af)
+                                    cid = ameta.get("conversation_id")
+                                    if cid:
+                                        t["conversation_id"] = cid
+                                        t["attach_command"] = f"agy --conversation {cid}"
+                            except Exception:
+                                pass
                 tasks.append(t)
             except Exception:
                 pass
@@ -235,6 +248,10 @@ def spawn_task_from_dashboard(
                 model=model or None,
             )
             run_id = meta.get("run_id")
+            time.sleep(0.4)
+            st = manager.check_status(run_id)
+            agy_conv_id = st.get("conversation_id")
+            agy_attach_cmd = f"agy --conversation {agy_conv_id}" if agy_conv_id else "agy -c"
 
         elif adapter == "codex":
             os.makedirs(CODEX_STATE_DIR, exist_ok=True)
@@ -299,6 +316,10 @@ def spawn_task_from_dashboard(
                     body["runs"] = [run_id]
                 body["adapter"] = adapter
                 body["model"] = model or "default"
+                if adapter == "agy":
+                    if agy_conv_id:
+                        body["conversation_id"] = agy_conv_id
+                    body["attach_command"] = agy_attach_cmd
                 body["note"] = f"Spawned via Web Dashboard ({adapter}: {model or 'default'})"
                 c.execute("UPDATE tasks SET body = ? WHERE rowid = ?;", (json.dumps(body), rowid))
                 conn.commit()
@@ -306,7 +327,7 @@ def spawn_task_from_dashboard(
     except Exception:
         pass
 
-    return True, {
+    res_dict = {
         "run_id": run_id,
         "task_id": task_id,
         "adapter": adapter,
@@ -314,6 +335,10 @@ def spawn_task_from_dashboard(
         "cwd": resolved_cwd,
         "summary": summary_text,
     }
+    if adapter == "agy":
+        res_dict["conversation_id"] = agy_conv_id
+        res_dict["attach_command"] = agy_attach_cmd
+    return True, res_dict
 
 
 def load_runs_map() -> Dict[str, Any]:
@@ -1316,6 +1341,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <span>${t.runs && t.runs.length ? 'Run: ' + t.runs[0] : 'Pending'}${t.run_model ? ' (' + t.run_model + ')' : (t.model ? ' (' + t.model + ')' : '')}</span>
               <span style="color:var(--green); font-weight:500;">${t.run_speed ? t.run_speed + ' t/s' : ''}${t.run_usd_saved ? ' • +$' + t.run_usd_saved : ''}</span>
             </div>
+            ${(t.conversation_id || t.attach_command) ? `
+              <div style="margin-top:6px; font-size:0.75rem; background:rgba(88,166,255,0.08); border:1px solid rgba(88,166,255,0.2); border-radius:4px; padding:4px 6px; display:flex; justify-content:space-between; align-items:center;">
+                <span style="color:var(--text-muted); font-size:0.72rem;">Session:</span>
+                <code style="color:var(--blue); font-size:0.72rem; cursor:pointer;" onclick="navigator.clipboard.writeText('${t.attach_command || ('agy --conversation ' + t.conversation_id)}'); alert('Copied to clipboard:\\n' + '${t.attach_command || ('agy --conversation ' + t.conversation_id)}')" title="Click to copy connect command">${t.attach_command || ('agy --conversation ' + t.conversation_id)} 📋</code>
+              </div>
+            ` : ''}
             ${t.run_quality !== null && t.run_quality !== undefined ? `<div style="margin-top:6px;"><span class="badge badge-green" style="font-size:0.72rem;">Quality: ${t.run_quality}/100</span></div>` : ''}
             ${t.note ? `<div style="margin-top:6px; font-size:0.72rem; color:var(--text-muted); font-style:italic;">"${t.note.substring(0, 100)}..."</div>` : ''}
             <div class="task-actions">
@@ -1668,6 +1699,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           document.getElementById('spawnTask').value = '';
           document.getElementById('spawnSummary').value = '';
           fetchData();
+          if (res.attach_command) {
+            alert('🚀 Task dispatched successfully!\\n\\nTo connect / view session in terminal:\\n' + res.attach_command);
+          }
         } else {
           errDiv.innerText = 'Launch failed: ' + (res.error || 'unknown error');
           errDiv.style.display = 'block';
