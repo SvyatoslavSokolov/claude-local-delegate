@@ -169,8 +169,8 @@ def spawn_task_from_dashboard(
         return False, {"error": "Task prompt cannot be empty"}
 
     adapter = (adapter or "local").strip().lower()
-    if adapter not in ("local", "agy", "architect", "codex"):
-        return False, {"error": f"Unsupported adapter: {adapter}. Must be local, agy, architect, or codex."}
+    if adapter not in ("local", "claude", "agy", "architect", "codex"):
+        return False, {"error": f"Unsupported adapter: {adapter}. Must be local, claude, agy, architect, or codex."}
 
     resolved_cwd = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
     if not os.path.isdir(resolved_cwd):
@@ -200,6 +200,31 @@ def spawn_task_from_dashboard(
             if err:
                 return False, {"error": err}
             run_id = short_id
+
+        elif adapter == "claude":
+            # Direct Claude Code on user's subscription (Anthropic Cloud)
+            cmd = [
+                CLAUDE_BIN, "--bg",
+                "--permission-mode", "bypassPermissions",
+            ]
+            if model:
+                cmd.extend(["--model", model])
+            effective_task = f"[PROJECT CWD: {resolved_cwd}]\n\n" + task_text
+            cmd.append(effective_task)
+            proc = subprocess.run(
+                cmd,
+                cwd=resolved_cwd,
+                env=dict(os.environ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=120,
+            )
+            out = proc.stdout.decode("utf-8", "replace") if proc.stdout else ""
+            if proc.returncode != 0 and "backgrounded" not in out:
+                return False, {"error": f"claude --bg exited {proc.returncode}.\n{out.strip()[-1000:]}"}
+            import server
+            short_id = server._parse_bg_id(out)
+            run_id = short_id or f"claude-{uuid.uuid4().hex[:6]}"
 
         elif adapter == "agy":
             from adapters.agy.agy_delegate import AgyDelegateManager
@@ -1152,24 +1177,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     const ADAPTER_PRESETS = {
       local: [
-        { label: 'Qwen 2.5 Coder 32B (Local vLLM default)', value: 'qwen2.5-coder-32b' },
+        { label: 'Qwen 2.5 Coder 32B (Tier 0 Local vLLM default)', value: 'qwen2.5-coder-32b' },
         { label: 'Qwen 2.5 Coder 14B (Fast local worker)', value: 'qwen2.5-coder-14b' },
         { label: 'Local Fast Profile (No thinking overhead)', value: 'local-fast' }
       ],
+      claude: [
+        { label: 'Claude 3.7 Sonnet (Anthropic Tier 1 Architect)', value: 'claude-3-7-sonnet' },
+        { label: 'Claude 3.5 Sonnet (Standard)', value: 'claude-3-5-sonnet' },
+        { label: 'Claude 3.5 Haiku (Fast)', value: 'claude-3-5-haiku' },
+        { label: 'Claude 3 Opus (Deep reasoning)', value: 'claude-3-opus' }
+      ],
       agy: [
-        { label: 'Gemini 3.8 Flash High (Default)', value: 'gemini-3.8-flash-high' },
+        { label: 'Gemini 3.8 Flash High (Default AGY)', value: 'gemini-3.8-flash-high' },
         { label: 'Gemini 2.5 Pro (Deep reasoning)', value: 'gemini-2.5-pro' },
         { label: 'Gemini 2.5 Flash (Ultra-fast)', value: 'gemini-2.5-flash' }
-      ],
-      architect: [
-        { label: 'Gemini 2.5 Pro (Architect default)', value: 'gemini-2.5-pro' },
-        { label: 'Gemini 3.8 Flash High', value: 'gemini-3.8-flash-high' },
-        { label: 'Claude 3.7 Sonnet', value: 'claude-3-7-sonnet' }
       ],
       codex: [
         { label: 'o3-mini (OpenAI reasoning)', value: 'o3-mini' },
         { label: 'GPT-4o (Standard)', value: 'gpt-4o' },
         { label: 'o1 (High capability)', value: 'o1' }
+      ],
+      architect: [
+        { label: 'Gemini 2.5 Pro (Architect default)', value: 'gemini-2.5-pro' },
+        { label: 'Gemini 3.8 Flash High', value: 'gemini-3.8-flash-high' },
+        { label: 'Claude 3.7 Sonnet', value: 'claude-3-7-sonnet' }
       ]
     };
 
@@ -1278,10 +1309,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="form-group">
           <label>Runner / Adapter</label>
           <select id="spawnAdapter" class="form-ctrl" onchange="onAdapterChange()">
-            <option value="local">🖥️ Local Worker (Claude Code + vLLM / Qwen)</option>
-            <option value="agy">🧠 Google Antigravity (AGY / Gemini)</option>
-            <option value="architect">🏛️ Gemini Architect (Tier 1 Supervisor)</option>
-            <option value="codex">⚡ OpenAI Codex</option>
+            <optgroup label="Tier 0: Local GPU Cluster">
+              <option value="local">🖥️ Local Worker (Claude Code + vLLM / Qwen on 4x RTX 3090)</option>
+            </optgroup>
+            <optgroup label="Tier 1: Architect Super-Models">
+              <option value="claude">⚡ Claude Code (Anthropic Subscription / Sonnet 3.7)</option>
+              <option value="agy">🧠 Google Antigravity (AGY / Gemini 2.5 Pro)</option>
+              <option value="codex">🤖 OpenAI Codex (o3-mini / GPT-4o)</option>
+              <option value="architect">🏛️ Gemini Architect Persona</option>
+            </optgroup>
           </select>
         </div>
 

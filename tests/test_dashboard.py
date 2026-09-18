@@ -171,6 +171,24 @@ class DashboardTests(unittest.TestCase):
                     self.assertEqual(res["adapter"], "codex")
                     self.assertEqual(res["model"], "o3-mini")
 
+                # 5. Direct Claude Code adapter spawn (Anthropic subscription)
+                with patch("subprocess.run") as mock_run:
+                    mock_res = MagicMock()
+                    mock_res.returncode = 0
+                    mock_res.stdout = b"Agent abcdef12 backgrounded.\n"
+                    mock_run.return_value = mock_res
+
+                    ok, res = dashboard.spawn_task_from_dashboard(
+                        adapter="claude",
+                        task="Design system architecture",
+                        model="claude-3-7-sonnet",
+                        cwd=tmpdir,
+                    )
+                    self.assertTrue(ok)
+                    self.assertEqual(res["adapter"], "claude")
+                    self.assertEqual(res["model"], "claude-3-7-sonnet")
+                    self.assertEqual(res["run_id"], "abcdef12")
+
 
 if __name__ == "__main__":
     unittest.main()
