@@ -37,6 +37,11 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("tasksCancelled", html)
         self.assertIn("cleanupStale", html)
         self.assertIn("updateTask", html)
+        self.assertIn("spawnModal", html)
+        self.assertIn("spawnAdapter", html)
+        self.assertIn("spawnModel", html)
+        self.assertIn("submitSpawn", html)
+        self.assertIn("/api/task/spawn", html)
 
     def test_update_and_cleanup_tasks(self):
         import tempfile
@@ -89,7 +94,85 @@ class DashboardTests(unittest.TestCase):
                 t2 = [t for t in tasks if t["id"] == task2_id][0]
                 self.assertEqual(t2["status"], "cancelled")
 
+    def test_spawn_task_from_dashboard(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = f"{tmpdir}/coordination.sqlite3"
+            codex_state = f"{tmpdir}/codex_runs"
+
+            with patch("dashboard.DB_PATH", db_path), \
+                 patch("dashboard.CODEX_STATE_DIR", codex_state):
+
+                # 1. Validation errors
+                ok, res = dashboard.spawn_task_from_dashboard("local", "")
+                self.assertFalse(ok)
+                self.assertIn("empty", res["error"])
+
+                ok, res = dashboard.spawn_task_from_dashboard("unsupported_adapter", "do something")
+                self.assertFalse(ok)
+                self.assertIn("Unsupported", res["error"])
+
+                ok, res = dashboard.spawn_task_from_dashboard("local", "do something", cwd="/non/existent/path")
+                self.assertFalse(ok)
+                self.assertIn("does not exist", res["error"])
+
+                # 2. Local adapter spawn
+                with patch("server._spawn_native_agent") as mock_spawn_local:
+                    mock_spawn_local.return_value = ("loc-run-123", None)
+                    ok, res = dashboard.spawn_task_from_dashboard(
+                        adapter="local",
+                        task="Refactor telemetry",
+                        model="qwen2.5-coder-32b",
+                        cwd=tmpdir,
+                        summary="Refactor telemetry task",
+                    )
+                    self.assertTrue(ok)
+                    self.assertEqual(res["run_id"], "loc-run-123")
+                    self.assertEqual(res["adapter"], "local")
+                    self.assertEqual(res["model"], "qwen2.5-coder-32b")
+
+                    # Verify task was claimed on Board
+                    tasks = dashboard.load_tasks()
+                    self.assertEqual(len(tasks), 1)
+                    self.assertEqual(tasks[0]["adapter"], "local")
+                    self.assertEqual(tasks[0]["runs"], ["loc-run-123"])
+
+                # 3. AGY adapter spawn
+                with patch("adapters.agy.agy_delegate.AgyDelegateManager.spawn") as mock_agy_spawn:
+                    mock_agy_spawn.return_value = {"run_id": "agy-abc-999", "status": "running"}
+                    ok, res = dashboard.spawn_task_from_dashboard(
+                        adapter="agy",
+                        task="Research papers",
+                        model="gemini-2.5-pro",
+                        cwd=tmpdir,
+                    )
+                    self.assertTrue(ok)
+                    self.assertEqual(res["run_id"], "agy-abc-999")
+                    self.assertEqual(res["adapter"], "agy")
+                    tasks = dashboard.load_tasks()
+                    self.assertEqual(len(tasks), 2)
+                    agy_task = [t for t in tasks if t["adapter"] == "agy"][0]
+                    self.assertEqual(agy_task["runs"], ["agy-abc-999"])
+
+                # 4. Codex adapter spawn
+                with patch("subprocess.Popen") as mock_popen:
+                    mock_proc = MagicMock()
+                    mock_proc.pid = 98765
+                    mock_popen.return_value = mock_proc
+
+                    ok, res = dashboard.spawn_task_from_dashboard(
+                        adapter="codex",
+                        task="Write unit test",
+                        model="o3-mini",
+                        cwd=tmpdir,
+                    )
+                    self.assertTrue(ok)
+                    self.assertTrue(res["run_id"].startswith("codex-"))
+                    self.assertEqual(res["adapter"], "codex")
+                    self.assertEqual(res["model"], "o3-mini")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

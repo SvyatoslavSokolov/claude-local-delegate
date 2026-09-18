@@ -17,9 +17,12 @@ import glob
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
+import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,6 +35,11 @@ STATE_DIR = os.environ.get("CLAUDE_LOCAL_DELEGATE_STATE_DIR", os.path.expanduser
 DB_PATH = os.path.join(STATE_DIR, "coordination.sqlite3")
 RUNS_JSON = os.path.join(STATE_DIR, "runs.json")
 METRICS_JSONL = os.path.join(STATE_DIR, "metrics.jsonl")
+CODEX_STATE_DIR = os.path.join(STATE_DIR, "codex_runs")
+
+CODEX_BIN = os.environ.get("CODEX_BIN", shutil.which("codex") or "codex")
+AGY_BIN = os.environ.get("AGY_BIN", shutil.which("agy") or "agy")
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", shutil.which("claude") or "claude")
 
 
 def load_tasks(runs_lookup: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -146,6 +154,140 @@ def cleanup_stale_tasks(max_age_hours: float = 2.0, target_status: str = "done")
         return updated_count
     except Exception:
         return 0
+
+
+def spawn_task_from_dashboard(
+    adapter: str,
+    task: str,
+    model: Optional[str] = None,
+    cwd: Optional[str] = None,
+    summary: Optional[str] = None,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Spawn a task via local worker, agy, architect, or codex, and register in coordination.sqlite3."""
+    if not task or not task.strip():
+        return False, {"error": "Task prompt cannot be empty"}
+
+    adapter = (adapter or "local").strip().lower()
+    if adapter not in ("local", "agy", "architect", "codex"):
+        return False, {"error": f"Unsupported adapter: {adapter}. Must be local, agy, architect, or codex."}
+
+    resolved_cwd = os.path.abspath(os.path.expanduser(cwd or os.getcwd()))
+    if not os.path.isdir(resolved_cwd):
+        return False, {"error": f"Working directory does not exist: {cwd}"}
+
+    task_text = task.strip()
+    summary_text = (summary or task_text.split("\n", 1)[0])[:120].strip()
+
+    run_id = None
+    try:
+        if adapter in ("local", "architect"):
+            import server
+            role = "architect" if adapter == "architect" else "worker"
+            agent_persona = "gemini-architect" if adapter == "architect" else None
+            allowed_tools = None if adapter == "architect" else server.DEFAULT_ALLOWED_TOOLS
+            name = server._format_agent_name(None, task_text, role=role, profile="think" if role == "worker" else None)
+            short_id, err = server._spawn_native_agent(
+                task=task_text,
+                allowed_tools=allowed_tools,
+                cwd=resolved_cwd,
+                name=name,
+                permission_mode=server.DEFAULT_PERMISSION_MODE,
+                agent=agent_persona,
+                spawn_model=model or None,
+                role=role,
+            )
+            if err:
+                return False, {"error": err}
+            run_id = short_id
+
+        elif adapter == "agy":
+            from adapters.agy.agy_delegate import AgyDelegateManager
+            manager = AgyDelegateManager()
+            meta = manager.spawn(
+                task=task_text,
+                cwd=resolved_cwd,
+                model=model or None,
+            )
+            run_id = meta.get("run_id")
+
+        elif adapter == "codex":
+            os.makedirs(CODEX_STATE_DIR, exist_ok=True)
+            run_id = f"codex-{uuid.uuid4().hex[:8]}"
+            out_f = open(os.path.join(CODEX_STATE_DIR, f"{run_id}.out"), "w", encoding="utf-8")
+            err_f = open(os.path.join(CODEX_STATE_DIR, f"{run_id}.err"), "w", encoding="utf-8")
+            cmd = [CODEX_BIN, "exec"]
+            if model:
+                cmd.extend(["-c", f'model="{model}"'])
+            cmd.append(task_text)
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=resolved_cwd,
+                    stdout=out_f,
+                    stderr=err_f,
+                    start_new_session=True,
+                )
+            except Exception as exc:
+                out_f.close()
+                err_f.close()
+                return False, {"error": f"Failed to spawn codex: {exc}"}
+
+            meta_data = {
+                "run_id": run_id,
+                "pid": proc.pid,
+                "task": task_text,
+                "cwd": resolved_cwd,
+                "model": model or "default",
+                "start_time": time.time(),
+                "status": "running",
+            }
+            with open(os.path.join(CODEX_STATE_DIR, f"{run_id}.json"), "w", encoding="utf-8") as mf:
+                json.dump(meta_data, mf)
+
+    except Exception as exc:
+        return False, {"error": f"Exception spawning {adapter}: {exc}"}
+
+    # Register task on Coordination Board
+    task_id = None
+    try:
+        from coordination import Board
+        board = Board(DB_PATH)
+        task_key = f"web-{adapter}-{uuid.uuid4().hex[:6]}"
+        claim_res = board.claim("dashboard", {
+            "project": resolved_cwd,
+            "task_key": task_key,
+            "mode": "write",
+            "summary": summary_text,
+        })
+        task_obj = claim_res.get("task", {})
+        task_id = task_obj.get("id")
+        if task_id:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT rowid, body FROM tasks WHERE id = ?;", (task_id,))
+            row = c.fetchone()
+            if row:
+                rowid, b_str = row
+                body = json.loads(b_str)
+                if run_id:
+                    body["runs"] = [run_id]
+                body["adapter"] = adapter
+                body["model"] = model or "default"
+                body["note"] = f"Spawned via Web Dashboard ({adapter}: {model or 'default'})"
+                c.execute("UPDATE tasks SET body = ? WHERE rowid = ?;", (json.dumps(body), rowid))
+                conn.commit()
+            conn.close()
+    except Exception:
+        pass
+
+    return True, {
+        "run_id": run_id,
+        "task_id": task_id,
+        "adapter": adapter,
+        "model": model or "default",
+        "cwd": resolved_cwd,
+        "summary": summary_text,
+    }
 
 
 def load_runs_map() -> Dict[str, Any]:
@@ -581,6 +723,88 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       background: var(--accent);
       border-radius: 4px;
     }
+
+    .badge-blue { color: var(--accent); border-color: rgba(88, 166, 255, 0.4); background: rgba(88, 166, 255, 0.1); }
+
+    /* Modal Styles */
+    .modal-backdrop {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+    }
+    .modal-box {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      width: 580px;
+      max-width: 94vw;
+      max-height: 90vh;
+      overflow-y: auto;
+      box-shadow: 0 20px 45px rgba(0, 0, 0, 0.85);
+      display: flex;
+      flex-direction: column;
+    }
+    .modal-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .modal-header h2 {
+      font-size: 1.1rem;
+      margin: 0;
+      color: #fff;
+    }
+    .close-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 1.4rem;
+      cursor: pointer;
+    }
+    .close-btn:hover { color: #fff; }
+    .modal-body {
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .form-group label {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+    .form-ctrl {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      color: #c9d1d9;
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 0.85rem;
+      font-family: inherit;
+    }
+    .form-ctrl:focus {
+      border-color: var(--accent);
+      outline: none;
+    }
+    .modal-footer {
+      padding: 14px 20px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
   </style>
 </head>
 <body>
@@ -594,6 +818,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <span id="clusterBadge" class="badge">Loading Cluster...</span>
       <span id="savedBadge" class="badge badge-green">$0.00 Saved</span>
       <span id="activeBadge" class="badge">0 Active Tasks</span>
+      <button class="btn" onclick="openSpawnModal()" style="background: linear-gradient(135deg, #1f6feb, #238636); border: none; font-weight: 600; display: inline-flex; align-items: center; gap: 6px;">➕ New Task / Dispatch</button>
       <button class="btn" onclick="fetchData()">Refresh</button>
     </div>
   </header>
@@ -638,6 +863,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </select>
       </div>
       <div style="display: flex; gap: 8px;">
+        <button class="btn" style="background: #1f6feb; border: none; font-size: 0.8rem; font-weight: 600;" onclick="openSpawnModal()">
+          🚀 Dispatch Task
+        </button>
         <button class="btn" style="background: #21262d; border: 1px solid var(--border); font-size: 0.8rem;" onclick="cleanupStale('done')">
           🧹 Archive Stale as Done
         </button>
@@ -768,11 +996,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="task-card">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
               <span class="badge badge-purple" style="font-size:0.7rem;">${t.project_name || 'project'}</span>
-              <span class="badge ${t.status === 'done' ? 'badge-green' : (t.status === 'active' ? 'badge-yellow' : (t.status === 'cancelled' ? 'badge-red' : ''))}" style="font-size:0.7rem;">${t.status}</span>
+              <div style="display:flex; gap:4px; align-items:center;">
+                ${t.adapter ? `<span class="badge badge-blue" style="font-size:0.68rem; text-transform:uppercase;">${t.adapter}</span>` : ''}
+                <span class="badge ${t.status === 'done' ? 'badge-green' : (t.status === 'active' ? 'badge-yellow' : (t.status === 'cancelled' ? 'badge-red' : ''))}" style="font-size:0.7rem;">${t.status}</span>
+              </div>
             </div>
             <div class="task-summary">${t.summary || t.task_key || t.id}</div>
             <div class="task-meta" style="margin-top:6px;">
-              <span>${t.runs && t.runs.length ? 'Run: ' + t.runs[0] : 'Pending'}${t.run_model ? ' (' + t.run_model + ')' : ''}</span>
+              <span>${t.runs && t.runs.length ? 'Run: ' + t.runs[0] : 'Pending'}${t.run_model ? ' (' + t.run_model + ')' : (t.model ? ' (' + t.model + ')' : '')}</span>
               <span style="color:var(--green); font-weight:500;">${t.run_speed ? t.run_speed + ' t/s' : ''}${t.run_usd_saved ? ' • +$' + t.run_usd_saved : ''}</span>
             </div>
             ${t.run_quality !== null && t.run_quality !== undefined ? `<div style="margin-top:6px;"><span class="badge badge-green" style="font-size:0.72rem;">Quality: ${t.run_quality}/100</span></div>` : ''}
@@ -918,10 +1149,174 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
+    const ADAPTER_PRESETS = {
+      local: [
+        { label: 'Qwen 2.5 Coder 32B (Local vLLM default)', value: 'qwen2.5-coder-32b' },
+        { label: 'Qwen 2.5 Coder 14B (Fast local worker)', value: 'qwen2.5-coder-14b' },
+        { label: 'Local Fast Profile (No thinking overhead)', value: 'local-fast' }
+      ],
+      agy: [
+        { label: 'Gemini 3.8 Flash High (Default)', value: 'gemini-3.8-flash-high' },
+        { label: 'Gemini 2.5 Pro (Deep reasoning)', value: 'gemini-2.5-pro' },
+        { label: 'Gemini 2.5 Flash (Ultra-fast)', value: 'gemini-2.5-flash' }
+      ],
+      architect: [
+        { label: 'Gemini 2.5 Pro (Architect default)', value: 'gemini-2.5-pro' },
+        { label: 'Gemini 3.8 Flash High', value: 'gemini-3.8-flash-high' },
+        { label: 'Claude 3.7 Sonnet', value: 'claude-3-7-sonnet' }
+      ],
+      codex: [
+        { label: 'o3-mini (OpenAI reasoning)', value: 'o3-mini' },
+        { label: 'GPT-4o (Standard)', value: 'gpt-4o' },
+        { label: 'o1 (High capability)', value: 'o1' }
+      ]
+    };
+
+    function onAdapterChange() {
+      const adapter = document.getElementById('spawnAdapter').value;
+      const presets = ADAPTER_PRESETS[adapter] || [];
+      const presetSel = document.getElementById('spawnModelPreset');
+      presetSel.innerHTML = presets.map(p => `<option value="${p.value}">${p.label}</option>`).join('');
+      if (presets.length > 0) {
+        document.getElementById('spawnModel').value = presets[0].value;
+      } else {
+        document.getElementById('spawnModel').value = '';
+      }
+    }
+
+    function onModelPresetChange() {
+      const val = document.getElementById('spawnModelPreset').value;
+      document.getElementById('spawnModel').value = val;
+    }
+
+    function openSpawnModal() {
+      const modal = document.getElementById('spawnModal');
+      modal.style.display = 'flex';
+      onAdapterChange();
+      document.getElementById('spawnError').style.display = 'none';
+
+      // Suggestions for project cwd
+      const projects = Array.from(new Set(rawTasks.map(t => t.project).filter(Boolean)));
+      const suggBox = document.getElementById('cwdSuggestions');
+      if (projects.length > 0) {
+        suggBox.innerHTML = '<span style="font-size:0.75rem; color:var(--text-muted); align-self:center;">Recent:</span>' +
+          projects.slice(0, 3).map(p => `<button type="button" class="badge" style="cursor:pointer;" onclick="document.getElementById('spawnCwd').value = '${p}'">${p.split('/').pop()}</button>`).join('');
+        if (!document.getElementById('spawnCwd').value) {
+          document.getElementById('spawnCwd').value = projects[0];
+        }
+      } else {
+        suggBox.innerHTML = '';
+      }
+
+      setTimeout(() => document.getElementById('spawnTask').focus(), 50);
+    }
+
+    function closeSpawnModal() {
+      document.getElementById('spawnModal').style.display = 'none';
+      document.getElementById('spawnError').style.display = 'none';
+    }
+
+    async function submitSpawn() {
+      const btn = document.getElementById('btnSpawnSubmit');
+      const errDiv = document.getElementById('spawnError');
+      errDiv.style.display = 'none';
+
+      const adapter = document.getElementById('spawnAdapter').value;
+      const model = document.getElementById('spawnModel').value.trim();
+      const cwd = document.getElementById('spawnCwd').value.trim();
+      const summary = document.getElementById('spawnSummary').value.trim();
+      const task = document.getElementById('spawnTask').value.trim();
+
+      if (!task) {
+        errDiv.innerText = 'Please enter task prompt / instructions.';
+        errDiv.style.display = 'block';
+        return;
+      }
+
+      btn.disabled = true;
+      btn.innerText = '⏳ Launching...';
+
+      try {
+        const resp = await fetch('/api/task/spawn', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({adapter, model, cwd, summary, task})
+        });
+        const res = await resp.json();
+        if (res.ok) {
+          closeSpawnModal();
+          document.getElementById('spawnTask').value = '';
+          document.getElementById('spawnSummary').value = '';
+          fetchData();
+        } else {
+          errDiv.innerText = 'Launch failed: ' + (res.error || 'unknown error');
+          errDiv.style.display = 'block';
+        }
+      } catch (err) {
+        errDiv.innerText = 'Network error: ' + err;
+        errDiv.style.display = 'block';
+      } finally {
+        btn.disabled = false;
+        btn.innerText = '🚀 Launch Agent';
+      }
+    }
+
     // Auto-poll every 4 seconds
     fetchData();
     setInterval(fetchData, 4000);
   </script>
+
+  <!-- Modal: Dispatch New Task -->
+  <div id="spawnModal" class="modal-backdrop" style="display:none;" onclick="if(event.target===this)closeSpawnModal()">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h2>🚀 Dispatch New Task</h2>
+        <button class="close-btn" onclick="closeSpawnModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Runner / Adapter</label>
+          <select id="spawnAdapter" class="form-ctrl" onchange="onAdapterChange()">
+            <option value="local">🖥️ Local Worker (Claude Code + vLLM / Qwen)</option>
+            <option value="agy">🧠 Google Antigravity (AGY / Gemini)</option>
+            <option value="architect">🏛️ Gemini Architect (Tier 1 Supervisor)</option>
+            <option value="codex">⚡ OpenAI Codex</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>Target Model</label>
+          <div style="display: flex; gap: 8px;">
+            <select id="spawnModelPreset" class="form-ctrl" style="flex: 1;" onchange="onModelPresetChange()">
+            </select>
+            <input id="spawnModel" type="text" class="form-ctrl" style="flex: 1;" placeholder="Or type custom model..." />
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Working Directory (CWD)</label>
+          <input id="spawnCwd" type="text" class="form-ctrl" placeholder="/absolute/path/to/project" />
+          <div id="cwdSuggestions" style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px;"></div>
+        </div>
+
+        <div class="form-group">
+          <label>Task Summary (Optional)</label>
+          <input id="spawnSummary" type="text" class="form-ctrl" placeholder="Short label for Kanban card..." />
+        </div>
+
+        <div class="form-group">
+          <label>Task Prompt / Instructions</label>
+          <textarea id="spawnTask" class="form-ctrl" rows="6" placeholder="Provide clear, actionable instructions, files to modify, or tests to run..."></textarea>
+        </div>
+
+        <div id="spawnError" style="color: var(--red); font-size: 0.85rem; margin-top: 4px; display: none;"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" style="background: #21262d; border: 1px solid var(--border);" onclick="closeSpawnModal()">Cancel</button>
+        <button id="btnSpawnSubmit" class="btn" style="background: var(--green); color: white; font-weight: 600; border: none;" onclick="submitSpawn()">🚀 Launch Agent</button>
+      </div>
+    </div>
+  </div>
 </body>
 </html>
 """
@@ -1009,6 +1404,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             target_status = payload.get("target_status", "done")
             count = cleanup_stale_tasks(max_age_hours=max_age_hours, target_status=target_status)
             self._send_json({"ok": True, "cleaned_count": count})
+            return
+
+        if path == "/api/task/spawn":
+            adapter = payload.get("adapter", "local")
+            task = payload.get("task", "")
+            model = payload.get("model") or None
+            cwd = payload.get("cwd") or None
+            summary = payload.get("summary") or None
+            ok, res = spawn_task_from_dashboard(adapter=adapter, task=task, model=model, cwd=cwd, summary=summary)
+            if not ok:
+                self._send_json({"ok": False, "error": res.get("error", "Failed to spawn task")}, status=400)
+                return
+            self._send_json({"ok": True, **res})
             return
 
         self.send_error(404, f"Not Found: {path}")
