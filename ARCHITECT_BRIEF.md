@@ -14,7 +14,10 @@ nontrivial delegation whose briefing needs detailed acceptance criteria.
    including research, implementation, edits, and checks. Do not duplicate the
    delegate's work while it runs. Prefer one focused worker unless independent
    parallel tasks are necessary, and request full output only when compact results
-   and the diff are insufficient.
+   and the diff are insufficient. At most SIX local sessions may run at once
+   (the local pool's optimum): the server refuses a seventh with an overload
+   response, so keep parallel local work to six or fewer. Launch beyond six only
+   if you explicitly raise CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY.
 4. Brief one small outcome with exact files/anchors and an executable acceptance
    check. Ask for a short result and name known dirty/forbidden paths. Split work
    before delegating if it spans unrelated files or more than about five steps.
@@ -53,8 +56,14 @@ once): median duration 804s, 19 model calls, 25k output tokens (~69% of it
 thinking), 67k peak context; p95 peak context 154k. That history carried ~20-31k
 tokens of fixed system/tool overhead per call; spawns now pass `--tools` with only
 the granted built-ins, which measured ~3.7k. Grant only the tools a task needs. The delegate
-profile is capped at 262,144 context tokens, covering 97.2% of this history before
-compaction while limiting KV-cache outliers. Every delegated task carries a report contract asking for at most 30 lines of
-substance (changes, verification actually run, assumptions), so the default
-compaction (first 4 + last 30 lines) normally never fires. Full transcripts and detailed history stay on disk and are loaded
-only when a review requires them.
+profile is capped at 180,244 tokens context + 98,304 output (the deployment's actual usable
+budget, user-confirmed 2026-09-16 -- not the 262,144 MAX_MODEL_LEN in the vLLM stack's .env,
+which this deployment does not actually deliver), covering 97.2% of the historical run
+distribution before compaction while limiting KV-cache outliers. Every delegated task carries a
+report contract asking for a concise final chat message (changes, verification actually run,
+assumptions) with NO fixed line count in the prompt (removed 2026-09-16: a weak local model
+conflated a numeric report-length cap with an unrelated length target inside the task itself,
+e.g. "shrink this file to ~N lines", and looped trying to reconcile the two). Display-side
+compaction of what the paid supervisor reads (DEFAULT_RESULT_LINES, default 60) is separate and
+never truncates the transcript on disk or the model's own generation. Full transcripts and
+detailed history stay on disk and are loaded only when a review requires them.

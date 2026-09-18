@@ -13,12 +13,13 @@ from coordination import Board, TOOLS, STRING, schema
 READ_ONLY_CALLS = frozenset({
     'project_sync', 'local_backend_info', 'check_delegate_status', 'watch_delegate',
     'get_delegate_result', 'check_fanout_status', 'get_fanout_result', 'rate_delegate',
+    'check_agy_status', 'get_agy_result', 'stop_agy', 'show_agent_tree',
 })
-# Tools whose slow step is a `claude --bg` subprocess and which hold no
+# Tools whose slow step is a `claude --bg` or `agy` subprocess and which hold no
 # half-written state across it, so the lock may be released while it runs.
 # The verified loop is deliberately NOT here: its state machine advances across
 # the spawn, and two supervisors polling one vid must not both launch a checker.
-SPAWN_CALLS = frozenset({'delegate_to_local', 'fan_out_to_local', 'continue_delegate'})
+SPAWN_CALLS = frozenset({'delegate_to_local', 'delegate_to_architect', 'fan_out_to_local', 'continue_delegate', 'delegate_to_agy'})
 
 
 def install(server):
@@ -139,20 +140,13 @@ def install(server):
             roster = server._agents_json()
             if roster is None:
                 return None, 'Cannot inspect native roster; refusing an unaccounted spawn. Retry when Claude supervisor is available.'
-            # The pool being protected is the local vLLM's, so only runs THIS server
-            # recorded as local delegates count against it (shared file, so a Codex
-            # supervisor's delegates count too). A paid Anthropic background session
-            # -- the supervisor itself, for one -- sits in the same native roster but
-            # never touches the GPU, and used to consume a slot it did not use.
-            recorded = server._load_provenance()
-            settled_states = ('done', 'completed', 'idle', 'failed', 'stopped')
-            active = [a for a in roster if a.get('kind') == 'background'
-                      and (a.get('state') or a.get('status')) not in settled_states
-                      and recorded.get(a.get('id'), {}).get('backend') == 'local']
-            pending = _tickets()
-            if len(active) + len(pending) >= server.LOCAL_SERVER_MAX_CONCURRENCY:
-                return None, ('Local pool full (' + str(len(active)) + ' local delegate(s) running, '
-                              + str(len(pending)) + ' spawning). Retry after one settles.')
+            # Concurrency-ceiling admission gate REMOVED (2026-09-16, user
+            # request): it counted a `blocked` session (paused, waiting on a
+            # reply -- zero live vLLM inference) the same as a `working` one,
+            # so an unrelated project's blocked backlog reported the pool
+            # "full" while the GPU sat idle (0/3 utilized, 33 blocked from
+            # virtual-hal). No longer wired to refuse a spawn here; the
+            # reservation/coordination checks below are unaffected.
             if reservation and writes:
                 lookup = {a.get('id'): a for a in roster}
                 terminal = ('done', 'completed', 'idle', 'failed', 'stopped')
@@ -217,14 +211,9 @@ def install(server):
     def pool_snapshot():
         """How much local capacity is actually free, by the same accounting the
         spawn admission uses -- so 'retry later' has a number behind it."""
-        roster = server._agents_json()
-        if roster is None:
+        active, roster_ok = server._local_pool_usage()
+        if not roster_ok:
             return {'known': False, 'note': 'native roster unavailable'}
-        recorded = server._load_provenance()
-        busy = ('done', 'completed', 'idle', 'failed', 'stopped')
-        active = [a.get('id') for a in roster if a.get('kind') == 'background'
-                  and (a.get('state') or a.get('status')) not in busy
-                  and recorded.get(a.get('id'), {}).get('backend') == 'local']
         pending = len(_tickets())
         ceiling = server.LOCAL_SERVER_MAX_CONCURRENCY
         return {'known': True, 'max': ceiling, 'local_running': len(active),

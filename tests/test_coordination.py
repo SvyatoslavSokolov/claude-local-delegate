@@ -1,8 +1,11 @@
 """Unit tests for the coordination.Board reservation API (no model calls, no network)."""
 import os
+import sys
 import unittest
 from pathlib import Path
 import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from coordination import Board
 

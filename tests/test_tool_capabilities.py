@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 HERE = Path(__file__).resolve()
 ROOT = HERE.parent.parent  # claude-local-delegate/
+sys.path.insert(0, str(ROOT))
 
 
 def test_navigation_mcp_names_are_read_only_and_separate_from_delegation():
@@ -37,7 +38,6 @@ def test_navigation_mcp_names_are_read_only_and_separate_from_delegation():
             "mcp__serena__find_declaration",
             "mcp__serena__find_implementations",
             "mcp__serena__get_diagnostics_for_file",
-            "mcp__serena__search_for_pattern",
             "mcp__serena__list_memories",
             "mcp__serena__read_memory",
         }
@@ -70,7 +70,10 @@ class DefaultAllowedToolsTest(unittest.TestCase):
     def test_default_contains_full_writer_set(self):
         tools = {t.strip() for t in self.s.DEFAULT_ALLOWED_TOOLS.split(',') if t.strip()}
         expected = {'Read', 'Grep', 'Glob', 'Edit', 'Write', 'Bash',
-                    'WebSearch', 'WebFetch', 'LSP', 'NotebookRead', 'NotebookEdit'}
+                    'WebSearch', 'WebFetch', 'LSP', 'NotebookRead', 'NotebookEdit',
+                    'Skill', 'SendMessage', 'ListAgents', 'TodoWrite', 'ReportFindings',
+                    'ScheduleWakeup', 'WaitForMcpServers', 'EnterWorktree', 'ExitWorktree',
+                    'CronCreate', 'CronDelete', 'CronList'}
         self.assertEqual(tools, expected,
                          "DEFAULT_ALLOWED_TOOLS must be exactly the capability-rich writer set")
 
@@ -208,11 +211,17 @@ class PersonaNavigationOrderTest(unittest.TestCase):
                            "Serena semantic navigation must precede text search")
 
     def test_literals_are_not_guessed_as_symbols(self):
+        # Exact strings (CLI flags, config keys, error messages) go to a TEXT
+        # search (Grep / one scoped rg), NOT to LSP symbol search. Serena has no
+        # text-search tool (there is no search_for_pattern in the installed serena
+        # and none is granted), so the persona must say so and point to Grep/rg.
         t = load_navigation_order_text().lower()
-        self.assertIn("exact cli flag", t)
-        self.assertIn("search_for_pattern", t)
+        self.assertIn("exact string", t)
+        self.assertIn("serena has no text search", t)
         self.assertIn("lsp symbol search is not a text search", t)
         self.assertIn("stop when every edge", t)
+        # The phantom tool must not be advertised in the persona.
+        self.assertNotIn("search_for_pattern", t)
 
     def test_web_only_for_external_facts(self):
         t = load_navigation_order_text().lower()

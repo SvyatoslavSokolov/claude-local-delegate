@@ -27,6 +27,20 @@ tools are excluded. Keeping both separate from the delegation server matters: de
 are denied the recursive delegation MCP, but retain the map router plus Serena's
 read-only tools. Bash remains available.
 
+## Documentation map
+
+| File | What it is |
+|---|---|
+| [README.md](README.md) | This file — overview, install, usage, safety. |
+| [README_INSTALL_RU.md](README_INSTALL_RU.md) | **Russian** install walkthrough, step by step, in order. |
+| [REQUIREMENTS.md](REQUIREMENTS.md) | The contract: runtime deps, the repository-structure rules, and the analytics quality bar. |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | How the pieces fit, why the layout is flat (not a package), the delegation lifecycle, state on disk. |
+| [docs/ANALYTICS.md](docs/ANALYTICS.md) | The "improve the pipeline" loop: `contrib/report.py`, the flat pandas CSV, thresholds. |
+| [ARCHITECT_BRIEF.md](ARCHITECT_BRIEF.md) | Low-context supervisor path (read this instead of the full references on every turn). |
+| [COORDINATION.md](COORDINATION.md) / [TASK_DESIGN.md](TASK_DESIGN.md) / [SUPERVISION.md](SUPERVISION.md) | Coordination, task-design, and supervision references. |
+| [MIGRATION_AND_USAGE_RU.md](MIGRATION_AND_USAGE_RU.md) | **Russian** migration to another machine + daily usage. |
+| [HARNESS_ARCHITECTURE.md](HARNESS_ARCHITECTURE.md) | **Normative standard**: tiered multi-agent orchestration, context-loss prevention, and deterministic oracle loops. |
+
 For the low-context supervisor path, read [ARCHITECT_BRIEF.md](ARCHITECT_BRIEF.md)
 instead of loading the full coordination and task-design references on every turn.
 `project_sync` returns every unfinished task for the exact requested repository,
@@ -243,6 +257,39 @@ separate process using its own `--settings` file (pointed at a local
 gateway), not a shared LLM gateway sitting in front of your main session —
 which would otherwise disable subscription billing for *all* traffic through
 it, including your main model.
+
+## Tier 1 Gemini Architect & Hierarchical Multi-Agent Tree
+
+In addition to direct local workers, the harness supports a **3-tier hierarchical architecture**:
+1. **Tier 2 (Claude Supervisor / Opus):** High-level decomposition and review.
+2. **Tier 1 (Google Gemini Architect):** Background `claude --bg` session running on Gemini (via LiteLLM on the vLLM server). Reads repository context, explores codebase topology via `code-nav` and Serena LSP, creates atomic subtask specifications, and delegates mechanical work to local workers.
+3. **Tier 0 (Local Workers on 4x RTX 3090):** High-throughput local Qwen 27B workers performing bounded edits and running test checks.
+
+### Spawning an Architect
+- **Via dedicated tool:** `delegate_to_architect(task="Explore module and prepare atomic edits", cwd="...")`
+- **Via profile parameter:** `delegate_to_local(task="...", profile="architect")`
+The Architect session runs with the persona `~/.claude/agents/gemini-architect.md` and uses `~/.claude/gemini.delegate.settings.json`. It is granted access to `delegate_to_local` so it can dispatch tasks down to Tier 0 workers. Child workers automatically record the Architect's `run_id` as their `parent_id`.
+
+### Single Pane of Glass: Live Tree Monitor
+Inspect the entire multi-agent tree from a single point of entry:
+- **From Claude Code (MCP tool):** Call `show_agent_tree()` to get a real-time snapshot.
+- **From terminal (live watch mode):**
+  ```bash
+  python3 tree_monitor.py --watch
+  ```
+- **From scripts:** `python3 tree_monitor.py --json`
+
+```text
+👑 TIER 2: CLAUDE SUPERVISOR (Opus / Main Session)
+  ├── 🧠 TIER 1: GEMINI ARCHITECT [c4d9a1f2] (gemini-3.1-flash-lite) - WORKING (14.2s)
+  │      Name: refactor-auth-architecture
+  │      ├── 🔨 TIER 0: WORKER [aa46976f] (Qwen-27B) - WORKING (8.1s)
+  │      │      Task: write-auth-migration
+  │      └── 🔨 TIER 0: WORKER [bb000002] (Qwen-27B) - DONE (24.0s)
+  │             Task: test-auth-migration
+  └── 🔨 TIER 0: DIRECT WORKER [d26c0a4c] (Qwen-27B) - SETTLED
+         Task: audit-run-launch
+```
 
 ## Async by design
 

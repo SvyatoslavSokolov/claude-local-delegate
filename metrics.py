@@ -196,3 +196,120 @@ def transcript_stats(path):
         "tool_calls": len(tool_use_ids) + tool_use_no_id,
         "duration_s": round(duration_s, 2),
     }
+
+
+# ---------------------------------------------------------------------------
+# Shared readers for the delegation history. report.py (and any future
+# analytics tool) imports these instead of re-parsing the state dir, so the
+# ledger/verified/batch formats live in exactly one place. All readers are
+# read-only and tolerate a missing dir/file (they return an empty structure,
+# never raise).
+# ---------------------------------------------------------------------------
+
+def percentile(values, p):
+    """Deterministic nearest-rank percentile. None for empty input."""
+    if not values:
+        return None
+    import math
+    ordered = sorted(values)
+    rank = int(math.ceil(p / 100.0 * len(ordered)))
+    rank = max(1, min(len(ordered), rank))
+    return ordered[rank - 1]
+
+
+def load_ledger(state_dir):
+    """Join the metrics ledger by run_id.
+
+    Returns {run_id: {"spawn": dict|None, "rate": dict|None,
+                      "blocked": [dict, ...], "n_blocked": int}} for every run
+    seen. "spawn" is the first spawn event; "rate" is the LAST rate event
+    (a run is rated once, but a re-rate would win); "blocked" collects every
+    blocked event in order. Tolerates blank/garbage lines and a missing file
+    (returns {}).
+    """
+    path = os.path.join(state_dir, "metrics.jsonl")
+    if not os.path.exists(path):
+        return {}
+    runs = {}
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            run_id = event.get("run_id")
+            if not run_id:
+                continue
+            entry = runs.setdefault(run_id, {"spawn": None, "rate": None,
+                                             "blocked": [], "n_blocked": 0})
+            kind = event.get("event")
+            if kind == "spawn" and entry["spawn"] is None:
+                entry["spawn"] = event
+            elif kind == "rate":
+                entry["rate"] = event  # later rate wins
+            elif kind == "blocked":
+                entry["blocked"].append(event)
+                entry["n_blocked"] += 1
+    return runs
+
+
+def load_verified(state_dir):
+    """Read every verified/ work->check->revise cycle.
+
+    Returns {vid: dict} where dict carries the on-disk fields (phase,
+    iteration, current_worker_id, final_answer, failure_report, coordination_task_id,
+    ...). The on-disk values are JSON-decoded (so None/ints come back as real
+    values, not the strings 'None'/'3'). Missing dir -> {}.
+    """
+    base = os.path.join(state_dir, "verified")
+    out = {}
+    if not os.path.isdir(base):
+        return out
+    for name in os.listdir(base):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(base, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            out[data.get("vid") or name[:-5]] = data
+    return out
+
+
+def load_batches(state_dir):
+    """Read every fan_out batch.
+
+    Returns {batch_id: {"agent_ids": [str, ...], "created_at": float|None}}.
+    A batch is considered successful when it has at least one agent. Missing
+    dir -> {}.
+    """
+    base = os.path.join(state_dir, "batches")
+    out = {}
+    if not os.path.isdir(base):
+        return out
+    for name in os.listdir(base):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(base, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        batch_id = data.get("batch_id") or name[:-5]
+        agents = data.get("agent_ids") or []
+        out[batch_id] = {
+            "agent_ids": [a for a in agents if isinstance(a, str)],
+            "created_at": parse_timestamp(data.get("created_at")),
+        }
+    return out

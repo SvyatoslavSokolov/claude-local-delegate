@@ -92,6 +92,10 @@ SERVER_VERSION = "0.8.0"
 # if the slim one isn't present.
 SLIM_SETTINGS_PATH = os.path.expanduser("~/.claude/vllm.delegate.settings.json")
 FALLBACK_SETTINGS_PATH = os.path.expanduser("~/.claude/vllm.settings.json")
+DEFAULT_GEMINI_SETTINGS_PATH = os.environ.get(
+    "CLAUDE_GEMINI_DELEGATE_SETTINGS",
+    os.path.expanduser("~/.claude/gemini.delegate.settings.json"),
+)
 
 
 def _default_settings_path():
@@ -112,7 +116,21 @@ def _default_settings_path():
 # delegation needs a write reservation (see README) and callers that only need
 # lookup pass an explicit read-only subset (DEFAULT_READ_ONLY_TOOLS).
 DEFAULT_ALLOWED_TOOLS = ("Read,Grep,Glob,Edit,Write,Bash,WebSearch,WebFetch,"
-                         "LSP,NotebookRead,NotebookEdit")
+                         "LSP,NotebookRead,NotebookEdit,Skill,SendMessage,"
+                         "ListAgents,TodoWrite,ReportFindings,ScheduleWakeup,"
+                         "WaitForMcpServers,EnterWorktree,ExitWorktree,"
+                         "CronCreate,CronDelete,CronList")
+# AskUserQuestion and EnterPlanMode are deliberately NOT in this list even
+# though "grant everything except recursion" is the goal: both render an
+# interactive picker/approval gate with no human attached to a `claude --bg`
+# session, so granting them would just hang the run rather than deliver an
+# answer. The actual ask-the-parent path for an unattended delegate is
+# SendMessage (granted above) plus DEFAULT_ANNOUNCE_PLAN=1 below: the
+# delegate narrates and pings the parent, which answers via SendMessage while
+# the agent sits `blocked` (see the module docstring's "RECOVERING A
+# DRIFTING AGENT" section). Agent/Task (the recursion vector) are excluded
+# unconditionally regardless of this list -- see DELEGATION_BLOCKED_TOOLS and
+# the mcp__claude-local-delegate disallow in _spawn_native_agent.
 # Intrinsically read-only built-ins: they change nothing on the machine, so a
 # delegation whose whole allowlist is these is safe to run in dontAsk (where
 # the allowlist is enforced) instead of bypassPermissions. WebSearch/WebFetch
@@ -137,7 +155,6 @@ SERENA_READ_ONLY_MCP_TOOLS = (
     "mcp__serena__find_declaration",
     "mcp__serena__find_implementations",
     "mcp__serena__get_diagnostics_for_file",
-    "mcp__serena__search_for_pattern",
     "mcp__serena__list_memories",
     "mcp__serena__read_memory",
 )
@@ -227,15 +244,111 @@ READ_ONLY_PERMISSION_MODE = os.environ.get(
     "CLAUDE_LOCAL_DELEGATE_READONLY_PERMISSION_MODE", "dontAsk",
 )
 
-# vLLM concurrency ceiling from this stack (--max-num-seqs). Not enforced here;
-# fan_out_to_local only warns past it (see README).
-LOCAL_SERVER_MAX_CONCURRENCY = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY", "16"))
+# Local-delegation concurrency ceiling (--max-num-seqs / shared KV-cache pool).
+# The overload evidence (stream failures once ~6 local runs share the pool) makes
+# 6 the default, matching the requested "up to six parallel local sessions". It is
+# ENFORCED for every new local launch (single and fan-out): a full pool is a clear
+# overload response, never a silent queue and never a kill -- running sessions are
+# never terminated just because the ceiling changed. Override with a validated
+# positive integer via CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY (invalid/0/negative
+# fall back to the default, so the limit can never be disabled or inverted).
+DEFAULT_MAX_CONCURRENCY = 6
+
+
+def _parse_max_concurrency(raw, default=DEFAULT_MAX_CONCURRENCY):
+    """Validate the CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY override: a positive
+    integer, else the default. 0/negative/invalid are rejected (they would either
+    allow unlimited spawns or admit nothing), not silently accepted."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 1 else default
+
+
+LOCAL_SERVER_MAX_CONCURRENCY = _parse_max_concurrency(
+    os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY"),
+)
+
+# ---- turn-cap safety ceiling (runaway-turn watchdog) -------------------------
+# A prior forensic audit of long local runs found runaway loops with 41-61 model
+# turns (45-64 tool calls) and ZERO long tool-free runs -- the drift is in the
+# tool-loop, not in one big generation. The invoked CLI (`claude --bg`) exposes
+# NO max-turns / max-tool-calls flag (verified against `claude --help`), so the
+# cap cannot be a launch flag: it is enforced supervisor-side (see
+# _turn_guard_check) by watching the run's model-turn count and SIGTERM-ing a
+# run that EXCEEDS it. This stops the observed >40-turn drift while leaving
+# ordinary tool use untouched -- a run is allowed up to 40 turns and is stopped
+# at 41, the shortest observed runaway. 0 (or a non-integer) disables the guard;
+# a value < 1 is clamped back to the default. Override through the same
+# CLAUDE_LOCAL_DELEGATE_* env pattern as every other ceiling; it does not touch
+# --allowedTools/--tools.
+def _parse_max_turns(raw, default=40):
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+DEFAULT_MAX_TURNS = _parse_max_turns(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_TURNS"), 40)
+
+# Repeat-call watchdog: kills a run the moment it issues the SAME tool call
+# (name + exact args) this many times in a row, well before it could ever
+# reach DEFAULT_MAX_TURNS. This is the server-side backstop the local-worker
+# persona's "LOOP-BREAK RULE" alone could not guarantee on a 27B model (see
+# .serena/memories/local-worker-choke-root-cause.md): the model re-issues an
+# identical grep/find/sed/WebFetch dozens of times, and each repeat is one
+# more full turn of growing context, so catching it at 4 repeats instead of
+# waiting for the 40-turn cap saves most of the wasted context and wall time.
+# 0 disables the check.
+REPEAT_CALL_CAP = _parse_max_turns(os.environ.get("CLAUDE_LOCAL_DELEGATE_REPEAT_CALL_CAP"), 4)
+
+
+def _repeat_streak(tool_calls):
+    """Length of the run of identical (name, args-json) calls at the END of
+    tool_calls. [] or a single call -> 0."""
+    if len(tool_calls) < 2:
+        return 0
+    last = tool_calls[-1]
+    n = 0
+    for call in reversed(tool_calls):
+        if call != last:
+            break
+        n += 1
+    return n
+
+# ---- stop escalation grace period --------------------------------------------
+# After signalling a stopped session the supervisor must wait for it to SETTLE
+# before deciding the signal was not enough (and before escalating). A native
+# `claude --bg` session settles in ~10-15s; 5s is the minimum that is still a
+# real grace (the runaway-respawn case -- the session reappears under a
+# different PID after the first signal -- is caught by the re-discovery after
+# the wait, not by making the wait longer). Override with a validated
+# non-negative number of seconds; invalid values fall back to the default, so
+# the wait can be lengthened but never silently made meaningless.
+DEFAULT_STOP_GRACE_SECONDS = 5.0
+
+
+def _parse_stop_grace(raw, default=DEFAULT_STOP_GRACE_SECONDS):
+    """Validate the CLAUDE_LOCAL_DELEGATE_STOP_GRACE_SECONDS override: a
+    non-negative number of seconds, else the default. Negative/garbage values
+    would either skip the grace entirely or hang the call, so they are
+    rejected, not accepted."""
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+STOP_GRACE_SECONDS = _parse_stop_grace(os.environ.get("CLAUDE_LOCAL_DELEGATE_STOP_GRACE_SECONDS"))
 
 # Result compaction. A fan-out of 8 agents returning their full final answers
 # used to paste all 8 in one tool result; the parent pays for every line of it.
 # Default is a tail plus a sha256 of the full text; `full: true` still returns
 # everything, and the transcript on disk is never truncated.
-DEFAULT_RESULT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_RESULT_LINES", "30"))
+DEFAULT_RESULT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_RESULT_LINES", "60"))
 DEFAULT_FANOUT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_FANOUT_LINES", "15"))
 # A result call may wait inside the MCP process instead of making the paid
 # supervisor take one model turn per status poll. The installer gives this call
@@ -310,6 +423,20 @@ DEFAULT_PERMISSION_MODE = os.environ.get(
     "CLAUDE_LOCAL_DELEGATE_PERMISSION_MODE", "bypassPermissions"
 )
 
+
+def _resolve_cwd(raw_cwd=None):
+    """Resolve and validate working directory.
+    Returns (abs_cwd, err_msg).
+    If raw_cwd is omitted, falls back to CLAUDE_PROJECT_DIR, INIT_CWD, or os.getcwd().
+    Ensures cwd is an existing directory.
+    """
+    candidate = raw_cwd or os.environ.get("CLAUDE_PROJECT_DIR") or os.environ.get("INIT_CWD") or os.getcwd()
+    resolved = os.path.abspath(os.path.expanduser(candidate))
+    if not os.path.isdir(resolved):
+        return None, f"Working directory does not exist or is not a directory: {candidate}"
+    return resolved, None
+
+
 # Optionally prepended when announce_plan=True. It turns the
 # agent into something a parent session can SUPERVISE cheaply: the parent reads
 # only the agent's plain-text messages (watch_delegate strips tool output), so
@@ -317,41 +444,55 @@ DEFAULT_PERMISSION_MODE = os.environ.get(
 # treat a mid-run message as a course-correction. The marker line lets
 # watch_delegate show the real task without this boilerplate.
 SUPERVISION_MARKER = "=== YOUR TASK (everything below is the task) ==="
-SUPERVISED_PREAMBLE = (
-    "SUPERVISED RUN. A parent session is watching you. It sees ONLY your "
-    "plain-text messages -- never your tool calls or their output. So:\n"
-    "  1. FIRST, before any tool call, post a short numbered plan (one line per step).\n"
-    "  2. Before each step: one plain sentence saying what you are about to do.\n"
-    "  3. After each step: one plain sentence on the outcome -- NOT a code or output dump.\n"
-    "  4. Keep messages terse: no pasted code, no file contents, no big tables.\n"
-    "  5. If a new instruction arrives mid-run, it is a course-correction from the "
-    "supervisor: acknowledge it in one line and change course immediately.\n"
-    "  6. Prefer finishing a small task over expanding scope. If the task is bigger "
-    "than ~5 steps, say so in your plan instead of silently doing all of it.\n"
-    "  7. Work IN PLACE at the exact paths you are given. Do NOT create or enter a "
-    "git worktree, do NOT call EnterWorktree, do NOT branch -- if a Write or Edit "
-    "fails, report the real error in one sentence and stop; never 'work around' it "
-    "by relocating the work.\n\n"
-    + SUPERVISION_MARKER + "\n"
-)
+
+
+def _format_preamble(cwd):
+    return (
+        f"SUPERVISED RUN. Project directory: {cwd}.\n"
+        "A parent session is watching you. It sees ONLY your "
+        "plain-text messages -- never your tool calls or their output. So:\n"
+        "  1. FIRST, before any tool call, post a short numbered plan (one line per step).\n"
+        "  2. Before each step: one plain sentence saying what you are about to do.\n"
+        "  3. After each step: one plain sentence on the outcome -- NOT a code or output dump.\n"
+        "  4. Keep messages terse: no pasted code, no file contents, no big tables.\n"
+        "  5. If a new instruction arrives mid-run, it is a course-correction from the "
+        "supervisor: acknowledge it in one line and change course immediately.\n"
+        "  6. Prefer finishing a small task over expanding scope. If the task is bigger "
+        "than ~5 steps, say so in your plan instead of silently doing all of it.\n"
+        "  7. Work IN PLACE in this working directory. Do NOT create or enter a "
+        "git worktree, do NOT call EnterWorktree, do NOT branch. Do NOT run git commit or push.\n\n"
+        + SUPERVISION_MARKER + "\n"
+    )
+
+
+SUPERVISED_PREAMBLE = _format_preamble(".")
 DEFAULT_ANNOUNCE_PLAN = os.environ.get(
-    "CLAUDE_LOCAL_DELEGATE_ANNOUNCE_PLAN", "0"
+    "CLAUDE_LOCAL_DELEGATE_ANNOUNCE_PLAN", "1"
 ).strip().lower() not in ("0", "false", "no", "")
 
 
-# Appended to every delegated task. The parent compacts a final answer longer
-# than DEFAULT_RESULT_LINES, and an elided middle is exactly where a delegate's
-# assumptions and evidence live -- so ask for an answer that fits instead of
-# cutting one that doesn't. This caps the REPORT, never the work: the agent is
-# told explicitly to do the full job and the full verification first.
+# Appended to every delegated task. NOTE: no numeric line cap here (removed
+# 2026-09-16, user instruction: strip artificial limits on the local model).
+# It used to say "write a final message of AT MOST N lines" -- a weak 27B
+# model doing a task that ALSO names a length target (e.g. "shrink this file
+# to ~N lines") repeatedly conflated the two numbers and looped trying to
+# force its file output to satisfy the report's cap. The parent-side display
+# truncation (DEFAULT_RESULT_LINES, in _compact) still keeps what the paid
+# supervisor reads bounded -- that is a display concern, not a model
+# instruction, and the full untruncated answer/transcript is never lost.
 REPORT_CONTRACT = (
     "\n\n=== HOW TO REPORT (does not change the work) ===\n"
+    "This section is ONLY about the one final chat message you send when you are "
+    "done. It has NOTHING to do with any line count, length, or size target that "
+    "is part of the task itself (e.g. 'shrink this file to ~N lines', 'keep the "
+    "diff under N lines'). If the task names a target like that, it applies to "
+    "the FILE/DIFF/OUTPUT you produce, never to this report message.\n"
     "Do the task in full and verify it properly -- run the real check, do not "
     "shorten the work to shorten the report.\n"
-    f"Then write a final message of AT MOST {{max_lines}} lines. Fit it by leaving out "
-    "narration, not substance: no pasted file contents, no command transcripts, no "
-    "restating the task, no summary of what you were going to do.\n"
-    "Those lines must carry, in this order: (1) what you changed, as exact "
+    "Then write a final CHAT MESSAGE summarizing what you did. Leave out "
+    "narration, not substance: no pasted file contents, no command transcripts, "
+    "no restating the task, no summary of what you were going to do.\n"
+    "Carry, in this order: (1) what you changed, as exact "
     "file:line or path per item; (2) the verification you actually ran and its "
     "real result, quoted in one line each; (3) any assumption you made or anything "
     "you could not do. If something failed, say so plainly -- a truthful short "
@@ -398,6 +539,132 @@ def _provenance_for(run_id):
     return _load_provenance().get(run_id)
 
 
+def _resolve_parent_from_token(token):
+    """Map correlation token to the parent agent run_id recorded in provenance."""
+    if not token:
+        return "supervisor"
+    runs = _load_provenance()
+    for rid, entry in runs.items():
+        if isinstance(entry, dict) and entry.get("token") == token:
+            return rid
+    return "supervisor"
+
+
+def _local_pool_usage():
+    """How many local-delegate slots are occupied right now, by the same
+    accounting the ceiling protects: ONLY runs THIS server recorded as local
+    (shared provenance file), not settled, and backed by a LIVE native PID.
+    Claude Code retains old `blocked` records after their processes disappear;
+    those stale records must not freeze the local GPU pool. A paid background session --
+    the supervisor itself, for one -- sits in the native roster but never touches
+    the local GPU, so it does not consume a slot. Returns (active_ids, roster_ok).
+    roster_ok is False when `claude agents --json` could not be read; the caller
+    must then refuse an unaccounted spawn rather than guess."""
+    roster = _agents_json()
+    if roster is None:
+        return [], False
+    recorded = _load_provenance()
+    settled = ("done", "completed", "idle", "failed", "stopped")
+    active = [
+        a.get("id") for a in roster
+        if a.get("kind") == "background"
+        and (a.get("state") or a.get("status")) not in settled
+        and recorded.get(a.get("id"), {}).get("backend") == "local"
+        and _is_live_pid(a.get("pid"))
+    ]
+    return active, True
+
+
+def _admission_error(active_ids):
+    """The clear, non-error-in-spirit overload response for a full local pool.
+    It never kills or queues: it tells the supervisor to retry once a session
+    settles, and makes explicit that already-running sessions are untouched."""
+    return (
+        f"Local pool is full: {len(active_ids)} local delegate(s) already running "
+        f"at the ceiling of {LOCAL_SERVER_MAX_CONCURRENCY} "
+        "(up to six by default; override CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY). "
+        "No new local session was started -- this is an overload response, not a "
+        "queue. Existing runs are NOT stopped. Retry after one settles "
+        "(watch_delegate/check_delegate_status)."
+    )
+
+
+_TURN_GUARD_KILLED = set()  # run_ids already reported as guard-terminated
+
+
+def _turn_guard_check(agent, state, session_id):
+    """Runaway-turn watchdog: if a live delegate's model-turn count exceeds the
+    ceiling, SIGTERM it and return a distinct status note; else None.
+
+    This is the supervisor-side substitute for a `--max-turns` flag, which the
+    invoked `claude --bg` CLI does not have. It is deterministic and side-effect
+    free until the ceiling is actually crossed, so it is safe to run on every
+    status/result poll. The note is phrased so it is unmistakable that the run
+    was stopped BY THIS GUARD -- not a user `stop_delegate`, not a model
+    failure, not a blocked/needs-input state.
+    """
+    run_id = agent.get("id")
+    if (not run_id) or (not session_id) or run_id in _TURN_GUARD_KILLED:
+        return None
+    if state not in ("working", "busy", "unknown"):
+        return None
+    cap = DEFAULT_MAX_TURNS
+    transcript = _find_transcript(session_id)
+    if not transcript:
+        return None
+    summary = _transcript_summary(transcript)
+    turns = summary["turns"]
+
+    repeat_n = _repeat_streak(summary.get("tool_calls") or [])
+    turn_capped = cap > 0 and turns > cap
+    # Allow up to `cap` turns; kill only once the run EXCEEDS it (default 40 is
+    # the observed minimum historical runaway: 41 turns). Independently, kill
+    # on REPEAT_CALL_CAP identical consecutive tool calls -- prompt-only
+    # discipline (the persona's LOOP-BREAK RULE) has repeatedly proven
+    # insufficient on the 27B local model, which re-issues the exact same
+    # grep/find/sed/WebFetch call dozens of times before ever hitting the turn
+    # cap, so this catches the loop far earlier and with a much clearer signal.
+    if not turn_capped and repeat_n < REPEAT_CALL_CAP:
+        return None
+    pid = agent.get("pid")
+    if pid:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, ValueError, OSError):
+            pass
+    _TURN_GUARD_KILLED.add(run_id)
+    reason = "repeat-call" if not turn_capped else "turn-cap"
+    metrics.append_event(STATE_DIR, {
+        "event": "turn-guard",
+        "run_id": run_id,
+        "session_id": session_id,
+        "turns": turns,
+        "cap": cap,
+        "reason": reason,
+        "repeat_streak": repeat_n,
+    })
+    if reason == "repeat-call":
+        return (
+            f"TURN GUARD: agent {run_id} repeated the SAME tool call "
+            f"{repeat_n} times in a row and was terminated with SIGTERM by "
+            "this server's repeat-call watchdog -- this was NOT a user "
+            "stop_delegate, a model failure, or a blocked/needs-input state. "
+            f"The repeat cap is {REPEAT_CALL_CAP} (env "
+            "CLAUDE_LOCAL_DELEGATE_REPEAT_CALL_CAP, 0 disables). The "
+            f"transcript remains readable via get_delegate_result({run_id!r}); "
+            "re-delegate a sharper, smaller task to continue."
+        )
+    return (
+        f"TURN GUARD: agent {run_id} hit {turns} model turns (safety ceiling is "
+        f"{cap}) and was terminated with SIGTERM by this server's runaway-turn "
+        "watchdog -- this was NOT a user stop_delegate, a model failure, or a "
+        f"blocked/needs-input state. The turn cap is "
+        f"CLAUDE_LOCAL_DELEGATE_MAX_TURNS (0 disables). The transcript remains "
+        f"readable via get_delegate_result({run_id!r}); re-delegate a sharper, "
+        "smaller task to continue."
+    )
+
+
 def _settings_fingerprint(path):
     try:
         with open(path, "rb") as f:
@@ -436,13 +703,14 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
                         resume_session=None,
                         profile=None, spawn_model=None,
                         complexity=None, est_minutes=None, blocks=None,
-                        task_id=None, task_key=None):
-    """Spawn ONE native `claude --bg` agent on the local model.
+                        task_id=None, task_key=None, settings_override=None,
+                        role="worker", token=None):
+    """Spawn ONE native `claude --bg` agent on the local model or specified settings profile.
 
     Returns (short_id, None) on success or (None, error_message).
     The agent's working directory is `cwd` (the --bg session runs in the
     shell's cwd, exactly as `claude agents --json` reports it). --settings
-    carries the vLLM profile through to the backgrounded session, which is the
+    carries the profile through to the backgrounded session, which is the
     documented way to point dispatched sessions at a different gateway.
 
     permission_mode defaults to DEFAULT_PERMISSION_MODE (bypassPermissions)
@@ -450,10 +718,6 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     above the constant).
 
     disallowed_tools (comma-separated, e.g. "Bash") is passed as --disallowedTools
-    to strip tools from the agent. Useful against user-level hooks/gates: a
-    delegated agent that would reach for Bash can be forced to a Write-only
-    path by disallowing Bash, sidestepping any Bash PreToolUse gate it can't
-    satisfy on its own.
 
     agent (a subagent-definition name) is passed as --agent, applying that
     persona's system prompt/body to the delegated session. None -> no --agent.
@@ -461,7 +725,7 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     MCP servers (web capability) come from user scope, not per-spawn flags --
     see the note above DEFAULT_PERMISSION_MODE and the recursion guard below.
     """
-    settings_path = _default_settings_path()
+    settings_path = settings_override or _default_settings_path()
     if not os.path.isfile(settings_path):
         return None, (
             f"Local settings file not found: {settings_path}. "
@@ -475,14 +739,43 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     for nav_tool in NAVIGATION_MCP_TOOLS:
         if nav_tool not in tools:
             tools.append(nav_tool)
+    # Mutating Serena tools (symbol rename/edit/delete, memory write, shell
+    # exec, ...) are granted by default too -- "everything except recursion".
+    # The read-only path below still explicitly denies all of these, so a
+    # caller-requested lookup-only delegation stays genuinely read-only.
+    for serena_tool in SERENA_MUTATING_MCP_TOOLS:
+        if serena_tool not in tools:
+            tools.append(serena_tool)
     disallowed = [t.strip() for t in (disallowed_tools or "").split(",") if t.strip()]
-    # Recursion guard (native analogue of the old ROLE=child): a delegated agent
-    # is unattended, so strip the spawner MCP itself. It is registered at
-    # USER SCOPE (so every fresh `claude --bg` loads it), which means without
-    # this guard a delegated agent could call delegate_to_local and spawn further
-    # delegations unboundedly. Disallow the whole claude-local-delegate server.
-    if "mcp__claude-local-delegate" not in disallowed:
-        disallowed.append("mcp__claude-local-delegate")
+
+    if role == "architect":
+        # Tier 1 Architect can delegate to local workers, but cannot recursively delegate to architects
+        for rec_tool in ("mcp__claude-local-delegate__delegate_to_architect", "mcp__claude-local-delegate__delegate_to_agy"):
+            if rec_tool not in disallowed:
+                disallowed.append(rec_tool)
+        for del_tool in (
+            "mcp__claude-local-delegate__delegate_to_local",
+            "mcp__claude-local-delegate__wait_for_delegate",
+            "mcp__claude-local-delegate__get_delegate_result",
+            "mcp__claude-local-delegate__check_delegate_status",
+            "mcp__claude-local-delegate__watch_delegate",
+            "mcp__claude-local-delegate__stop_delegate",
+            "mcp__claude-local-delegate__delegate_verified",
+            "mcp__claude-local-delegate__task_claim",
+            "mcp__claude-local-delegate__task_release",
+            "mcp__claude-local-delegate__task_list",
+            "mcp__claude-local-delegate__show_agent_tree",
+        ):
+            if del_tool not in tools:
+                tools.append(del_tool)
+    else:
+        # Recursion guard (native analogue of the old ROLE=child): a delegated agent
+        # is unattended, so strip the spawner MCP itself. It is registered at
+        # USER SCOPE (so every fresh `claude --bg` loads it), which means without
+        # this guard a delegated agent could call delegate_to_local and spawn further
+        # delegations unboundedly. Disallow the whole claude-local-delegate server.
+        if "mcp__claude-local-delegate" not in disallowed:
+            disallowed.append("mcp__claude-local-delegate")
     # Least privilege that actually holds: an allowlist is only enforced outside
     # bypassPermissions, so a read-only delegation runs in dontAsk (see the
     # READ_ONLY_PERMISSION_MODE note). Writers still default to bypass, because
@@ -506,11 +799,11 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     # Wrap the task so the delegated agent narrates its plan/steps in plain text
     # (what watch_delegate surfaces to the parent). announce_plan=None -> default.
     want_plan = DEFAULT_ANNOUNCE_PLAN if announce_plan is None else bool(announce_plan)
-    effective_task = (SUPERVISED_PREAMBLE + task) if want_plan else task
+    effective_task = (_format_preamble(cwd) + task) if want_plan else (f"[PROJECT CWD: {cwd}]\n\n" + task)
     # The checker opts out: its final message has a mandatory VERDICT shape of its
     # own, and a second, later "how to report" block would displace it.
     if report_contract:
-        effective_task += REPORT_CONTRACT.format(max_lines=DEFAULT_RESULT_LINES)
+        effective_task += REPORT_CONTRACT
 
     from local_backend import environment, profile as _backend_profile  # 'profile' is taken by the param
     try:
@@ -528,6 +821,11 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
                     "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
                     "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
             backend_env[var] = spawn_model
+
+    if role == "architect":
+        backend_env["CLAUDE_LOCAL_DELEGATE_ROLE"] = "architect"
+        if token:
+            backend_env["CLAUDE_LOCAL_DELEGATE_PARENT_TOKEN"] = token
 
     cmd = [
         CLAUDE_BIN, "--settings", settings_path, "--bg",
@@ -587,9 +885,15 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
 
     short_id = _parse_bg_id(out)
     if short_id:
+        caller_token = os.environ.get("CLAUDE_LOCAL_DELEGATE_PARENT_TOKEN")
+        parent_id = _resolve_parent_from_token(caller_token) if caller_token else "supervisor"
+        backend_type = "gemini" if (role == "architect" or "gemini" in settings_path.lower()) else "local"
         _record_provenance(short_id, {
             "at": time.time(),
-            "backend": "local",
+            "backend": backend_type,
+            "role": role,
+            "token": token,
+            "parent_id": parent_id,
             "model": model,
             "base_url": backend_env.get("ANTHROPIC_BASE_URL", ""),
             "settings_path": settings_path,
@@ -601,6 +905,7 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
             "name": name,
             "profile_requested": profile,
             "profile_effective": profile,
+            "max_turns": DEFAULT_MAX_TURNS,
         })
         # Planning metadata for the delegation metrics ledger (best-effort; it
         # never breaks a spawn). The matching "rate" event is written by
@@ -611,6 +916,9 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
             "task_id": task_id,
             "task_key": task_key,
             "name": name,
+            "role": role,
+            "parent_id": parent_id,
+            "backend": backend_type,
             "complexity": complexity,
             "est_minutes": est_minutes,
             "blocks": blocks or [],
@@ -815,6 +1123,7 @@ def _transcript_summary(transcript_path):
 
     prompt = None
     lines = []
+    tool_calls = []
     inp = out = turns = 0
     step = 0
     for e in _iter_events(transcript_path):
@@ -844,15 +1153,16 @@ def _transcript_summary(transcript_path):
                 step += 1
                 lines.append(f"[{step}] {item['text'].strip()}")
             elif item.get("type") == "tool_use":
-                raw = json.dumps(item.get("input", {}), ensure_ascii=False)
-                if len(raw) > 140:
-                    raw = raw[:140] + "\u2026"
+                full_raw = json.dumps(item.get("input", {}), ensure_ascii=False, sort_keys=True)
+                tool_calls.append((item.get("name"), full_raw))
+                raw = full_raw if len(full_raw) <= 140 else full_raw[:140] + "\u2026"
                 lines.append(f"      \u00b7 {item.get('name')} {raw}")
         if len(lines) > _DIGEST_KEEP * 2:
             del lines[:-_DIGEST_KEEP]
 
     summary = {"prompt": prompt, "digest": lines[-_DIGEST_KEEP:],
-               "input": inp, "output": out, "turns": turns}
+               "input": inp, "output": out, "turns": turns,
+               "tool_calls": tool_calls[-32:]}
     if key is not None:
         if len(_SUMMARY_CACHE) >= _SUMMARY_CACHE_MAX:
             _SUMMARY_CACHE.clear()
@@ -928,6 +1238,13 @@ _BLOCK_SIGNATURES = (
 )
 
 
+# run_ids whose current `blocked` episode is already in the metrics ledger.
+# check_status runs on every poll, but we want ONE blocked event per blocked
+# episode (not one per poll). The set is cleared when a run leaves `blocked`,
+# so a later re-block records a fresh episode.
+_BLOCKED_RECORDED = set()
+
+
 def _classify_blocked(agent, transcript_path):
     """Return (category, last_words) describing why a `blocked` agent is parked.
     Preference: the native roster `waitingFor` field (Claude Code's own call) is
@@ -961,8 +1278,22 @@ def start_delegate(args):
     if not task or not isinstance(task, str):
         return _error_result("`task` is required and must be a non-empty string.")
 
+    if args.get("profile") == "architect":
+        return start_architect_delegate(args)
+
+    # Concurrency-ceiling admission gate REMOVED (2026-09-16, user request): it
+    # counted a `blocked` (paused, waiting on a reply -- zero live vLLM
+    # inference) session as occupying a slot exactly like a `working` one, so a
+    # backlog of blocked delegates from an unrelated project could report the
+    # pool "full" while the GPU sat idle. Rather than special-case one more
+    # state, the whole admission refusal is gone: a new local launch is never
+    # blocked here. LOCAL_SERVER_MAX_CONCURRENCY / _local_pool_usage /
+    # _admission_error are kept for status reporting elsewhere, just no longer
+    # wired to refuse a spawn.
     allowed_tools = args.get("allowed_tools") or DEFAULT_ALLOWED_TOOLS
-    cwd = args.get("cwd") or os.getcwd()
+    cwd, cwd_err = _resolve_cwd(args.get("cwd"))
+    if cwd_err:
+        return _error_result(cwd_err)
     name = args.get("name") or _slug_from_task(task)
     permission_mode = args.get("permission_mode")
     disallowed_tools = args.get("disallowed_tools")
@@ -1006,6 +1337,68 @@ def start_delegate(args):
                 f"mid-run SendMessage; use SendMessage only to answer it when it is `blocked`.\n"
                 f"After review call rate_delegate(run_id, quality, worth_it)."
             ),
+        }],
+        "isError": False,
+    }
+
+
+def start_architect_delegate(args):
+    task = args.get("task")
+    if not task or not isinstance(task, str):
+        return _error_result("`task` is required and must be a non-empty string.")
+    allowed_tools = args.get("allowed_tools")
+    cwd, cwd_err = _resolve_cwd(args.get("cwd"))
+    if cwd_err:
+        return _error_result(cwd_err)
+    name = args.get("name") or ("gemini-architect-" + _slug_from_task(task))
+    permission_mode = args.get("permission_mode")
+    disallowed_tools = args.get("disallowed_tools")
+    agent = args.get("agent") or "gemini-architect"
+    announce_plan = args.get("announce_plan")
+    complexity = args.get("complexity")
+    est_minutes = args.get("est_minutes")
+    blocks = args.get("blocks")
+    task_id = args.get("task_id")
+
+    settings_path = os.environ.get(
+        "CLAUDE_GEMINI_DELEGATE_SETTINGS",
+        DEFAULT_GEMINI_SETTINGS_PATH,
+    )
+    if not os.path.isfile(settings_path):
+        return _error_result(
+            f"Gemini settings file not found: {settings_path}. "
+            "Ensure ~/.claude/gemini.delegate.settings.json exists."
+        )
+
+    import uuid
+    token = uuid.uuid4().hex[:8]
+    _kw = {
+        "profile": "architect",
+        "role": "architect",
+        "settings_override": settings_path,
+        "token": token,
+        "complexity": complexity,
+        "est_minutes": est_minutes,
+        "blocks": blocks,
+        "task_id": task_id,
+    }
+    short_id, err = _spawn_native_agent(
+        task, allowed_tools, cwd, name, permission_mode, disallowed_tools, agent,
+        announce_plan, **_kw,
+    )
+    if err:
+        return _error_result(err)
+
+    return {
+        "content": [{
+            "type": "text",
+            "text": (
+                f"Spawned Tier 1 Gemini Architect in claude --bg. agent id: {short_id}\n"
+                f"Routes to Google Gemini via LiteLLM. Role: architect, Parent: supervisor.\n"
+                f"Call get_delegate_result({short_id!r}, wait_seconds={MAX_RESULT_WAIT_SECONDS}) to wait for completion.\n"
+                f"Use watch_delegate({short_id!r}) or check_delegate_status({short_id!r}) for diagnostics.\n"
+                f"Call show_agent_tree to inspect the live multi-agent hierarchy."
+            )
         }],
         "isError": False,
     }
@@ -1085,11 +1478,18 @@ def check_status(args):
     state = agent.get("state") or agent.get("status") or "unknown"
     session_id = agent.get("sessionId") or ""
 
+    # Runaway-turn watchdog (supervisor-side; the CLI has no max-turns flag).
+    # If this run crossed the ceiling, it has just been SIGTERMed; surface that
+    # distinct reason so the parent is not misled into calling it a model error.
+    guard_note = _turn_guard_check(agent, state, session_id)
+
     text = (
         f"agent {agent.get('id')}: native state = {state}\n"
         f"  cwd: {agent.get('cwd')}\n"
         f"  session: {session_id}"
     )
+    if guard_note:
+        text += "\n" + guard_note
 
     # Cheap always-on supervision: the task it was given, its last plain sentence,
     # and tokens burned so far -- so "watch them always" costs almost nothing.
@@ -1129,6 +1529,19 @@ def check_status(args):
     if state == "blocked":
         tr = _find_transcript(session_id) if session_id else None
         category, waiting_for, last_words = _classify_blocked(agent, tr)
+        # Persist the blocked category ONCE per blocked episode so the analytics
+        # report (contrib/report.py) can aggregate it. check_status polls, so
+        # dedup on run_id; the set is cleared below when the run leaves blocked.
+        run_id = agent.get("id")
+        if run_id and run_id not in _BLOCKED_RECORDED:
+            _BLOCKED_RECORDED.add(run_id)
+            metrics.append_event(STATE_DIR, {
+                "event": "blocked",
+                "run_id": run_id,
+                "category": category,
+                "waiting_for": waiting_for,
+                "session_id": session_id,
+            })
         detail = f"  reason: {category}"
         if waiting_for:
             detail += f" (native waitingFor: {waiting_for!r})"
@@ -1141,6 +1554,9 @@ def check_status(args):
             "instead of a message: mcp-tool-missing (check ~/.claude.json), "
             "websearch-broken (use the curl fallback), hook-gate (use the slim profile)."
         )
+    elif state != "blocked":
+        # Left the blocked episode: allow a future re-block to record a fresh event.
+        _BLOCKED_RECORDED.discard(agent.get("id"))
 
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
@@ -1253,8 +1669,13 @@ def get_result(args):
         return check_status({"run_id": handle})
 
     # Still working? Don't hand back a partial answer -- unless the transcript
-    # already proves termination (the roster lags the transcript).
+    # already proves termination (the roster lags the transcript). First check
+    # the runaway-turn watchdog: if the run crossed the ceiling we just stopped
+    # it, so report the guard termination instead of "still working".
     if state in ("working", "busy", "unknown"):
+        guard_note = _turn_guard_check(agent, state, session_id)
+        if guard_note:
+            return {"content": [{"type": "text", "text": guard_note}], "isError": False}
         inferred = _inferred_final_reply(agent, state)
         if inferred is not None:
             return inferred
@@ -1364,14 +1785,143 @@ def watch_delegate(args):
     return {"content": [{"type": "text", "text": body}], "isError": False}
 
 
+def _is_live_pid(pid):
+    """True if a process with this PID is still alive (probe with signal 0).
+    PermissionError means the pid EXISTS (owned by another user) -> live.
+    Garbage (non-numeric) pids are never 'live': they cannot be signalled at
+    all, and treating them as live would loop the escalation forever."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _discover_session_pids(session_id):
+    """Re-discover the LIVE process(es) of a session RIGHT NOW, by exact
+    session id only. A stored roster PID is NOT reliable for a stopped
+    runaway: the observed case reappeared under a different
+    `claude bg-pty-host` / `claude --resume` PID after the first signal, so
+    every escalation step re-discovers instead of trusting an old pid.
+    Matching is an EXACT sessionId comparison -- never a name, pattern, or
+    prefix -- so a different session can never be targeted."""
+    pids = []
+    if not session_id:
+        return pids
+    settled = ("done", "completed", "idle", "failed", "stopped")
+    roster = _agents_json(include_completed=True)
+    for a in (roster or []):
+        if str(a.get("sessionId", "")) != session_id:
+            continue
+        if (a.get("state") or a.get("status")) in settled:
+            continue
+        pid = a.get("pid")
+        ipid = int(pid) if isinstance(pid, int) else None
+        if ipid is None:
+            try:
+                ipid = int(str(pid).strip())
+            except (TypeError, ValueError):
+                continue
+        if ipid not in pids and _is_live_pid(ipid):
+            pids.append(ipid)
+    return pids
+
+
+def _signal_pids(pids, sig):
+    """Send `sig` to each pid; return the subset actually signalled.
+    ProcessLookupError (gone between discovery and signal) is expected and
+    swallowed; it is proof of non-liveness, not a failure."""
+    signalled = []
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+            signalled.append(pid)
+        except ProcessLookupError:
+            continue
+        except (PermissionError, ValueError, OSError) as exc:
+            raise RuntimeError(f"Could not signal pid {pid}: {exc}")
+    return signalled
+
+
+def _stop_escalate(agent, handle, mode):
+    """Escalating, PROVEN stop for one session. Policy:
+
+    1. Graceful first signal -- SIGINT for mode 'interrupt' (ask it to drop
+       the current step), SIGTERM for mode 'terminate' (end the run) -- to
+       every live pid of the session (roster pid + fresh re-discovery).
+    2. Wait STOP_GRACE_SECONDS, then RE-DISCOVER live pids by exact session
+       id. Escalation applies ONLY when still alive.
+    3. SIGTERM the still-live pids; wait; re-discover.
+    4. SIGKILL the still-live pids; wait; re-discover.
+    5. Success is claimed only AFTER liveness is proven gone. The terminal
+       result is one of `graceful-stop` (settled after the first signal),
+       `terminated` (needed SIGTERM), `killed` (needed SIGKILL), or
+       `already-settled` (no live process found at all) -- never a claim
+       that "a signal was sent" is enough.
+    """
+    session_id = agent.get("sessionId") or ""
+    run_id = agent.get("id")
+    ladder = ([signal.SIGINT, signal.SIGTERM, signal.SIGKILL]
+              if mode == "interrupt" else [signal.SIGTERM, signal.SIGKILL])
+    labels = {signal.SIGINT: "graceful-stop", signal.SIGTERM: "terminated",
+              signal.SIGKILL: "killed"}
+
+    pids = _discover_session_pids(session_id)
+    if not pids:
+        return {"content": [{"type": "text", "text": (
+            f"agent {handle}: no live process for session {session_id} -- "
+            f"already-settled (roster entry is stale, state "
+            f"{agent.get('state') or agent.get('status')}). Nothing signalled. Read "
+            f"what it produced with get_delegate_result({handle!r})."
+        )}], "isError": False}
+
+    settled_by = None
+    for i, sig in enumerate(ladder):
+        _signal_pids(pids, sig)
+        time.sleep(STOP_GRACE_SECONDS)
+        pids = _discover_session_pids(session_id)
+        if not pids:
+            settled_by = sig
+            break
+    if settled_by is None:
+        return _error_result(
+            f"Could NOT stop agent {handle}: live pid(s) {pids} for session "
+            f"{session_id} survived SIGINT/SIGTERM/SIGKILL. Do not treat this "
+            "session as stopped -- investigate natively (`claude agents`, "
+            "ps) before delegating again."
+        )
+    return {"content": [{"type": "text", "text": (
+        f"agent {handle} stopped -- outcome: {labels[settled_by]}. Signalled "
+        f"{settled_by.name} and VERIFIED liveness is gone: re-discovered pids by "
+        f"exact session id {session_id} after each grace period of "
+        f"{STOP_GRACE_SECONDS}s; none remain (escalation only while still "
+        "alive). The run is not reachable by SendMessage -- course-correct by "
+        f"calling delegate_to_local again with a sharper task; read what it "
+        f"already produced with get_delegate_result({run_id!r})."
+    )}], "isError": False}
+
+
 def stop_delegate(args):
-    """Halt a delegated agent by signalling its process (pid from the native
-    roster). mode 'interrupt' = SIGINT (ask it to drop the current step),
-    'terminate' = SIGTERM (end the run). The agent settles to `done` in ~10-15s
-    and is then NOT reachable by SendMessage -- course-correct by calling
-    delegate_to_local again with a sharper task (the stopped run's transcript
-    stays readable via get_delegate_result).
-    The native equivalent is the TaskStop tool with the agent's name."""
+    """Halt a delegated agent with a PROVEN, session-scoped stop.
+
+    mode 'interrupt' begins with SIGINT (graceful; ask it to drop the current
+    step); mode 'terminate' begins with SIGTERM. After a grace period the
+    session is RE-DISCOVERED by exact session id (a stopped runaway
+    reappears under a different pid, so the stored roster pid alone is
+    unreliable) and escalation (SIGTERM, then SIGKILL) is applied ONLY while
+    it is still live. A terminal result is returned: `graceful-stop`,
+    `terminated`, `killed`, or `already-settled` -- the server never claims a
+    signal was enough before liveness is proven gone, and it never signals a
+    process that does not match the session's exact id.
+    """
     handle = args.get("run_id") or args.get("agent_id")
     if not handle:
         return _error_result("`run_id` (the agent id) is required.")
@@ -1387,7 +1937,6 @@ def stop_delegate(args):
             f"No background agent with id {handle} in `claude agents --json`."
         )
 
-    pid = agent.get("pid")
     state = agent.get("state") or agent.get("status") or "unknown"
     if state in ("completed", "failed", "stopped", "done", "idle"):
         return {"content": [{"type": "text", "text": (
@@ -1407,33 +1956,7 @@ def stop_delegate(args):
                 "signalled -- the roster entry is stale. Read what it produced with "
                 f"get_delegate_result({handle!r})."
             )}], "isError": False}
-    if not pid:
-        return _error_result(
-            f"agent {handle} has no pid in the roster (state {state}). Use the "
-            f"native TaskStop tool with its name instead."
-        )
-
-    sig = signal.SIGINT if mode == "interrupt" else signal.SIGTERM
-    try:
-        os.kill(int(pid), sig)
-    except ProcessLookupError:
-        return {"content": [{"type": "text", "text": (
-            f"agent {handle} (pid {pid}) is already gone."
-        )}], "isError": False}
-    except (PermissionError, ValueError, OSError) as exc:
-        return _error_result(
-            f"Could not signal pid {pid}: {exc}. Use the native TaskStop tool "
-            f"with the agent's name."
-        )
-
-    return {"content": [{"type": "text", "text": (
-        f"Sent {sig.name} to agent {handle} (pid {pid}, was {state}).\n"
-        f"Give it ~10-15s, then check_delegate_status to confirm it is `done`. "
-        f"Then course-correct by calling delegate_to_local again with a sharper task -- "
-        f"read what it already produced with get_delegate_result({handle!r}) and fold "
-        f"anything useful into the new task text. (A stopped agent is not reachable by "
-        f"SendMessage.) If SIGINT did not settle it, retry with mode='terminate'."
-    )}], "isError": False}
+    return _stop_escalate(agent, handle, mode)
 
 
 def _batch_path(batch_id):
@@ -1448,8 +1971,14 @@ def fan_out_to_local(args):
     if not shared_instruction or not isinstance(shared_instruction, str):
         return _error_result("`shared_instruction` is required and must be a non-empty string.")
 
+    # Concurrency-ceiling admission gate REMOVED (2026-09-16, user request) --
+    # same reasoning as delegate_to_local above: `blocked` sessions were
+    # counted as occupying a slot, so an unrelated project's blocked backlog
+    # could refuse a fan-out while the GPU was idle. No longer wired here.
     allowed_tools = args.get("allowed_tools") or DEFAULT_ALLOWED_TOOLS
-    cwd = args.get("cwd") or os.getcwd()
+    cwd, cwd_err = _resolve_cwd(args.get("cwd"))
+    if cwd_err:
+        return _error_result(cwd_err)
     permission_mode = args.get("permission_mode")
     disallowed_tools = args.get("disallowed_tools")
     agent = args.get("agent")  # None -> default persona; "" -> no persona; name -> that persona
@@ -1477,20 +2006,12 @@ def fan_out_to_local(args):
         json.dump({"batch_id": batch_id, "agent_ids": agent_ids,
                    "shared_instruction": shared_instruction, "created_at": time.time()}, f)
 
-    warning = ""
-    if len(items) > LOCAL_SERVER_MAX_CONCURRENCY:
-        warning = (
-            f"\n\nNote: {len(items)} agents spawned, but the local server's concurrency "
-            f"ceiling is {LOCAL_SERVER_MAX_CONCURRENCY} (vLLM --max-num-seqs) and, more "
-            "importantly, its shared KV-cache pool. The extras queue rather than running "
-            "truly in parallel -- correctness is fine, just not full-parallel speed."
-        )
     return {
         "content": [{
             "type": "text",
             "text": (f"Spawned {len(agent_ids)} parallel native agents. batch_id: {batch_id}\n"
                      f"agent ids: {agent_ids}\n"
-                     f"Poll check_fanout_status({batch_id!r}), then get_fanout_result({batch_id!r}).{warning}"),
+                     f"Poll check_fanout_status({batch_id!r}), then get_fanout_result({batch_id!r})."),
         }],
         "isError": False,
     }
@@ -1733,8 +2254,9 @@ def _spawn_verify_checker(state, candidate):
         "END your final message with, on its own line, exactly:\n"
         "  VERDICT: PASS   (if every criterion is met and nothing is broken)\n"
         "  VERDICT: FAIL   (otherwise)\n"
-        "then 1-6 lines of concrete reasons: what you ran, what passed, what failed, "
-        "and for a FAIL the smallest change that would fix it."
+        "then concrete reasons: what you ran, what passed, what failed, "
+        "and for a FAIL the smallest change that would fix it. Keep it to reasons, "
+        "not a transcript dump -- but no fixed line count."
     )
     return _spawn_native_agent(
         task, VERIFY_CHECKER_TOOLS, state["cwd"],
@@ -1874,7 +2396,9 @@ def delegate_verified(args):
     acceptance = args.get("acceptance_criteria")
     if acceptance is not None and not isinstance(acceptance, str):
         return _error_result("`acceptance_criteria`, if given, must be a string.")
-    cwd = args.get("cwd") or os.getcwd()
+    cwd, cwd_err = _resolve_cwd(args.get("cwd"))
+    if cwd_err:
+        return _error_result(cwd_err)
     allowed_tools = args.get("allowed_tools") or DEFAULT_VERIFY_WORKER_TOOLS
     try:
         max_iters = int(args.get("max_iterations") or DEFAULT_MAX_VERIFY_ITERS)
@@ -2010,23 +2534,102 @@ def get_verified_result(args):
     return {"content": [{"type": "text", "text": body}], "isError": True}
 
 
+# ---- agy delegation handlers (Google Antigravity / Gemini) -------------------
+
+_agy_mgr = None
+
+def _get_agy_mgr():
+    global _agy_mgr
+    if _agy_mgr is None:
+        from agy_delegate import AgyDelegateManager
+        _agy_mgr = AgyDelegateManager()
+    return _agy_mgr
+
+
+def start_agy_delegate(args):
+    task = args.get("task")
+    if not task or not isinstance(task, str):
+        return _error_result("`task` is required and must be a non-empty string.")
+    cwd, cwd_err = _resolve_cwd(args.get("cwd"))
+    if cwd_err:
+        return _error_result(cwd_err)
+    model = args.get("model")
+    effort = args.get("effort")
+    conv_id = args.get("conversation_id")
+    try:
+        meta = _get_agy_mgr().spawn(task=task, cwd=cwd, model=model, effort=effort, conversation_id=conv_id)
+        return {
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"Spawned Google Antigravity task. run_id: {meta['run_id']}\n"
+                    f"Model: {meta['model']}, PID: {meta['pid']}\n"
+                    f"Call get_agy_result('{meta['run_id']}', wait_seconds=300) to wait and get the result."
+                )
+            }],
+            "isError": False,
+        }
+    except Exception as e:
+        return _error_result(f"Failed to spawn agy: {e}")
+
+
+def check_agy_status(args):
+    run_id = args.get("run_id")
+    if not run_id:
+        return _error_result("`run_id` is required.")
+    res = _get_agy_mgr().check_status(run_id)
+    return {"content": [{"type": "text", "text": json.dumps(res, indent=2)}], "isError": False}
+
+
+def get_agy_result(args):
+    run_id = args.get("run_id")
+    if not run_id:
+        return _error_result("`run_id` is required.")
+    wait_seconds = args.get("wait_seconds", 300)
+    res = _get_agy_mgr().get_result(run_id, wait_seconds=wait_seconds)
+    status = res.get("status")
+    if status == "completed":
+        conv_id = res.get("conversation_id", "")
+        t_path = res.get("transcript_path") or f"~/.gemini/antigravity-cli/brain/{conv_id}/.system_generated/logs/transcript.jsonl"
+        text = (
+            f"AGY COMPLETED ({res.get('agy_duration', 0):.1f}s)\n"
+            f"Conversation ID: {conv_id}\n"
+            f"Transcript: {t_path}\n"
+            f"Inspect / Resume: agy --conversation {conv_id}\n"
+            f"Usage: {json.dumps(res.get('usage', {}))}\n\n"
+            f"--- RESULT ---\n"
+            f"{res.get('response', '')}"
+        )
+        return {"content": [{"type": "text", "text": text}], "isError": False}
+    elif status == "timeout":
+        return _error_result(f"AGY TIMEOUT: {res.get('error')}")
+    else:
+        return _error_result(f"AGY FAILED ({status}): {res.get('error')}")
+
+
+def stop_agy(args):
+    run_id = args.get("run_id")
+    if not run_id:
+        return _error_result("`run_id` is required.")
+    res = _get_agy_mgr().stop(run_id)
+    return {"content": [{"type": "text", "text": json.dumps(res, indent=2)}], "isError": False}
+
+
 # ---- tool schema (parent side only) ------------------------------------------
 
 PARENT_TOOLS = [
     {
         "name": "delegate_to_local",
         "description": (
-            "Start one native Claude Code background agent on the local model and return "
-            "its id immediately. Give one self-contained, mechanical task; keep architecture "
-            "and final review in the parent. Normal flow: call get_delegate_result once with "
-            f"wait_seconds={MAX_RESULT_WAIT_SECONDS} (this client's ceiling). Use status/watch only for diagnosis. To correct drift, stop and "
-            "re-delegate a tighter task; a running agent reads messages only after its turn."
+            "Start native Claude Code background agent on local model and return "
+            f"its id immediately. Normal flow: get_delegate_result with wait_seconds={MAX_RESULT_WAIT_SECONDS}. "
+            "Use status/watch only for diagnosis. To correct drift, stop and re-delegate."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "task": {"type": "string", "description": "Self-contained task; the agent has no conversation memory."},
-                "allowed_tools": {"type": "string", "description": f"Comma-separated built-in tools granted to the agent (explicit list always wins). Default '{DEFAULT_ALLOWED_TOOLS}' -- a capability-rich WRITER set: navigation (Read/Grep/Glob, LSP), Edit/Write, Bash, WebSearch/WebFetch, notebooks. The subagent-spawning Agent/Task tools are never granted. For a lookup-only run pass the read-only subset, e.g. '{DEFAULT_READ_ONLY_TOOLS}' (no Edit/Write, no Bash) -- but a FULL default run can write, so it needs a write reservation."},
+                "allowed_tools": {"type": "string", "description": "Comma-separated tools granted (default: full writer set). For lookup-only, pass read-only subset."},
                 "cwd": {"type": "string", "description": "Working directory for the agent. Defaults to this server's cwd."},
                 "name": {"type": "string", "description": "Optional display name for the agent (shown in `claude agents`). Defaults to a short slug of the task."},
                 "permission_mode": {"type": "string", "description": f"Native mode. Read-only defaults to '{READ_ONLY_PERMISSION_MODE}'; writers to unattended '{DEFAULT_PERMISSION_MODE}'."},
@@ -2036,7 +2639,7 @@ PARENT_TOOLS = [
                 "complexity": {"type": "string", "enum": list(metrics.COMPLEXITIES), "description": "Expected size of the work. Feeds the schedule/ETA report; trivial/small -> fast profile, medium/large -> think (unless profile is set)."},
                 "est_minutes": {"type": "integer", "minimum": 0, "description": "Estimated wall-clock minutes for this run. Feeds the schedule/ETA report."},
                 "blocks": {"type": "array", "items": {"type": "string"}, "description": "Task keys (from task_claim) that this work blocks. Feeds the schedule/ETA report."},
-                "profile": {"type": "string", "enum": ["fast", "think"], "description": "Model profile. fast = thinking off (and the cheaper FAST_MODEL if configured); think = default. Explicit profile wins over the complexity heuristic."},
+                "profile": {"type": "string", "enum": ["fast", "think", "architect"], "description": "Model profile. fast = thinking off (and the cheaper FAST_MODEL if configured); think = default local; architect = Tier 1 Google Gemini in claude --bg. Explicit profile wins over the complexity heuristic."},
             },
             "required": ["task"],
         },
@@ -2176,7 +2779,7 @@ PARENT_TOOLS = [
             "properties": {
                 "task": {"type": "string", "description": "Self-contained task with exact paths and completion conditions."},
                 "acceptance_criteria": {"type": "string", "description": "Explicit checks the checker must confirm."},
-                "allowed_tools": {"type": "string", "description": f"Worker tools; default the full capability-rich writer set ('{DEFAULT_VERIFY_WORKER_TOOLS}'). The checker is read-only + Bash (no Edit/Write) by design: '{VERIFY_CHECKER_TOOLS}'."},
+                "allowed_tools": {"type": "string", "description": "Worker tools (default: full writer set). Checker is read-only + Bash."},
                 "cwd": {"type": "string", "description": "Working directory for both worker and checker. Defaults to this server's cwd."},
                 "always_verify": {"type": "boolean", "description": "Force checking even without criteria or disk changes."},
                 "max_iterations": {"type": "integer", "description": f"Max work->check rounds before giving up. Default {DEFAULT_MAX_VERIFY_ITERS}, clamped to 1..10."},
@@ -2211,6 +2814,79 @@ PARENT_TOOLS = [
             "required": ["vid"],
         },
     },
+    {
+        "name": "delegate_to_agy",
+        "description": "Spawn background task on Antigravity (agy, Gemini models). Normal flow: get_agy_result.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "cwd": {"type": "string"},
+                "model": {"type": "string", "description": "gemini-3.8-flash-high, gemini-3.1-pro-high, etc."},
+                "effort": {"type": "string", "enum": ["low", "medium", "high"]},
+                "conversation_id": {"type": "string"},
+            },
+            "required": ["task"],
+        },
+    },
+    {
+        "name": "check_agy_status",
+        "description": "Diagnostic status for delegated agy task.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"run_id": {"type": "string"}},
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "get_agy_result",
+        "description": "Wait server-side for agy task and return result with token usage.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "wait_seconds": {"type": "integer"},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "stop_agy",
+        "description": "Stop running agy task.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"run_id": {"type": "string"}},
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "delegate_to_architect",
+        "description": (
+            "Start a Tier 1 native Claude Code background agent (claude --bg) on Google Gemini via LiteLLM. "
+            "The Architect plans, analyzes large codebases, and delegates atomic tasks to Tier 0 local workers. "
+            f"Normal flow: call get_delegate_result(run_id, wait_seconds={MAX_RESULT_WAIT_SECONDS})."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "High-level planning, exploration, or architecture task."},
+                "cwd": {"type": "string", "description": "Working directory. Defaults to current directory."},
+                "name": {"type": "string", "description": "Display name in claude agents (default: gemini-architect-<task>)."},
+                "allowed_tools": {"type": "string", "description": "Comma-separated tools. By default includes full writer set + local worker delegation."},
+            },
+            "required": ["task"],
+        },
+    },
+    {
+        "name": "show_agent_tree",
+        "description": "Return hierarchical live view of all agents (Opus, Google, and 4x 3090 local workers).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit_tasks": {"type": "integer", "description": "Max tasks per project to display (default 5)."}
+            },
+        },
+    },
 ]
 
 
@@ -2218,8 +2894,19 @@ def _error_result(message):
     return {"content": [{"type": "text", "text": message}], "isError": True}
 
 
+def show_agent_tree_handler(args):
+    try:
+        from tree_monitor import format_tree_text
+        limit = args.get("limit_tasks", 5)
+        text = format_tree_text(limit_tasks=limit)
+        return {"content": [{"type": "text", "text": text}], "isError": False}
+    except Exception as e:
+        return _error_result(f"Failed to generate agent tree: {e}")
+
+
 TOOL_HANDLERS = {
     "delegate_to_local": start_delegate,
+    "delegate_to_architect": start_architect_delegate,
     "check_delegate_status": check_status,
     "get_delegate_result": get_result,
     "rate_delegate": rate_delegate,
@@ -2231,6 +2918,11 @@ TOOL_HANDLERS = {
     "delegate_verified": delegate_verified,
     "check_verified_status": check_verified_status,
     "get_verified_result": get_verified_result,
+    "delegate_to_agy": start_agy_delegate,
+    "check_agy_status": check_agy_status,
+    "get_agy_result": get_agy_result,
+    "stop_agy": stop_agy,
+    "show_agent_tree": show_agent_tree_handler,
 }
 TOOLS = PARENT_TOOLS
 

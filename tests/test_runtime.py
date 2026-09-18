@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from coordination_runtime import install
 
 
@@ -20,7 +22,7 @@ class RuntimeTests(unittest.TestCase):
                                            'CLAUDE_LOCAL_DELEGATE_SESSION_ID': 'test-parent'})
         self.env.start()
         self.addCleanup(self.env.stop)
-        spec = importlib.util.spec_from_file_location('isolated_server', Path(__file__).with_name('server.py'))
+        spec = importlib.util.spec_from_file_location('isolated_server', Path(__file__).resolve().parent.parent / 'server.py')
         self.s = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.s)
         self.s.VERIFIED_DIR = str(Path(self.tmp.name) / 'verified')
@@ -42,9 +44,12 @@ class RuntimeTests(unittest.TestCase):
 
     def test_original_tools_and_portable_tools(self):
         tools = self.s.handle_request({'id': 1, 'method': 'tools/list'})['result']['tools']
-        self.assertEqual(len(tools), 18)
+        self.assertEqual(len(tools), 24)
         self.assertIn('delegate_verified', {t['name'] for t in tools})
         self.assertIn('continue_delegate', {t['name'] for t in tools})
+        self.assertIn('delegate_to_architect', {t['name'] for t in tools})
+        self.assertIn('delegate_to_agy', {t['name'] for t in tools})
+        self.assertIn('show_agent_tree', {t['name'] for t in tools})
 
     def test_overlapping_reservation_no_longer_blocks_spawn(self):
         # A legacy spawn (no task_id) that overlaps another session's write
@@ -71,17 +76,32 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(reply['isError'])
         self.spawn.assert_not_called()
 
-    def test_capacity_counts_only_recorded_local_delegates(self):
+    def test_capacity_gate_removed_local_delegates_never_refused(self):
+        # Admission gate REMOVED (2026-09-16, user request): it counted a
+        # `blocked` session (waiting on a reply, zero live vLLM inference) the
+        # same as a `working` one, so an unrelated blocked backlog could
+        # report the pool "full" while the GPU was idle. A spawn is never
+        # refused for capacity reasons any more, recorded-local or not.
         self.s.LOCAL_SERVER_MAX_CONCURRENCY = 1
-        self.s._agents_json = lambda *args: [{'id': 'other', 'kind': 'background', 'state': 'working'}]
-        # A background session this server never spawned is not on the local GPU;
-        # it must not consume a slot in the vLLM pool.
+        self.s._agents_json = lambda *args: [{'id': 'other', 'kind': 'background',
+                                               'state': 'working', 'pid': 12345}]
         self.assertFalse(self.call('delegate_to_local', task='read', cwd=self.tmp.name)['isError'])
         self.spawn.assert_called_once()
-        # Once it is recorded as a local delegate, the ceiling applies.
         self.s._record_provenance('other', {'at': 0, 'backend': 'local', 'model': 'm'})
-        self.assertTrue(self.call('delegate_to_local', task='read', cwd=self.tmp.name)['isError'])
-        self.assertEqual(self.spawn.call_count, 1)
+        with patch.object(self.s, '_is_live_pid', return_value=True):
+            self.assertFalse(self.call('delegate_to_local', task='read', cwd=self.tmp.name)['isError'])
+        self.assertEqual(self.spawn.call_count, 2)
+
+    def test_sync_pool_excludes_stale_blocked_entry_without_live_pid(self):
+        self.s.LOCAL_SERVER_MAX_CONCURRENCY = 6
+        self.s._agents_json = lambda *args: [{'id': 'stale', 'kind': 'background',
+                                               'state': 'blocked', 'pid': 12345}]
+        self.s._record_provenance('stale', {'at': 0, 'backend': 'local', 'model': 'm'})
+        with patch.object(self.s, '_is_live_pid', return_value=False):
+            reply = self.call('project_sync', project=self.tmp.name)
+        data = json.loads(reply['content'][0]['text'])
+        self.assertEqual(data['pool']['local_running'], 0)
+        self.assertEqual(data['pool']['headroom'], 6)
 
     def test_spawn_records_backend_provenance(self):
         self.s._spawn_native_agent = self.spawn  # coordination wraps the real one
@@ -144,14 +164,14 @@ class RuntimeTests(unittest.TestCase):
                     {'method': 'notifications/initialized'},
                     {'id': 2, 'method': 'tools/call', 'params': {'name': 'task_claim', 'arguments': {}}},
                     {'id': 3, 'method': 'tools/list'}]
-        p = subprocess.run([sys.executable, str(Path(__file__).with_name('server.py'))],
+        p = subprocess.run([sys.executable, str(Path(__file__).resolve().parent.parent / 'server.py')],
                            input=''.join(json.dumps(m) + '\n' for m in messages),
                            text=True, capture_output=True, timeout=10)
         self.assertEqual(p.returncode, 0, p.stderr)
         responses = [json.loads(line) for line in p.stdout.splitlines()]
         self.assertEqual([r['id'] for r in responses], [1, 2, 3])
         self.assertTrue(responses[1]['result']['isError'])
-        self.assertEqual(len(responses[2]['result']['tools']), 18)
+        self.assertEqual(len(responses[2]['result']['tools']), 24)
 
 
 if __name__ == '__main__':

@@ -3,14 +3,18 @@ reading, enforced read-only privilege, routing provenance, conditional verify.""
 import importlib.util
 import json
 import os
+import signal
+import sys
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 def load_server(tmp):
-    spec = importlib.util.spec_from_file_location('eff_server', Path(__file__).with_name('server.py'))
+    spec = importlib.util.spec_from_file_location('eff_server', Path(__file__).resolve().parent.parent / 'server.py')
     s = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(s)
     s.STATE_DIR = tmp
@@ -230,13 +234,17 @@ class EfficiencyTests(unittest.TestCase):
             _asst([{'type': 'tool_use', 'name': 'Bash', 'input': {}}], stop_reason='tool_use'),
         ])
         working = {'id': 'abc12345', 'state': 'working', 'sessionId': 'session-x', 'pid': 98765}
+        live = iter((True, False))
         with patch.object(self.s, '_resolve_agent', return_value=(working, None)), \
              patch.object(self.s, '_find_transcript', return_value=path), \
+             patch.object(self.s, '_agents_json', return_value=[working]), \
+             patch.object(self.s, '_is_live_pid', side_effect=lambda _pid: next(live)), \
+             patch.object(self.s.time, 'sleep'), \
              patch.object(self.s.os, 'kill') as kill:
             result = self.s.stop_delegate({'run_id': 'abc12345'})
         self.assertFalse(result['isError'])
-        self.assertIn('Sent SIGINT', result['content'][0]['text'])
-        kill.assert_called_once()
+        self.assertIn('graceful-stop', result['content'][0]['text'])
+        kill.assert_called_once_with(98765, signal.SIGINT)
 
     # ---- one pass, memoised -------------------------------------------------
     def test_transcript_is_read_once_and_cached(self):

@@ -1,0 +1,14 @@
+Why local-model delegation "chokes" (user complaint 2026-09): it is NOT Serena and NOT "parsing too much data". Serena works fine and returns small targeted answers (find_symbol, get_symbols_overview verified live).
+
+Root cause (from transcript forensics on the 8 worst runs): the 27B local model RE-RUNS THE SAME tool call 90-300x in a loop (same `grep`, same `find`, same `sed`, same `python3 - <<EOF` heredoc, or the same WebFetch URL 100+ times) without finalizing, so its own context bloats (65k-152k) and most such runs hit the ~900s wall with NO final answer (final_text=False).
+
+Two concrete bugs that fed this, both FIXED:
+1. `mcp__serena__search_for_pattern` is a PHANTOM tool — it does not exist in installed serena (no text search in serena). It was wrongly granted in server.py SERENA_READ_ONLY_MCP_TOOLS and told to in the local-worker persona. The persona now says: exact strings -> Grep / one scoped `rg`, not Serena.
+2. local-worker persona had no anti-repeat rule. Added a "LOOP-BREAK RULE" section: never repeat a call whose answer you have; one decisive evidence per unknown, then stop.
+
+2026-09-16 update: the problem recurred (user report: "regularly zацikливаются" — loops regularly now, did not before) confirming the prompt-only fix was insufficient by itself. Implemented the previously-proposed server-side backstop:
+- server.py `_turn_guard_check` now also kills a run on REPEAT_CALL_CAP (default 4, env CLAUDE_LOCAL_DELEGATE_REPEAT_CALL_CAP) identical consecutive tool calls (name + exact args, via new `_repeat_streak`/`tool_calls` in `_transcript_summary`), independent of and much earlier than the 40-turn cap. Distinct "TURN GUARD: ... repeated the SAME tool call" note vs the turn-cap note.
+- Also fixed a stale customInstructions claiming a 122880-token limit in ~/.claude/vllm.settings.json (leftover from a prior, smaller local backend). CORRECTION (same day): first attempt raised CLAUDE_CODE_MAX_CONTEXT_TOKENS/MAX_OUTPUT_TOKENS to sum to 262144 (MAX_MODEL_LEN from /home/svyatoslav/Projects/vllm/.env) — user corrected that the deployment's ACTUAL usable context is only 180244, not the .env's configured ceiling. Reverted both ~/.claude/vllm.settings.json and ~/.claude/vllm.delegate.settings.json to CLAUDE_CODE_MAX_CONTEXT_TOKENS=147476 + CLAUDE_CODE_MAX_OUTPUT_TOKENS=32768 (sum 180244). Lesson: --max-model-len / MAX_MODEL_LEN in a config file is not proof of deliverable context for a given deployment; trust the user's observed number over the config file.
+- Added a matching LOOP-BREAK RULE to local-checker.md (it had none before; the checker can loop on repeated diff/test/build calls the same way the worker loops on search calls) and noted the new server backstop in both persona files.
+
+Related: [[local-model-delegation-setup]]

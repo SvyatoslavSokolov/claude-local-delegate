@@ -1,8 +1,11 @@
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import code_nav
 
