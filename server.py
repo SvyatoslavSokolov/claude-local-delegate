@@ -761,7 +761,7 @@ def _default_agent():
     override = os.environ.get("CLAUDE_LOCAL_DELEGATE_AGENT")
     if override:
         return override
-    default = os.path.expanduser("~/.claude/agents/local-worker.md")
+    default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents", "local-worker.md")
     return "local-worker" if os.path.isfile(default) else None
 
 
@@ -2352,7 +2352,8 @@ def _spawn_verify_checker(state, candidate):
 
 
 def _persona_exists(name):
-    return bool(name) and os.path.isfile(os.path.expanduser(f"~/.claude/agents/{name}.md"))
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    return bool(name) and os.path.isfile(os.path.join(repo_dir, "agents", f"{name}.md"))
 
 
 def _fail_verified(state, report):

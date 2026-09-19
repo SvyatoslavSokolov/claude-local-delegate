@@ -85,7 +85,7 @@ loops, then finish/cancel the old task. Ordinary sessions use unique automatic I
 
 The executor is `claude --settings ~/.claude/vllm.delegate.settings.json --bg`,
 using the local model even when its parent is Codex. The same worker/checker
-personas in ~/.claude/agents and the same settings file are used by both clients.
+personas in agents and the same settings file are used by both clients.
 They are not native Codex subagents. No second model profile or duplicated secrets
 are needed. ~/.codex/local-delegate-agents is a convenience symlink to these
 personas, not Codex's native agents configuration.

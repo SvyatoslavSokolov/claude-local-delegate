@@ -21,7 +21,7 @@
 | Python 3 (≥3.8), **только stdlib** | `pip install` не нужен. Любой модуль и любой скрипт `contrib/` работают на стандартной библиотеке. |
 | Локальный gateway модели | Anthropic-совместимый HTTP(S)-gateway (напр. vLLM + LiteLLM), достижимый с этой машины. |
 | Профиль настроек (settings) | JSON для `--settings`, указывающий Claude Code на gateway. **Содержит секреты — никогда не коммитить.** |
-| Персоны (по умолчанию) | `~/.claude/agents/local-worker.md` (writer) и `~/.claude/agents/local-checker.md` (checker для verified-цикла). |
+| Персоны (по умолчанию) | `agents/local-worker.md` (writer) и `agents/local-checker.md` (checker для verified-цикла). |
 
 Путь профиля по умолчанию: `~/.claude/vllm.delegate.settings.json`
 (фолбэк: `~/.claude/vllm.settings.json`; override: env
@@ -63,10 +63,10 @@ print(profile(p) and 'profile OK'); print(inspect(p))"
 ## Шаг 3. Подготовить персоны (по умолчанию)
 
 Убедитесь, что персоны на месте (в репозитории они не хранятся — это
-per-machine файлы в `~/.claude/agents/`):
+per-machine файлы в `agents/`):
 
 ```bash
-ls -la ~/.claude/agents/local-worker.md ~/.claude/agents/local-checker.md
+ls -la agents/local-worker.md agents/local-checker.md
 ```
 
 Если их нет — делегации будут работать, но без персоны (graceful degrade).
@@ -189,7 +189,7 @@ python3 contrib/report.py --days 0 --csv delegations.csv   # плоская CSV 
 1. Требования: `claude`, Python3 (stdlib), локальный vLLM gateway.
 2. `git clone`.
 3. Профиль настроек `~/.claude/vllm.delegate.settings.json` (**секреты**).
-4. Персоны `~/.claude/agents/local-{worker,checker}.md`.
+4. Персоны `agents/local-{worker,checker}.md`.
 5. Два MCP в `~/.claude.json` (`claude-local-delegate` → `server.py`,
    `code-nav` → `code_nav_server.py`).
 6. (Рекомендуется) `worktree.bgIsolation:none` + hook `delegate-pool-status.py`.

@@ -116,7 +116,7 @@ def main():
         if updated != text:
             changes[target] = updated
     link = home / '.codex/local-delegate-agents'
-    agents = home / '.claude/agents'
+    agents = repo / 'agents'
     if link.exists() or link.is_symlink():
         if not link.is_symlink() or link.resolve() != agents.resolve():
             raise SystemExit(f'Refusing to replace existing path: {link}')

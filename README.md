@@ -269,7 +269,7 @@ In addition to direct local workers, the harness supports a **3-tier hierarchica
 ### Spawning an Architect
 - **Via dedicated tool:** `delegate_to_architect(task="Explore module and prepare atomic edits", cwd="...")`
 - **Via profile parameter:** `delegate_to_local(task="...", profile="architect")`
-The Architect session runs with the persona `~/.claude/agents/gemini-architect.md` and uses `~/.claude/gemini.delegate.settings.json`. It is granted access to `delegate_to_local` so it can dispatch tasks down to Tier 0 workers. Child workers automatically record the Architect's `run_id` as their `parent_id`.
+The Architect session runs with the persona `agents/gemini-architect.md` and uses `~/.claude/gemini.delegate.settings.json`. It is granted access to `delegate_to_local` so it can dispatch tasks down to Tier 0 workers. Child workers automatically record the Architect's `run_id` as their `parent_id`.
 
 ### Single Pane of Glass: Live Tree Monitor
 Inspect the entire multi-agent tree from a single point of entry:
@@ -475,7 +475,7 @@ The repo carries the MCP code and `contrib/`. Everything else is per-machine:
 3. Already needed by every version, so likely already present on a machine that
    ran the old one: `~/.claude/vllm.delegate.settings.json` (the local backend
    profile — **contains secrets**, copy it out of band, never commit it),
-   `~/.claude/agents/local-worker.md`, the MCP registration above, and network
+   `agents/local-worker.md`, the MCP registration above, and network
    reach to the vLLM box in `ANTHROPIC_BASE_URL`.
 
 ## Usage

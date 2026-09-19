@@ -101,7 +101,7 @@ first as the template**. Do not run them in parallel.
 
 ## 6. The honest negative — already in the persona, reinforce it when it matters
 
-`~/.claude/agents/local-worker.md` (the default persona every delegation runs with)
+`agents/local-worker.md` (the default persona every delegation runs with)
 already requires evidence, assumptions and "say what you could not verify". That is
 why reports come back volunteering that a numeric harness proves algebra and not
 runtime, or that a count came from an environment the agent could not reproduce.

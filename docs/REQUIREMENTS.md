@@ -20,7 +20,7 @@ the supervising session stays on its regular (paid) model.
 | Python 3 (≥3.8), **stdlib only** | No `pip install`. Every module and every `contrib/` CLI runs on the standard library alone. |
 | Local model gateway | An Anthropic-compatible HTTP(S) gateway (e.g. vLLM + LiteLLM) reachable from the box. |
 | Settings profile | A `--settings` JSON pointing Claude Code at that gateway. Default `~/.claude/vllm.delegate.settings.json` (fallback `~/.claude/vllm.settings.json`), override with `CLAUDE_LOCAL_DELEGATE_SETTINGS`. **Contains secrets — never commit it.** |
-| Personas (optional but default) | `~/.claude/agents/local-worker.md` (writer default) and `~/.claude/agents/local-checker.md` (verified-loop checker). Absence degrades gracefully to no persona. |
+| Personas (optional but default) | `agents/local-worker.md` (writer default) and `agents/local-checker.md` (verified-loop checker). Absence degrades gracefully to no persona. |
 | Two MCP registrations (user scope) | `claude-local-delegate` → `server.py`, and `code-nav` → `code_nav_server.py`. See `README.md` / `MIGRATION_AND_USAGE_RU.md`. |
 | `worktree.bgIsolation: "none"` | Required for delegated writers to `Write`/`Edit` in the main checkout. |
 

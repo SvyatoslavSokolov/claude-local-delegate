@@ -8,7 +8,7 @@ real failures (consumer discovery as a precondition, why `py_compile` never prov
 import move, oracle + wrong-direction control for numeric refactors, one file per task
 with the anchors pre-found, pinning the exact environment in every command).
 
-Note the division of labour: `~/.claude/agents/local-worker.md` is the **persona** — it
+Note the division of labour: `agents/local-worker.md` is the **persona** — it
 governs how the agent behaves in any task (run a real check, show the output, list
 assumptions, say what it could not verify). `TASK_DESIGN.md` is for **you**, the caller —
 the per-task facts the persona cannot know: which line the anchor is on, which callers

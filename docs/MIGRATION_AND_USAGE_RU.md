@@ -26,7 +26,7 @@
    Если новая машина — **чистое** окружение, стартовать с **пустым** state-каталогом
    (MCP создаст свежий `coordination.sqlite3` сам).
 3. **Ссылка-симлинк пересоздаётся, а не копируется.** `~/.codex/local-delegate-agents`
-   — это *ссылка* на `~/.claude/agents`. Если её скопировать как обычный файл/папку,
+   — это *ссылка* на `agents`. Если её скопировать как обычный файл/папку,
    она «замерзнет» (stale link) и не обновится. Инсталлятор (`contrib/install_codex.py`)
    сам создаёт симлинк; ручное копирование ссылки — ошибка.
 4. **User-scope MCP** хранится в `~/.claude.json` → `mcpServers` (не в `settings.json`),
@@ -62,15 +62,15 @@ rsync -a --delete /home/svyatoslav/Projects/claude-code-mcp/claude-local-delegat
 
 | Файл | Что это | Как перенести (секретно) |
 |---|---|---|
-| `~/.claude/agents/local-worker.md` | персона делегата (worker) | `scp`/`tar` с сохранением прав `600` |
-| `~/.claude/agents/local-checker.md` | персона локального чекера | то же |
+| `agents/local-worker.md` | персона делегата (worker) | `scp`/`tar` с сохранением прав `600` |
+| `agents/local-checker.md` | персона локального чекера | то же |
 | `~/.claude/vllm.delegate.settings.json` | **slim-профиль** для `--bg` (vLLM + env) | то же, **права `600`**, не раскрывать в общем месте |
 
 Правильный способ перенести конфиг с уже встроенными секретами — **зашифрованным
 архивом** (age/gpg) или ограниченным каналом:
 
 ```bash
-tar -cf - ~/.claude/vllm.delegate.settings.json ~/.claude/agents/ \
+tar -cf - ~/.claude/vllm.delegate.settings.json agents/ \
   | age -r recipient  > migrate.age
 # на новой:
 age -d migrate.age > - | tar -xf - -C /
@@ -149,7 +149,7 @@ python3 $REPO/contrib/install_codex.py --apply
   (с абсолютным `$REPO/server.py` и `CLAUDE_LOCAL_DELEGATE_SETTINGS`);
 - дописывает ссылку на `COORDINATION.md`/`TASK_DESIGN.md` в `~/.codex/AGENTS.md`
   и `~/.claude/CLAUDE.md`;
-- **создаёт** симлинк `~/.codex/local-delegate-agents -> ~/.claude/agents`
+- **создаёт** симлинк `~/.codex/local-delegate-agents -> agents`
   (не копирует — см. A0.3);
 - **пишет** блоки `[mcp_servers.claude-local-delegate.tools.<tool>] output_token_limit`
   в `~/.codex/config.toml` — у Codex они ограничивают вывод каждого инструмента
