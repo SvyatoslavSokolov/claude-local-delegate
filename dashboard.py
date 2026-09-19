@@ -95,19 +95,35 @@ def load_tasks(runs_lookup: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
                             except Exception:
                                 pass
                         # 3. Try json metadata
-                        if not cid and os.path.isfile(agy_json):
+                        run_st = None
+                        run_err = None
+                        if os.path.isfile(agy_json):
                             try:
                                 with open(agy_json, "r", encoding="utf-8") as af:
                                     ameta = json.load(af)
-                                    cid = ameta.get("conversation_id")
+                                    if not cid:
+                                        cid = ameta.get("conversation_id")
+                                    run_st = ameta.get("status")
+                                    run_err = ameta.get("error")
                             except Exception:
                                 pass
+                        t["run_status"] = run_st
+                        t["run_error"] = run_err
                         if cid:
                             t["conversation_id"] = cid
                             t["attach_command"] = f"agy --conversation {cid}"
                         else:
                             t["conversation_id"] = None
                             t["attach_command"] = None
+
+                        if run_st == "failed" and t.get("status") == "active":
+                            t["status"] = "cancelled"
+                            clean_err = (run_err or "Process exited with failure").strip().replace("\n", " ")[:150]
+                            t["note"] = f"[FAILED: {clean_err}]"
+                            try:
+                                update_task_status(t["id"], "cancelled", note=f"Auto-cancelled: {clean_err}")
+                            except Exception:
+                                pass
                 tasks.append(t)
             except Exception:
                 pass
@@ -279,12 +295,16 @@ def spawn_task_from_dashboard(
             )
             run_id = meta.get("run_id")
             agy_conv_id = None
+            st = {}
             for _ in range(12):
                 time.sleep(0.25)
                 st = manager.check_status(run_id)
                 agy_conv_id = st.get("conversation_id")
-                if agy_conv_id:
+                if agy_conv_id or st.get("status") in ("failed", "completed"):
                     break
+            if st.get("status") == "failed":
+                err_msg = st.get("error") or "AGY process failed to start."
+                return False, {"error": err_msg}
             agy_attach_cmd = f"agy --conversation {agy_conv_id}" if agy_conv_id else None
 
         elif adapter == "codex":
@@ -1431,9 +1451,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 </div>
                 ${t.conversation_id ? `
                   <input type="text" readonly value="agy --conversation ${t.conversation_id}" onclick="this.select()" title="Click to select all, then Ctrl+C" style="width:100%; background:#0d1117; border:1px solid #30363d; border-radius:4px; color:#58a6ff; font-family:monospace; font-size:0.75rem; padding:4px 6px; box-sizing:border-box; cursor:text; user-select:all;" />
+                ` : ((t.run_status === 'failed' || t.status === 'cancelled' || t.run_error) ? `
+                  <div style="font-size:0.75rem; color:var(--red); padding:4px 0; line-height:1.3; word-break:break-word;">
+                    ❌ <strong>Launch Error:</strong> ${(t.run_error || 'Process failed during startup').substring(0, 180)}
+                  </div>
                 ` : `
                   <div style="font-size:0.72rem; color:var(--yellow); padding:3px 0;">⏳ Initializing session ID (starting up)...</div>
-                `}
+                `)}
               </div>
             ` : ''}
             ${t.run_quality !== null && t.run_quality !== undefined ? `<div style="margin-top:6px;"><span class="badge badge-green" style="font-size:0.72rem;">Quality: ${t.run_quality}/100</span></div>` : ''}
