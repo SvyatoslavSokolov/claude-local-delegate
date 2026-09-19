@@ -37,6 +37,9 @@ class AgyDelegateManager:
     def _err_path(self, run_id: str) -> Path:
         return self.state_dir / f"{run_id}.err"
 
+    def _cli_log_path(self, run_id: str) -> Path:
+        return self.state_dir / f"{run_id}.cli.log"
+
     def spawn(
         self,
         task: str,
@@ -72,6 +75,9 @@ class AgyDelegateManager:
             cmd.extend(["--mode", mode])
         if print_timeout > 0:
             cmd.extend(["--print-timeout", f"{print_timeout}s"])
+
+        cli_log_file = self._cli_log_path(run_id)
+        cmd.extend(["--log-file", str(cli_log_file)])
 
         out_file = self._out_path(run_id)
         err_file = self._err_path(run_id)
@@ -189,13 +195,16 @@ class AgyDelegateManager:
         if not conv_id and parsed_result and parsed_result.get("conversation_id"):
             conv_id = parsed_result.get("conversation_id")
         if not conv_id:
-            try:
-                cache_file = Path.home() / ".gemini/antigravity-cli/cache/last_conversations.json"
-                if cache_file.exists():
-                    c_data = json.loads(cache_file.read_text(encoding="utf-8"))
-                    conv_id = c_data.get(meta.get("cwd"))
-            except Exception:
-                pass
+            cli_log = self._cli_log_path(run_id)
+            if cli_log.exists():
+                try:
+                    import re
+                    log_text = cli_log.read_text(encoding="utf-8", errors="replace")
+                    m = re.search(r"Created conversation ([0-9a-fA-F-]+)", log_text)
+                    if m:
+                        conv_id = m.group(1)
+                except Exception:
+                    pass
         if conv_id:
             meta["conversation_id"] = conv_id
             meta["attach_command"] = f"agy --conversation {conv_id}"
