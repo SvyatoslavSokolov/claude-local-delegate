@@ -690,6 +690,18 @@ To inspect or drive an agent directly, no MCP needed: `claude attach <id>`,
 `SendMessage` / `ListAgents` / `TaskStop` tools, or this server's
 `watch_delegate` / `stop_delegate`.
 
+### Миграция на новый сервер
+
+Все агенты, промпты и глобальные правила (`GEMINI.md`) теперь хранятся внутри репозитория в папке `agents/`. 
+Для переноса всего конвейера на новую машину:
+
+1. Склонируйте репозиторий на новой машине.
+2. Скопируйте файл с секретами `~/.claude/vllm.delegate.settings.json` по безопасному каналу (он не хранится в git).
+3. Запустите `./install.sh` — этот скрипт автоматически пропишет все нужные симлинки для `claude`, `codex` и `agy`, чтобы они забирали агентов из локальной папки репозитория.
+4. Пропишите MCP-серверы в `~/.claude.json` и `~/.gemini/config/mcp_config.json` (скрипт `install.sh` выведет нужный JSON).
+
+Подробная инструкция (устаревший ручной способ) описана в `docs/MIGRATION_AND_USAGE_RU.md`.
+
 ### Cost / token notes
 
 `get_delegate_result` returns the agent's **native transcript** text, so there
