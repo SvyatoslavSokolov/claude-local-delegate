@@ -67,17 +67,31 @@ def load_tasks(runs_lookup: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
                 if t.get("adapter") == "agy" or (t.get("runs") and any(r.startswith("agy-") for r in t.get("runs", []))):
                     agy_rid = next((r for r in t.get("runs", []) if r.startswith("agy-")), None)
                     if agy_rid:
+                        agy_out = os.path.expanduser(f"~/.claude-local-delegate/agy_runs/{agy_rid}.out")
                         agy_json = os.path.expanduser(f"~/.claude-local-delegate/agy_runs/{agy_rid}.json")
-                        if os.path.isfile(agy_json):
+                        cid = None
+                        if os.path.isfile(agy_out):
+                            try:
+                                with open(agy_out, "r", encoding="utf-8") as of:
+                                    for line in reversed(of.readlines()):
+                                        line = line.strip()
+                                        if line.startswith("{") and line.endswith("}"):
+                                            p_data = json.loads(line)
+                                            if p_data.get("conversation_id"):
+                                                cid = p_data.get("conversation_id")
+                                                break
+                            except Exception:
+                                pass
+                        if not cid and os.path.isfile(agy_json):
                             try:
                                 with open(agy_json, "r", encoding="utf-8") as af:
                                     ameta = json.load(af)
                                     cid = ameta.get("conversation_id")
-                                    if cid:
-                                        t["conversation_id"] = cid
-                                        t["attach_command"] = f"agy --conversation {cid}"
                             except Exception:
                                 pass
+                        if cid:
+                            t["conversation_id"] = cid
+                            t["attach_command"] = f"agy --conversation {cid}"
                 tasks.append(t)
             except Exception:
                 pass
@@ -1271,6 +1285,49 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     let rawProjects = [];
     let currentFilter = 'all';
 
+    function copyCmd(text, btn) {
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(() => {
+          showCopied(btn);
+        }).catch(() => {
+          fallbackCopy(text, btn);
+        });
+        return;
+      }
+      fallbackCopy(text, btn);
+    }
+
+    function fallbackCopy(text, btn) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        ta.style.top = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (ok) {
+          showCopied(btn);
+          return;
+        }
+      } catch (e) {}
+      prompt('Copy command (Ctrl+C, Enter):', text);
+    }
+
+    function showCopied(btn) {
+      if (!btn) return;
+      const originalText = btn.innerText;
+      btn.innerText = '✅ Copied!';
+      btn.style.background = '#1f6feb';
+      setTimeout(() => {
+        btn.innerText = originalText;
+        btn.style.background = '#238636';
+      }, 2000);
+    }
+
     function switchTab(tabId) {
       document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
       event.target.classList.add('active');
@@ -1342,9 +1399,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <span style="color:var(--green); font-weight:500;">${t.run_speed ? t.run_speed + ' t/s' : ''}${t.run_usd_saved ? ' • +$' + t.run_usd_saved : ''}</span>
             </div>
             ${(t.conversation_id || t.attach_command) ? `
-              <div style="margin-top:6px; font-size:0.75rem; background:rgba(88,166,255,0.08); border:1px solid rgba(88,166,255,0.2); border-radius:4px; padding:4px 6px; display:flex; justify-content:space-between; align-items:center;">
-                <span style="color:var(--text-muted); font-size:0.72rem;">Session:</span>
-                <code style="color:var(--blue); font-size:0.72rem; cursor:pointer;" onclick="navigator.clipboard.writeText('${t.attach_command || ('agy --conversation ' + t.conversation_id)}'); alert('Copied to clipboard:\\n' + '${t.attach_command || ('agy --conversation ' + t.conversation_id)}')" title="Click to copy connect command">${t.attach_command || ('agy --conversation ' + t.conversation_id)} 📋</code>
+              <div style="margin-top:8px; background:#161b22; border:1px solid #30363d; border-radius:6px; padding:6px 8px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                  <span style="font-size:0.68rem; font-weight:600; color:var(--text-muted); text-transform:uppercase;">Connect Terminal</span>
+                  <button type="button" class="task-act-btn" style="background:#238636; color:#fff; border:none; padding:2px 8px; font-size:0.7rem; font-weight:600; border-radius:3px; cursor:pointer;" onclick="copyCmd('${t.attach_command || ('agy --conversation ' + t.conversation_id)}', this)">📋 Copy</button>
+                </div>
+                <input type="text" readonly value="${t.attach_command || ('agy --conversation ' + t.conversation_id)}" onclick="this.select()" title="Click to select all, then Ctrl+C" style="width:100%; background:#0d1117; border:1px solid #30363d; border-radius:4px; color:#58a6ff; font-family:monospace; font-size:0.75rem; padding:4px 6px; box-sizing:border-box; cursor:text; user-select:all;" />
               </div>
             ` : ''}
             ${t.run_quality !== null && t.run_quality !== undefined ? `<div style="margin-top:6px;"><span class="badge badge-green" style="font-size:0.72rem;">Quality: ${t.run_quality}/100</span></div>` : ''}

@@ -179,10 +179,18 @@ class AgyDelegateManager:
             return {"run_id": run_id, "status": "not_found", "error": f"No run found for {run_id}"}
 
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        parsed_result = self._try_parse_output(run_id)
+
+        # Always correct conversation_id if the output file contains the authoritative one
+        if parsed_result and parsed_result.get("conversation_id"):
+            real_cid = parsed_result.get("conversation_id")
+            if meta.get("conversation_id") != real_cid:
+                meta["conversation_id"] = real_cid
+                meta["attach_command"] = f"agy --conversation {real_cid}"
+                meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
         if meta.get("status") in ("completed", "failed", "stopped"):
             return meta
-
-        parsed_result = self._try_parse_output(run_id)
         pid = meta.get("pid", 0)
         alive = self.is_pid_alive(pid)
 
