@@ -329,74 +329,7 @@ class AgyDelegateManager:
         return self.get_result(run_id, wait_seconds=timeout)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Agy delegation helper CLI")
-    subparsers = parser.add_subparsers(dest="subcommand")
 
-    # spawn
-    p_spawn = subparsers.add_parser("spawn", help="Spawn background agy task")
-    p_spawn.add_argument("task", help="Task description / prompt")
-    p_spawn.add_argument("--cwd", help="Working directory")
-    p_spawn.add_argument("--model", help="Model name (e.g. gemini-3.8-flash-high)")
-    p_spawn.add_argument("--effort", choices=["low", "medium", "high"], help="Reasoning effort")
-    p_spawn.add_argument("--conversation", help="Resume previous conversation ID")
-
-    # status
-    p_status = subparsers.add_parser("status", help="Check status of run")
-    p_status.add_argument("run_id", help="Run ID (agy-xxxxxxxx)")
-
-    # result
-    p_result = subparsers.add_parser("result", help="Wait and get result")
-    p_result.add_argument("run_id", help="Run ID (agy-xxxxxxxx)")
-    p_result.add_argument("--wait", type=int, default=300, help="Wait timeout in seconds")
-
-    # stop
-    p_stop = subparsers.add_parser("stop", help="Stop running task")
-    p_stop.add_argument("run_id", help="Run ID (agy-xxxxxxxx)")
-
-    # run (sync)
-    p_run = subparsers.add_parser("run", help="Run task synchronously")
-    p_run.add_argument("task", help="Task description / prompt")
-    p_run.add_argument("--cwd", help="Working directory")
-    p_run.add_argument("--model", help="Model name")
-    p_run.add_argument("--timeout", type=int, default=300)
-
-    # test
-    subparsers.add_parser("test", help="Run self-test")
-
-    args = parser.parse_args()
-    mgr = AgyDelegateManager()
-
-    if args.subcommand == "spawn":
-        res = mgr.spawn(
-            task=args.task,
-            cwd=args.cwd,
-            model=args.model,
-            effort=args.effort,
-            conversation_id=args.conversation,
-        )
-        print(json.dumps(res, indent=2))
-
-    elif args.subcommand == "status":
-        res = mgr.check_status(args.run_id)
-        print(json.dumps(res, indent=2))
-
-    elif args.subcommand == "result":
-        res = mgr.get_result(args.run_id, wait_seconds=args.wait)
-        print(json.dumps(res, indent=2))
-
-    elif args.subcommand == "stop":
-        res = mgr.stop(args.run_id)
-        print(json.dumps(res, indent=2))
-
-    elif args.subcommand == "run":
-        res = mgr.run_sync(
-            task=args.task,
-            cwd=args.cwd,
-            model=args.model,
-            timeout=args.timeout,
-        )
-        print(json.dumps(res, indent=2))
 
 # MCP Server Implementation for Claude Code integration -----------------------
 

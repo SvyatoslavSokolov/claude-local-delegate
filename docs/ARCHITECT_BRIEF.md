@@ -13,11 +13,10 @@ nontrivial delegation whose briefing needs detailed acceptance criteria.
    review on the main model. Delegate every substantive project action first,
    including research, implementation, edits, and checks. Do not duplicate the
    delegate's work while it runs. Prefer one focused worker unless independent
-   parallel tasks are necessary, and request full output only when compact results
-   and the diff are insufficient. At most SIX local sessions may run at once
-   (the local pool's optimum): the server refuses a seventh with an overload
-   response, so keep parallel local work to six or fewer. Launch beyond six only
-   if you explicitly raise CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY.
+   and the diff are insufficient. At most SIX local sessions may be working (i.e. not blocked/idle) at once
+   (the local pool's optimum). Note that this is an ADVISORY limit: the server no longer enforces
+   it because blocked sessions use no GPU, but launching too many active sessions simultaneously
+   risks OOM errors and severe performance degradation on the local vLLM cluster.
 4. Brief one small outcome with exact files/anchors and an executable acceptance
    check. Ask for a short result and name known dirty/forbidden paths. Split work
    before delegating if it spans unrelated files or more than about five steps.

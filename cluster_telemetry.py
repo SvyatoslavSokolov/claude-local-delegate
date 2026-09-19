@@ -128,7 +128,7 @@ def check_cluster_overview(
             "healthy": gateway_ok,
             "status": gateway_status,
         },
-        "overall_healthy": vllm.get("healthy", False) or gateway_ok,
+        "overall_healthy": vllm.get("healthy", False) and gateway_ok,
     }
 
 

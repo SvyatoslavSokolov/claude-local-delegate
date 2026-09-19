@@ -344,24 +344,31 @@ def _parse_stop_grace(raw, default=DEFAULT_STOP_GRACE_SECONDS):
 
 STOP_GRACE_SECONDS = _parse_stop_grace(os.environ.get("CLAUDE_LOCAL_DELEGATE_STOP_GRACE_SECONDS"))
 
+def _parse_env_num(key, default, cast_fn=int, min_val=0):
+    try:
+        val = cast_fn(os.environ.get(key, str(default)))
+        return val if val >= min_val else default
+    except (TypeError, ValueError):
+        return default
+
 # Result compaction. A fan-out of 8 agents returning their full final answers
 # used to paste all 8 in one tool result; the parent pays for every line of it.
 # Default is a tail plus a sha256 of the full text; `full: true` still returns
 # everything, and the transcript on disk is never truncated.
-DEFAULT_RESULT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_RESULT_LINES", "60"))
-DEFAULT_FANOUT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_FANOUT_LINES", "15"))
+DEFAULT_RESULT_LINES = _parse_env_num("CLAUDE_LOCAL_DELEGATE_RESULT_LINES", 60)
+DEFAULT_FANOUT_LINES = _parse_env_num("CLAUDE_LOCAL_DELEGATE_FANOUT_LINES", 15)
 # A result call may wait inside the MCP process instead of making the paid
 # supervisor take one model turn per status poll. The installer gives this call
 # extra headroom with a 1200s client timeout. Callers with a shorter client
 # timeout can request a smaller value if needed.
-MAX_RESULT_WAIT_SECONDS = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_RESULT_WAIT", "900"))
-RESULT_WAIT_POLL_SECONDS = float(os.environ.get("CLAUDE_LOCAL_DELEGATE_RESULT_WAIT_POLL", "3"))
+MAX_RESULT_WAIT_SECONDS = _parse_env_num("CLAUDE_LOCAL_DELEGATE_MAX_RESULT_WAIT", 900)
+RESULT_WAIT_POLL_SECONDS = _parse_env_num("CLAUDE_LOCAL_DELEGATE_RESULT_WAIT_POLL", 3.0, float, 0.05)
 # How many consecutive state-less roster reads still count as "still working"
 # before the wait gives up and reports what it actually saw.
-MAX_UNKNOWN_STATE_READS = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_UNKNOWN_READS", "3"))
+MAX_UNKNOWN_STATE_READS = _parse_env_num("CLAUDE_LOCAL_DELEGATE_MAX_UNKNOWN_READS", 3)
 # How much of the worker's self-report the checker is shown. Its evidence comes
 # from git and from re-running things, not from the worker's prose.
-CHECKER_REPORT_LINES = int(os.environ.get("CLAUDE_LOCAL_DELEGATE_CHECKER_REPORT_LINES", "30"))
+CHECKER_REPORT_LINES = _parse_env_num("CLAUDE_LOCAL_DELEGATE_CHECKER_REPORT_LINES", 30)
 
 # ---- verified-delegation loop ----------------------------------------------
 # delegate_verified runs a CLOSED work->check->revise loop entirely on the local
@@ -1731,8 +1738,16 @@ def get_result(args):
 
     # A blocked agent needs supervisor input, so surface the actionable status
     # immediately instead of presenting its question as a final answer.
-    if state == "blocked" and wait_seconds:
-        return check_status({"run_id": handle})
+    if state == "blocked":
+        status = check_status({"run_id": handle})
+        if not wait_seconds and not status.get("isError"):
+            status_text = status.get("content", [{}])[0].get("text", "")
+            status["content"][0]["text"] = (
+                f"agent {handle} is blocked (waiting for user input) and has no final result yet.\n"
+                f"Call get_delegate_result again with wait_seconds to wait, or SendMessage to unblock.\n\n"
+                + status_text
+            )
+        return status
 
     # Still working? Don't hand back a partial answer -- unless the transcript
     # already proves termination (the roster lags the transcript). First check
@@ -3296,3 +3311,43 @@ if __name__ == "__main__":
     from coordination_runtime import install
     install(sys.modules[__name__])
     main()
+
+class LocalDelegateAdapter:
+    """Public adapter contract for programmatic use (e.g. by dashboard)."""
+    def spawn(self, task: str, cwd: str, model: str = None, role: str = "worker", **kwargs):
+        agent_persona = "gemini-architect" if role == "architect" else None
+        allowed_tools = None if role == "architect" else DEFAULT_ALLOWED_TOOLS
+        name = _format_agent_name(None, task, role=role, profile="think" if role == "worker" else None)
+        short_id, err = _spawn_native_agent(
+            task=task,
+            allowed_tools=allowed_tools,
+            cwd=cwd,
+            name=name,
+            permission_mode=DEFAULT_PERMISSION_MODE,
+            agent=agent_persona,
+            spawn_model=model,
+            role=role,
+        )
+        return short_id, err
+
+    def check_status(self, run_id: str):
+        agent, err = _resolve_agent(run_id)
+        if err or not agent:
+            return {"status": "failed", "error": err or "Not found in roster"}
+        st = agent.get("state") or agent.get("status") or "unknown"
+        if st in ("failed", "stopped"):
+            return {"status": "failed", "state": st}
+        if st in ("completed", "done", "idle"):
+            return {"status": "completed", "state": st}
+        return {"status": "active", "state": st}
+
+    def get_result(self, run_id: str):
+        st = self.check_status(run_id)
+        agent, _ = _resolve_agent(run_id)
+        if agent:
+            sid = agent.get("sessionId")
+            if sid:
+                tr = _find_transcript(sid)
+                if tr:
+                    st["response"] = _last_assistant_text(tr)
+        return st

@@ -32,6 +32,7 @@ class Board:
         con.row_factory = sqlite3.Row
         try:
             con.execute('CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, project TEXT NOT NULL, task_key TEXT NOT NULL, owner TEXT NOT NULL, body TEXT NOT NULL, UNIQUE(project, task_key))')
+            con.execute('CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(project)')
             con.execute('CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL, body TEXT NOT NULL)')
             con.execute('BEGIN IMMEDIATE')
             yield con
@@ -44,6 +45,9 @@ class Board:
 
     def _all(self, con):
         return [json.loads(r['body']) for r in con.execute('SELECT body FROM tasks ORDER BY rowid')]
+
+    def _by_project(self, con, project):
+        return [json.loads(r['body']) for r in con.execute('SELECT body FROM tasks WHERE project=? ORDER BY rowid', (project,))]
 
     def _save(self, con, t):
         t['updated_at'] = time.time()
@@ -148,14 +152,7 @@ class Board:
         completed_limit = max(0, min(20, int(args.get('completed_limit', 3))))
         event_limit = max(0, min(50, int(args.get('event_limit', 20))))
         with self.transaction() as con:
-            tasks = self._all(con)
-            # A supervisor's board view is repository-local. The old ancestor /
-            # descendant overlap made a sync from one repository include every
-            # task under ~/.claude (and vice versa), producing 200k+ tool output
-            # and causing local models to retry sync instead of delegating. Path
-            # overlap remains useful for claim conflict metadata; it must not
-            # leak unrelated repositories into the active context.
-            relevant = [t for t in tasks if t['project'] == project]
+            relevant = self._by_project(con, project)
             for t in relevant:
                 t['stale'] = time.time() - t['updated_at'] > 900
             active = [t for t in relevant if t['status'] not in ('done', 'cancelled')]

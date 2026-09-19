@@ -116,14 +116,7 @@ def load_tasks(runs_lookup: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
                             t["conversation_id"] = None
                             t["attach_command"] = None
 
-                        if run_st == "failed" and t.get("status") == "active":
-                            t["status"] = "cancelled"
-                            clean_err = (run_err or "Process exited with failure").strip().replace("\n", " ")[:150]
-                            t["note"] = f"[FAILED: {clean_err}]"
-                            try:
-                                update_task_status(t["id"], "cancelled", note=f"Auto-cancelled: {clean_err}")
-                            except Exception:
-                                pass
+                        # Removing side effects per #119. Reaping is now done via API action.
                 tasks.append(t)
             except Exception:
                 pass
@@ -216,6 +209,75 @@ def cleanup_stale_tasks(max_age_hours: float = 2.0, target_status: str = "done")
         return 0
 
 
+def reap_failed_tasks() -> int:
+    """Find active tasks whose underlying runs have failed, and mark them cancelled."""
+    if not os.path.isfile(DB_PATH):
+        return 0
+    runs_map = load_runs_map()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("BEGIN IMMEDIATE;")
+        c.execute("SELECT rowid, id, body FROM tasks;")
+        rows = c.fetchall()
+        updated_count = 0
+        now = time.time()
+        for rowid, tid, body_str in rows:
+            try:
+                body = json.loads(body_str)
+                if body.get("status") == "active":
+                    runs = body.get("runs", [])
+                    if not runs:
+                        continue
+                    run_id = runs[-1]
+                    adapter = body.get("adapter", "local")
+                    run_st = None
+                    run_err = None
+                    if adapter in ("local", "architect"):
+                        try:
+                            import server
+                            st = server.LocalDelegateAdapter().check_status(run_id)
+                            run_st = st.get("status")
+                            run_err = st.get("error")
+                        except Exception:
+                            rm = runs_map.get(run_id)
+                            if rm:
+                                run_st = rm.get("status")
+                                run_err = rm.get("error")
+                    elif adapter == "agy":
+                        agy_json = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{run_id}/.system_generated/meta.json")
+                        if os.path.isfile(agy_json):
+                            try:
+                                with open(agy_json, "r", encoding="utf-8") as af:
+                                    ameta = json.load(af)
+                                    run_st = ameta.get("status")
+                                    run_err = ameta.get("error")
+                            except Exception:
+                                pass
+                    if run_st == "failed":
+                        body["status"] = "cancelled"
+                        body["updated_at"] = now
+                        clean_err = (run_err or "Process exited with failure").strip().replace("\n", " ")[:150]
+                        body["note"] = f"{body.get('note', '')} [FAILED: {clean_err}]".strip()
+                        c.execute("UPDATE tasks SET body = ? WHERE rowid = ?;", (json.dumps(body), rowid))
+                        event_payload = {
+                            "task_id": tid,
+                            "owner": "dashboard",
+                            "kind": "status_change",
+                            "text": f"Auto-cancelled: {clean_err}",
+                            "at": now,
+                        }
+                        c.execute("INSERT INTO events (project, body) VALUES (?, ?);", (body.get("project", ""), json.dumps(event_payload)))
+                        updated_count += 1
+            except Exception:
+                pass
+        conn.commit()
+        conn.close()
+        return updated_count
+    except Exception:
+        return 0
+
+
 def spawn_task_from_dashboard(
     adapter: str,
     task: str,
@@ -243,18 +305,11 @@ def spawn_task_from_dashboard(
         if adapter in ("local", "architect"):
             import server
             role = "architect" if adapter == "architect" else "worker"
-            agent_persona = "gemini-architect" if adapter == "architect" else None
-            allowed_tools = None if adapter == "architect" else server.DEFAULT_ALLOWED_TOOLS
-            name = server._format_agent_name(None, task_text, role=role, profile="think" if role == "worker" else None)
-            short_id, err = server._spawn_native_agent(
+            short_id, err = server.LocalDelegateAdapter().spawn(
                 task=task_text,
-                allowed_tools=allowed_tools,
                 cwd=resolved_cwd,
-                name=name,
-                permission_mode=server.DEFAULT_PERMISSION_MODE,
-                agent=agent_persona,
-                spawn_model=model or None,
-                role=role,
+                model=model,
+                role=role
             )
             if err:
                 return False, {"error": err}
@@ -1980,7 +2035,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._send_json({"ok": False, "error": "Invalid Content-Length"}, status=400)
+            return
+
         body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
         try:
             payload = json.loads(body)
@@ -2002,10 +2062,20 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/tasks/cleanup-stale":
-            max_age_hours = float(payload.get("max_age_hours", 2.0))
+            try:
+                max_age_hours = float(payload.get("max_age_hours", 2.0))
+            except (TypeError, ValueError):
+                self._send_json({"ok": False, "error": "Invalid max_age_hours"}, status=400)
+                return
             target_status = payload.get("target_status", "done")
             count = cleanup_stale_tasks(max_age_hours=max_age_hours, target_status=target_status)
             self._send_json({"ok": True, "cleaned_count": count})
+            return
+
+
+        if path == "/api/tasks/reap-failed":
+            count = reap_failed_tasks()
+            self._send_json({"ok": True, "reaped_count": count})
             return
 
         if path == "/api/task/spawn":
