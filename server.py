@@ -2627,10 +2627,14 @@ def start_agy_delegate(args):
     conv_id = args.get("conversation_id")
     try:
         meta = _get_agy_mgr().spawn(task=task, cwd=cwd, model=model, effort=effort, conversation_id=conv_id)
-        time.sleep(0.4)
-        st = _get_agy_mgr().check_status(meta["run_id"])
-        cid = st.get("conversation_id")
-        attach_text = f"Connect / view interactive session:\n  agy --conversation {cid}" if cid else "Connect / view interactive session:\n  agy -c"
+        cid = None
+        for _ in range(12):
+            time.sleep(0.25)
+            st = _get_agy_mgr().check_status(meta["run_id"])
+            cid = st.get("conversation_id")
+            if cid:
+                break
+        attach_text = f"Connect / view interactive session:\n  agy --conversation {cid}" if cid else "Session starting... Check ID via check_agy_status."
         return {
             "content": [{
                 "type": "text",

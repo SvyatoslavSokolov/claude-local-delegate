@@ -67,10 +67,22 @@ def load_tasks(runs_lookup: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
                 if t.get("adapter") == "agy" or (t.get("runs") and any(r.startswith("agy-") for r in t.get("runs", []))):
                     agy_rid = next((r for r in t.get("runs", []) if r.startswith("agy-")), None)
                     if agy_rid:
+                        agy_cli_log = os.path.expanduser(f"~/.claude-local-delegate/agy_runs/{agy_rid}.cli.log")
                         agy_out = os.path.expanduser(f"~/.claude-local-delegate/agy_runs/{agy_rid}.out")
                         agy_json = os.path.expanduser(f"~/.claude-local-delegate/agy_runs/{agy_rid}.json")
                         cid = None
-                        if os.path.isfile(agy_out):
+                        # 1. Try cli log first (available early while running)
+                        if os.path.isfile(agy_cli_log):
+                            try:
+                                import re
+                                with open(agy_cli_log, "r", encoding="utf-8", errors="replace") as clf:
+                                    m = re.search(r"Created conversation ([0-9a-fA-F-]+)", clf.read())
+                                    if m:
+                                        cid = m.group(1)
+                            except Exception:
+                                pass
+                        # 2. Try out file if finished
+                        if not cid and os.path.isfile(agy_out):
                             try:
                                 with open(agy_out, "r", encoding="utf-8") as of:
                                     for line in reversed(of.readlines()):
@@ -82,6 +94,7 @@ def load_tasks(runs_lookup: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
                                                 break
                             except Exception:
                                 pass
+                        # 3. Try json metadata
                         if not cid and os.path.isfile(agy_json):
                             try:
                                 with open(agy_json, "r", encoding="utf-8") as af:
@@ -92,6 +105,9 @@ def load_tasks(runs_lookup: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
                         if cid:
                             t["conversation_id"] = cid
                             t["attach_command"] = f"agy --conversation {cid}"
+                        else:
+                            t["conversation_id"] = None
+                            t["attach_command"] = None
                 tasks.append(t)
             except Exception:
                 pass
@@ -262,10 +278,14 @@ def spawn_task_from_dashboard(
                 model=model or None,
             )
             run_id = meta.get("run_id")
-            time.sleep(0.4)
-            st = manager.check_status(run_id)
-            agy_conv_id = st.get("conversation_id")
-            agy_attach_cmd = f"agy --conversation {agy_conv_id}" if agy_conv_id else "agy -c"
+            agy_conv_id = None
+            for _ in range(12):
+                time.sleep(0.25)
+                st = manager.check_status(run_id)
+                agy_conv_id = st.get("conversation_id")
+                if agy_conv_id:
+                    break
+            agy_attach_cmd = f"agy --conversation {agy_conv_id}" if agy_conv_id else None
 
         elif adapter == "codex":
             os.makedirs(CODEX_STATE_DIR, exist_ok=True)
@@ -333,7 +353,10 @@ def spawn_task_from_dashboard(
                 if adapter == "agy":
                     if agy_conv_id:
                         body["conversation_id"] = agy_conv_id
-                    body["attach_command"] = agy_attach_cmd
+                        body["attach_command"] = agy_attach_cmd
+                    else:
+                        body["conversation_id"] = None
+                        body["attach_command"] = None
                 body["note"] = f"Spawned via Web Dashboard ({adapter}: {model or 'default'})"
                 c.execute("UPDATE tasks SET body = ? WHERE rowid = ?;", (json.dumps(body), rowid))
                 conn.commit()
@@ -1398,13 +1421,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <span>${t.runs && t.runs.length ? 'Run: ' + t.runs[0] : 'Pending'}${t.run_model ? ' (' + t.run_model + ')' : (t.model ? ' (' + t.model + ')' : '')}</span>
               <span style="color:var(--green); font-weight:500;">${t.run_speed ? t.run_speed + ' t/s' : ''}${t.run_usd_saved ? ' • +$' + t.run_usd_saved : ''}</span>
             </div>
-            ${(t.conversation_id || t.attach_command) ? `
+            ${(t.adapter === 'agy' || (t.runs && t.runs[0] && t.runs[0].startsWith('agy-'))) ? `
               <div style="margin-top:8px; background:#161b22; border:1px solid #30363d; border-radius:6px; padding:6px 8px;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
                   <span style="font-size:0.68rem; font-weight:600; color:var(--text-muted); text-transform:uppercase;">Connect Terminal</span>
-                  <button type="button" class="task-act-btn" style="background:#238636; color:#fff; border:none; padding:2px 8px; font-size:0.7rem; font-weight:600; border-radius:3px; cursor:pointer;" onclick="copyCmd('${t.attach_command || ('agy --conversation ' + t.conversation_id)}', this)">📋 Copy</button>
+                  ${t.conversation_id ? `
+                    <button type="button" class="task-act-btn" style="background:#238636; color:#fff; border:none; padding:2px 8px; font-size:0.7rem; font-weight:600; border-radius:3px; cursor:pointer;" onclick="copyCmd('agy --conversation ${t.conversation_id}', this)">📋 Copy</button>
+                  ` : ''}
                 </div>
-                <input type="text" readonly value="${t.attach_command || ('agy --conversation ' + t.conversation_id)}" onclick="this.select()" title="Click to select all, then Ctrl+C" style="width:100%; background:#0d1117; border:1px solid #30363d; border-radius:4px; color:#58a6ff; font-family:monospace; font-size:0.75rem; padding:4px 6px; box-sizing:border-box; cursor:text; user-select:all;" />
+                ${t.conversation_id ? `
+                  <input type="text" readonly value="agy --conversation ${t.conversation_id}" onclick="this.select()" title="Click to select all, then Ctrl+C" style="width:100%; background:#0d1117; border:1px solid #30363d; border-radius:4px; color:#58a6ff; font-family:monospace; font-size:0.75rem; padding:4px 6px; box-sizing:border-box; cursor:text; user-select:all;" />
+                ` : `
+                  <div style="font-size:0.72rem; color:var(--yellow); padding:3px 0;">⏳ Initializing session ID (starting up)...</div>
+                `}
               </div>
             ` : ''}
             ${t.run_quality !== null && t.run_quality !== undefined ? `<div style="margin-top:6px;"><span class="badge badge-green" style="font-size:0.72rem;">Quality: ${t.run_quality}/100</span></div>` : ''}
@@ -1858,22 +1887,34 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         # Silence default terminal noise during normal polling
         pass
 
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _send_json(self, data: Any, status: int = 200):
-        body = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _send_html(self, html: str, status: int = 200):
-        body = html.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = html.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -1962,6 +2003,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 class ReusableHTTPServer(HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc_type, _, _ = sys.exc_info()
+        if exc_type in (BrokenPipeError, ConnectionResetError):
+            return
+        super().handle_error(request, client_address)
 
 
 def _find_pid_on_port(port: int) -> Optional[int]:
