@@ -1723,8 +1723,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     const ADAPTER_PRESETS = {
       local: [
         { label: 'Qwen 3.8 27B (Tier 0 Local vLLM default)', value: 'qwen-3.8-27b' },
-        { label: 'Qwen 2.5 Coder 14B (Fast local worker)', value: 'qwen2.5-coder-14b' },
-        { label: 'Local Fast Profile (No thinking overhead)', value: 'local-fast' }
+        { label: 'Qwen 3.8 27B (Fast Profile - No Thinking)', value: 'local-fast' }
       ],
       claude: [
         { label: 'Claude 3.7 Sonnet (Anthropic Tier 1 Architect)', value: 'claude-3-7-sonnet' },
