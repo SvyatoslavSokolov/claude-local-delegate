@@ -264,7 +264,7 @@ it, including your main model.
 In addition to direct local workers, the harness supports a **3-tier hierarchical architecture**:
 1. **Tier 2 (Claude Supervisor / Opus):** High-level decomposition and review.
 2. **Tier 1 (Google Gemini Architect):** Background `claude --bg` session running on Gemini (via LiteLLM on the vLLM server). Reads repository context, explores codebase topology via `code-nav` and Serena LSP, creates atomic subtask specifications, and delegates mechanical work to local workers.
-3. **Tier 0 (Local Workers on 4x RTX 3090):** High-throughput local Qwen 27B workers performing bounded edits and running test checks.
+3. **Tier 0 (Local Workers on 4x RTX 3090):** High-throughput local Qwen 3.8 27B workers performing bounded edits and running test checks.
 
 ### Spawning an Architect
 - **Via dedicated tool:** `delegate_to_architect(task="Explore module and prepare atomic edits", cwd="...")`
@@ -280,11 +280,11 @@ Inspect the entire multi-agent tree from a single point of entry:
 👑 TIER 2: CLAUDE SUPERVISOR (Opus / Main Session)
   ├── 🧠 TIER 1: GEMINI ARCHITECT [c4d9a1f2] (gemini-3.1-flash-lite) - WORKING (14.2s)
   │      Name: refactor-auth-architecture
-  │      ├── 🔨 TIER 0: WORKER [aa46976f] (Qwen-27B) - WORKING (8.1s)
+  │      ├── 🔨 TIER 0: WORKER [aa46976f] (Qwen-3.8-27B) - WORKING (8.1s)
   │      │      Task: write-auth-migration
-  │      └── 🔨 TIER 0: WORKER [bb000002] (Qwen-27B) - DONE (24.0s)
+  │      └── 🔨 TIER 0: WORKER [bb000002] (Qwen-3.8-27B) - DONE (24.0s)
   │             Task: test-auth-migration
-  └── 🔨 TIER 0: DIRECT WORKER [d26c0a4c] (Qwen-27B) - SETTLED
+  └── 🔨 TIER 0: DIRECT WORKER [d26c0a4c] (Qwen-3.8-27B) - SETTLED
          Task: audit-run-launch
 ```
 

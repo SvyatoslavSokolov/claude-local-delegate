@@ -1722,7 +1722,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     const ADAPTER_PRESETS = {
       local: [
-        { label: 'Qwen 2.5 Coder 32B (Tier 0 Local vLLM default)', value: 'qwen2.5-coder-32b' },
+        { label: 'Qwen 3.8 27B (Tier 0 Local vLLM default)', value: 'qwen-3.8-27b' },
         { label: 'Qwen 2.5 Coder 14B (Fast local worker)', value: 'qwen2.5-coder-14b' },
         { label: 'Local Fast Profile (No thinking overhead)', value: 'local-fast' }
       ],

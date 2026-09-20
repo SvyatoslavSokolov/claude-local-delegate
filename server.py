@@ -3081,7 +3081,7 @@ def show_agent_tree_handler(args):
             st = (live.get("state") or live.get("status") or "settled").upper()
             icon = "🟢" if st in ("WORKING", "RUNNING") else ("🟡" if st == "BLOCKED" else "⚪")
             elapsed = round(now - dw.get("at", now), 1)
-            model = dw.get("model", "Qwen-27B")
+            model = dw.get("model", "Qwen-3.8-27B")
             name = dw.get("name", "worker")
             is_last = (i == len(direct_workers[:8]) - 1 and not architects and not agy_runs)
             prefix = "  └──" if is_last else "  ├──"
@@ -3108,7 +3108,7 @@ def show_agent_tree_handler(args):
                     cst = (clive.get("state") or clive.get("status") or "settled").upper()
                     cicon = "🟢" if cst in ("WORKING", "RUNNING") else ("🟡" if cst == "BLOCKED" else "⚪")
                     celapsed = round(now - ch.get("at", now), 1)
-                    cmodel = ch.get("model", "Qwen-27B")
+                    cmodel = ch.get("model", "Qwen-3.8-27B")
                     cname = ch.get("name", "worker")
                     pipe = "  │      └──" if j == len(children) - 1 else "  │      ├──"
                     lines.append(f"{pipe} {cicon} 🔨 TIER 0: WORKER [{cid}] ({cmodel}) - {cst} ({celapsed:.1f}s)")
