@@ -1726,20 +1726,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         { label: 'Qwen 3.8 27B (Fast Profile - No Thinking)', value: 'local-fast' }
       ],
       claude: [
-        { label: 'Claude 3.7 Sonnet (Anthropic Tier 1 Architect)', value: 'claude-3-7-sonnet' },
-        { label: 'Claude 3.5 Sonnet (Standard)', value: 'claude-3-5-sonnet' },
-        { label: 'Claude 3.5 Haiku (Fast)', value: 'claude-3-5-haiku' },
-        { label: 'Claude 3 Opus (Deep reasoning)', value: 'claude-3-opus' }
+        { label: 'Sonnet 5 (Efficient for routine tasks)', value: 'sonnet' },
+        { label: 'Fable 5.1 (Most capable for hardest tasks)', value: 'claude-fable-5-1' },
+        { label: 'Opus 5 (Best for everyday complex tasks)', value: 'opus' },
+        { label: 'Haiku 4.5 (Fastest for quick answers)', value: 'haiku' }
       ],
       agy: [
-        { label: 'Gemini 3.8 Flash High (Default AGY)', value: 'gemini-3.8-flash-high' },
-        { label: 'Gemini 2.5 Pro (Deep reasoning)', value: 'gemini-2.5-pro' },
-        { label: 'Gemini 2.5 Flash (Ultra-fast)', value: 'gemini-2.5-flash' }
+        { label: 'Gemini 3.8 Flash High (Default)', value: 'gemini-3.8-flash-high' },
+        { label: 'Gemini 3.1 Pro (Deep reasoning)', value: 'gemini-3.1-pro' }
       ],
       codex: [
-        { label: 'o3-mini (OpenAI reasoning)', value: 'o3-mini' },
-        { label: 'GPT-4o (Standard)', value: 'gpt-4o' },
-        { label: 'o1 (High capability)', value: 'o1' }
+        { label: 'gpt-6-astra (Most capable for complex work)', value: 'gpt-6-astra' },
+        { label: 'gpt-5.6-sol (Reliable agentic workhorse)', value: 'gpt-5.6-sol' },
+        { label: 'gpt-5.6-terra (Balanced coding model)', value: 'gpt-5.6-terra' },
+        { label: 'gpt-5.6-luna (Fast and affordable)', value: 'gpt-5.6-luna' },
+        { label: 'gpt-5.5 (Proven previous-generation)', value: 'gpt-5.5' }
       ],
       architect: [
         { label: 'Gemini 2.5 Pro (Architect default)', value: 'gemini-2.5-pro' },
@@ -1902,9 +1903,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <option value="local">🖥️ Local Worker (Claude Code + vLLM / Qwen on 4x RTX 3090)</option>
             </optgroup>
             <optgroup label="Tier 1: Architect Super-Models">
-              <option value="claude">⚡ Claude Code (Anthropic Subscription / Sonnet 3.7)</option>
-              <option value="agy">🧠 Google Antigravity (AGY / Gemini 2.5 Pro)</option>
-              <option value="codex">🤖 OpenAI Codex (o3-mini / GPT-4o)</option>
+              <option value="claude">⚡ Claude Code (Anthropic Subscription / Sonnet 5)</option>
+              <option value="agy">🧠 Google Antigravity (AGY / Gemini 3.8)</option>
+              <option value="codex">🤖 OpenAI Codex (gpt-6-astra / gpt-5.6-luna)</option>
               <option value="architect">🏛️ Gemini Architect Persona</option>
             </optgroup>
           </select>
