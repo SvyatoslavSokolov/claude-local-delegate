@@ -7,17 +7,37 @@ Reads the hook JSON on stdin (for session_id, to exclude self). Calls
 `claude agents --json` (cheap, no model). Emits additionalContext:
   - count of running delegate agents + their names
   - any BLOCKED agents, by name, flagged for an answer
-  - an IDLE warning when running < target (env CLAUDE_DELEGATE_TARGET, default 3)
+  - an IDLE hint when running < target (env CLAUDE_DELEGATE_TARGET, default 3)
+  - an OFFLINE notice instead when the local backend does not answer, so the
+    main session stops trying to delegate locally and routes to itself / AGY
 Never fails the turn: any error -> silent no-op.
 """
 import json
 import os
 import subprocess
 import sys
+import urllib.request
 
 TARGET = int(os.environ.get("CLAUDE_DELEGATE_TARGET", "3"))
 RUNNING = {"running", "working", "busy", "in_progress"}
 BLOCKED = {"blocked", "waiting", "needs_input"}
+SETTINGS = os.path.expanduser("~/.claude/vllm.delegate.settings.json")
+
+
+def backend_online():
+    """True/False when the gateway answers or not; None when unknown (no profile)."""
+    try:
+        with open(SETTINGS) as f:
+            base = json.load(f)["env"]["ANTHROPIC_BASE_URL"]
+    except Exception:
+        return None
+    try:
+        urllib.request.urlopen(base, timeout=2)
+    except urllib.error.HTTPError:
+        return True  # it answered, just not with 200
+    except Exception:
+        return False
+    return True
 
 
 def main():
@@ -55,13 +75,18 @@ def main():
     if blocked:
         lines.append(f"BLOCKED delegates need an answer NOW: {', '.join(blocked)}. "
                      f"Use watch_delegate then SendMessage / stop_delegate.")
-    if len(running) < TARGET:
-        lines.append(f"Local GPU is under-loaded ({len(running)}/{TARGET}). Per standing "
-                     f"instruction: split off mechanical/independent work and delegate_to_local "
-                     f"(or fan_out_to_local) until at least {TARGET} delegates are running, before "
-                     f"doing that work yourself.")
+    online = backend_online()
+    if online is False:
+        lines.append("Local backend is OFFLINE (gateway does not answer): do not call "
+                     "delegate_to_local/fan_out_to_local now. Do the work on the main model, "
+                     "or send self-contained mid-size tasks to delegate_to_agy.")
+    elif len(running) < TARGET:
+        lines.append(f"Local pool is idle ({len(running)}/{TARGET}). Augment mode: while you work, "
+                     f"fan_out_to_local small scoped scouts (code lookups, doc/web research, "
+                     f"tiny edits, test runs); size each with complexity, check project_sync.pool "
+                     f"for the token budget.")
     else:
-        lines.append(f"Pool at target ({len(running)}/{TARGET}); glance at watch_delegate for any drift.")
+        lines.append(f"Pool busy ({len(running)} running); glance at watch_delegate for any drift.")
 
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",

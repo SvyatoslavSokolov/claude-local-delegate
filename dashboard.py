@@ -536,10 +536,17 @@ def compile_runs_summary() -> List[Dict[str, Any]]:
         # Backfill USD saved if missing from historical record
         usd_saved = stats.get("usd_saved") or 0.0
         tsr = stats.get("token_savings_ratio") or 0.0
+        local_cost = stats.get("local_cost") or 0.0
+        
+        cached_in = stats.get("cached_input_tokens") or 0
         if usd_saved == 0.0 and (in_tokens or out_tokens):
-            roi = metrics.calculate_roi(in_tokens or 0, out_tokens or 0)
+            roi = metrics.calculate_roi(in_tokens or 0, out_tokens or 0, cached_in)
             usd_saved = roi["usd_saved"]
             tsr = roi["token_savings_ratio"]
+            local_cost = roi.get("local_cost", 0.0)
+        elif "local_cost" not in stats and (in_tokens or out_tokens):
+            roi = metrics.calculate_roi(in_tokens or 0, out_tokens or 0, cached_in)
+            local_cost = roi.get("local_cost", 0.0)
 
         item = {
             "run_id": rid,
@@ -566,6 +573,7 @@ def compile_runs_summary() -> List[Dict[str, Any]]:
             "tool_errors": stats.get("tool_errors", 0),
             "decode_speed_tok_s": speed,
             "usd_saved": usd_saved,
+            "local_cost": local_cost,
             "token_savings_ratio": tsr,
         }
         result.append(item)
@@ -722,7 +730,9 @@ def compile_overview() -> Dict[str, Any]:
 
     total_output_tokens = sum(r["output_tokens"] or 0 for r in runs)
     total_input_tokens = sum(r["total_input_tokens"] or 0 for r in runs)
+    total_cached_tokens = sum(r.get("cached_input_tokens", 0) or 0 for r in runs)
     total_usd_saved = round(sum(r["usd_saved"] or 0.0 for r in runs), 2)
+    total_local_cost = round(sum(r["local_cost"] or 0.0 for r in runs), 2)
 
     # Tool breakdown & error aggregation
     tools_agg: Dict[str, int] = {}
@@ -749,7 +759,9 @@ def compile_overview() -> Dict[str, Any]:
         "avg_worth_it": avg_worth_it,
         "total_output_tokens": total_output_tokens,
         "total_input_tokens": total_input_tokens,
+        "total_cached_tokens": total_cached_tokens,
         "total_usd_saved": total_usd_saved,
+        "total_local_cost": total_local_cost,
         "top_tools": dict(top_tools),
         "total_tool_errors": total_tool_errors,
         "evaluator_counts": evaluator_counts,
@@ -765,6 +777,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Claude Local Delegate — Observability & Metrics Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     :root {
       --bg: #0d1117;
@@ -1148,6 +1161,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <button class="tab-btn" onclick="switchTab('runsTab')">Recent Runs & Performance</button>
     <button class="tab-btn" onclick="switchTab('toolsTab')">Tool Usage & Observability</button>
     <button class="tab-btn" onclick="switchTab('quotasTab')">Architect Limits & Quotas</button>
+    <button class="tab-btn" onclick="switchTab('chartsTab')">Analytics & Charts</button>
   </div>
 
   <!-- Tab 1: Kanban -->
@@ -1377,6 +1391,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Tab 5: Charts -->
+  <div id="chartsTab" style="display: none;">
+    <div class="grid" style="grid-template-columns: repeat(2, 1fr);">
+      <div class="card">
+        <div class="card-title">Daily Runs</div>
+        <canvas id="runsChart" height="200"></canvas>
+      </div>
+      <div class="card">
+        <div class="card-title">Tokens Spent (In / Cache / Out)</div>
+        <canvas id="tokensChart" height="200"></canvas>
+      </div>
+      <div class="card">
+        <div class="card-title">Daily Local Cost ($)</div>
+        <canvas id="costChart" height="200"></canvas>
+      </div>
+      <div class="card">
+        <div class="card-title">Average Task Duration (seconds)</div>
+        <canvas id="durationChart" height="200"></canvas>
+      </div>
+    </div>
+  </div>
+
   <script>
     let rawTasks = [];
     let rawQuotas = null;
@@ -1433,6 +1469,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('kanbanTab').style.display = tabId === 'kanbanTab' ? 'block' : 'none';
       document.getElementById('toolsTab').style.display = tabId === 'toolsTab' ? 'block' : 'none';
       document.getElementById('quotasTab').style.display = tabId === 'quotasTab' ? 'block' : 'none';
+      document.getElementById('chartsTab').style.display = tabId === 'chartsTab' ? 'block' : 'none';
     }
 
     function filterKanban() {
@@ -1571,6 +1608,104 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
+let charts = {};
+function renderCharts(runs) {
+  if (!runs || runs.length === 0) return;
+
+  const daily = {};
+  runs.forEach(r => {
+    if (!r.at_str || r.at_str === '-') return;
+    const date = r.at_str.split(' ')[0];
+    if (!daily[date]) {
+      daily[date] = { count: 0, inTokens: 0, cacheTokens: 0, outTokens: 0, cost: 0, duration: 0 };
+    }
+    daily[date].count += 1;
+    const cache = r.cached_input_tokens || 0;
+    const totalIn = r.total_input_tokens || 0;
+    daily[date].inTokens += (totalIn - cache);
+    daily[date].cacheTokens += cache;
+    daily[date].outTokens += (r.output_tokens || 0);
+    daily[date].cost += (r.local_cost || 0);
+    daily[date].duration += (r.duration_s || 0);
+  });
+
+  const sortedDates = Object.keys(daily).sort();
+  if (sortedDates.length === 0) return;
+
+  const dataRuns = sortedDates.map(d => daily[d].count);
+  const dataIn = sortedDates.map(d => daily[d].inTokens);
+  const dataCache = sortedDates.map(d => daily[d].cacheTokens);
+  const dataOut = sortedDates.map(d => daily[d].outTokens);
+  const dataCost = sortedDates.map(d => daily[d].cost);
+  const dataDur = sortedDates.map(d => daily[d].count ? (daily[d].duration / daily[d].count) : 0);
+
+  const createChart = (id, type, data, options = {}) => {
+    const ctx = document.getElementById(id);
+    if (!ctx) return;
+    if (charts[id]) charts[id].destroy();
+    charts[id] = new Chart(ctx, {
+      type, data,
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { labels: { color: '#c9d1d9' } }
+        },
+        scales: {
+          x: { ticks: { color: '#8b949e' }, grid: { color: '#30363d' } },
+          y: { ticks: { color: '#8b949e' }, grid: { color: '#30363d' }, beginAtZero: true }
+        },
+        ...options
+      }
+    });
+  };
+
+  createChart('runsChart', 'bar', {
+    labels: sortedDates,
+    datasets: [{
+      label: 'Tasks Count',
+      data: dataRuns,
+      backgroundColor: '#58a6ff'
+    }]
+  });
+
+  createChart('tokensChart', 'bar', {
+    labels: sortedDates,
+    datasets: [
+      { label: 'Out Tokens', data: dataOut, backgroundColor: '#3fb950' },
+      { label: 'Cache Tokens', data: dataCache, backgroundColor: '#bc8cff' },
+      { label: 'In Tokens', data: dataIn, backgroundColor: '#f85149' }
+    ]
+  }, {
+    scales: {
+      x: { stacked: true, ticks: { color: '#8b949e' }, grid: { color: '#30363d' } },
+      y: { stacked: true, ticks: { color: '#8b949e' }, grid: { color: '#30363d' }, beginAtZero: true }
+    }
+  });
+
+  createChart('costChart', 'line', {
+    labels: sortedDates,
+    datasets: [{
+      label: 'Local Cost ($)',
+      data: dataCost,
+      borderColor: '#d29922',
+      backgroundColor: 'rgba(210, 153, 34, 0.2)',
+      fill: true,
+      tension: 0.3
+    }]
+  });
+
+  createChart('durationChart', 'line', {
+    labels: sortedDates,
+    datasets: [{
+      label: 'Avg Duration (s)',
+      data: dataDur,
+      borderColor: '#8b949e',
+      backgroundColor: 'rgba(139, 148, 158, 0.2)',
+      fill: true,
+      tension: 0.3
+    }]
+  });
+}
     async function fetchData() {
       try {
         const [overviewRes, runsRes, tasksRes] = await Promise.all([
@@ -1608,7 +1743,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('qualityDetails').innerText = 'Avg Worth-It: ' + overviewRes.avg_worth_it + ' / 100 (' + overviewRes.rated_count + ' rated)';
 
         document.getElementById('usdSaved').innerText = '$' + overviewRes.total_usd_saved;
-        document.getElementById('tokenSavings').innerText = (overviewRes.total_output_tokens || 0).toLocaleString() + ' output tokens generated';
+        document.getElementById('tokenSavings').innerHTML = 'In: ' + ((overviewRes.total_input_tokens || 0) - (overviewRes.total_cached_tokens || 0)).toLocaleString() + ' | Cache: ' + (overviewRes.total_cached_tokens || 0).toLocaleString() + ' | Out: ' + (overviewRes.total_output_tokens || 0).toLocaleString() + '<br>Local Cost: $' + (overviewRes.total_local_cost || 0);
 
         document.getElementById('contention').innerText = (vllm.contention || 'None').toUpperCase();
         document.getElementById('contentionSub').innerText = 'Running: ' + (vllm.running_requests || 0) + ' | Waiting: ' + (vllm.waiting_requests || 0);
@@ -1628,7 +1763,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <td>${r.decode_speed_tok_s ? r.decode_speed_tok_s + ' t/s' : '-'}</td>
               <td>${r.quality !== null && r.quality !== undefined ? '<span class="badge badge-green">' + r.quality + '</span>' : '-'}</td>
               <td>${r.evaluator ? '<span class="badge badge-purple">' + r.evaluator + '</span>' : '-'}</td>
-              <td style="color: var(--green); font-weight: 500;">${r.usd_saved ? '+$' + r.usd_saved : '-'}</td>
+              <td style="color: var(--green); font-weight: 500;">${r.usd_saved ? '+$' + r.usd_saved : '-'}<br><span style="color: var(--text-color); font-size: 0.8em; font-weight: 400;">Cost: $${r.local_cost || 0}</span></td>
             </tr>
           `).join('');
         }
@@ -1714,6 +1849,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
           updateModalQuotaBanner();
         }
+          renderCharts(runsRes);
 
       } catch (err) {
         console.error('Fetch error:', err);

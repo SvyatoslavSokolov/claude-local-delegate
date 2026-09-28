@@ -112,18 +112,39 @@ def prompt_specificity(text: str) -> float:
     return round(min(1.0, score), 2)
 
 
+def load_cost_config():
+    import os, json
+    config_path = os.path.join(os.path.dirname(__file__), 'cost_config.json')
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"in": 0.20, "out": 2.50, "cache": 0.05}
+
+
 def calculate_roi(
     total_input_tokens: int,
     output_tokens: int,
+    cached_input_tokens: int = 0,
     tier1_input_per_m: float = 3.0,
     tier1_output_per_m: float = 15.0,
 ) -> Dict[str, Any]:
     """Calculate token savings ratio and estimated USD saved by delegating to local tier 0."""
     cost_if_tier1 = (total_input_tokens * tier1_input_per_m + output_tokens * tier1_output_per_m) / 1_000_000.0
     tsr = round(total_input_tokens / max(1, total_input_tokens + output_tokens), 3)
+    
+    cfg = load_cost_config()
+    regular_in = total_input_tokens - cached_input_tokens
+    local_cost = (regular_in * cfg.get("in", 0.20) + 
+                  cached_input_tokens * cfg.get("cache", 0.05) + 
+                  output_tokens * cfg.get("out", 2.50)) / 1_000_000.0
+                  
     return {
         "usd_saved": round(cost_if_tier1, 4),
         "token_savings_ratio": tsr,
+        "local_cost": round(local_cost, 4)
     }
 
 
@@ -251,7 +272,7 @@ def transcript_stats(path):
 
     total_tool_calls = len(tool_use_ids) + tool_use_no_id
     decode_speed = round(output_tokens / duration_s, 2) if duration_s > 0 else 0.0
-    roi = calculate_roi(total_input_tokens, output_tokens)
+    roi = calculate_roi(total_input_tokens, output_tokens, cached_input_tokens)
 
     return {
         "api_calls": len(first_seen_order),
@@ -270,6 +291,7 @@ def transcript_stats(path):
         "decode_speed_tok_s": decode_speed,
         "usd_saved": roi["usd_saved"],
         "token_savings_ratio": roi["token_savings_ratio"],
+        "local_cost": roi["local_cost"],
     }
 
 

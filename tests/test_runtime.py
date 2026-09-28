@@ -1,11 +1,14 @@
 """Integration regressions without model calls or user state writes."""
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -103,7 +106,20 @@ class RuntimeTests(unittest.TestCase):
             reply = self.call('project_sync', project=self.tmp.name)
         data = json.loads(reply['content'][0]['text'])
         self.assertEqual(data['pool']['local_running'], 0)
-        self.assertEqual(data['pool']['headroom'], 6)
+        self.assertEqual(data['pool']['context_free_est'], self.s.LOCAL_CONTEXT_BUDGET)
+
+    def test_sync_pool_budget_counts_working_by_complexity_not_blocked(self):
+        self.s._agents_json = lambda *args: [
+            {'id': 'w', 'kind': 'background', 'state': 'working', 'pid': 1},
+            {'id': 'b', 'kind': 'background', 'state': 'blocked', 'pid': 2}]
+        self.s._record_provenance('w', {'at': 0, 'backend': 'local', 'complexity': 'large'})
+        self.s._record_provenance('b', {'at': 0, 'backend': 'local', 'complexity': 'large'})
+        with patch.object(self.s, '_is_live_pid', return_value=True):
+            pool = json.loads(self.call('project_sync', project=self.tmp.name)['content'][0]['text'])['pool']
+        self.assertEqual((pool['local_running'], pool['blocked']), (1, 1))
+        free = self.s.LOCAL_CONTEXT_BUDGET - self.s.TASK_CONTEXT_ESTIMATE['large']
+        self.assertEqual(pool['context_free_est'], free)
+        self.assertEqual(pool['fits_now']['small'], free // self.s.TASK_CONTEXT_ESTIMATE['small'])
 
     def test_spawn_records_backend_provenance(self):
         self.s._spawn_native_agent = self.spawn  # coordination wraps the real one
@@ -174,6 +190,44 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual([r['id'] for r in responses], [1, 2, 3])
         self.assertTrue(responses[1]['result']['isError'])
         self.assertEqual(len(responses[2]['result']['tools']), 27)
+
+    def test_result_wait_does_not_block_later_calls(self):
+        # A 900 s get_delegate_result wait used to hold the serial stdio loop, so every
+        # later call of the session queued behind it and timed out client-side.
+        release = threading.Event()
+
+        def slow_result(args):
+            release.wait(5)
+            return {'content': [{'type': 'text', 'text': 'done'}]}
+
+        self.s.TOOL_HANDLERS['get_delegate_result'] = slow_result
+        self.s._start_guard_sweep = lambda: None
+        order = []
+
+        class Out(io.StringIO):
+            def write(inner, text):
+                order.append(json.loads(text)['id'])
+                release.set()   # the fast reply is out: let the wait finish
+                return len(text)
+
+        msgs = [{'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                 'params': {'name': 'get_delegate_result', 'arguments': {'run_id': 'x', 'wait_seconds': 900}}},
+                {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}]
+        started = time.monotonic()
+        self.s.main(stdin=io.StringIO(''.join(json.dumps(m) + '\n' for m in msgs)), stdout=Out())
+        self.assertEqual(order, [2, 1])
+        self.assertLess(time.monotonic() - started, 4)
+
+    def test_owner_is_stable_across_server_restarts(self):
+        env = {k: v for k, v in os.environ.items() if k != 'CLAUDE_LOCAL_DELEGATE_SESSION_ID'}
+        env['CLAUDE_CODE_SESSION_ID'] = 'abc-123'
+        init = json.dumps({'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2024-11-05'}}) + '\n'
+        owners = []
+        for _ in range(2):   # two server processes of the same Claude Code session
+            p = subprocess.run([sys.executable, str(Path(__file__).resolve().parent.parent / 'server.py')],
+                               input=init, text=True, capture_output=True, timeout=10, env=env)
+            owners.append(json.loads(p.stdout.splitlines()[0])['result']['instructions'].rsplit(' ', 1)[-1])
+        self.assertEqual(owners, ['session-cc-abc-123'] * 2)
 
 
 if __name__ == '__main__':

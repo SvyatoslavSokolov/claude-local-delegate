@@ -5,21 +5,38 @@ handoffs, recovery, or multi-supervisor work. Read `TASK_DESIGN.md` only before 
 nontrivial delegation whose briefing needs detailed acceptance criteria.
 
 1. Call `project_sync(project=<absolute root>)`, keeping `next_event` for later
-   incremental syncs. It returns all unfinished work, only three compact completed
+   incremental syncs. It returns your unfinished tasks and fresh ones of other
+   sessions, only a count + short digest of idle foreign reservations
+   (`stale_foreign`; they never block -- ignore them), three compact completed
    digests, counts, and at most 20 events by default.
 2. Claim a stable task key with literal paths. Start the task this MCP session
    owns, and pass its `task_id` to every delegate.
-3. Keep only task framing, architecture, security decisions, and concise final
-   review on the main model. Delegate every substantive project action first,
-   including research, implementation, edits, and checks. Do not duplicate the
-   delegate's work while it runs. Prefer one focused worker unless independent
-   and the diff are insufficient. At most SIX local sessions may be working (i.e. not blocked/idle) at once
-   (the local pool's optimum). Note that this is an ADVISORY limit: the server no longer enforces
-   it because blocked sessions use no GPU, but launching too many active sessions simultaneously
-   risks OOM errors and severe performance degradation on the local vLLM cluster.
+3. Operating mode (2026-09-28): AUGMENT, not offload. The main model (Opus 5.5,
+   large plan) does the deep work itself -- architecture, hard debugging, final
+   code. Local workers run ALONGSIDE it as cheap parallel scouts that make the
+   main model faster and better informed: find where things live in the code,
+   read and summarize modules, collect docs/web facts, run a named test or
+   command, make very small mechanical edits. Start scouts at the beginning of a
+   task, keep working while they run, and fold their answers in when they land;
+   never sit idle waiting for them. AGY (`delegate_to_agy`, subscription) takes
+   self-contained mid-size tasks that need a strong model but not your context;
+   always report `agy --conversation <id>` for it.
+   Local capacity is a TOKEN budget (default 1.7M context across the pool,
+   `CLAUDE_LOCAL_DELEGATE_CONTEXT_BUDGET`), not a session count. `project_sync`
+   returns `pool.context_free_est` and `pool.fits_now` (how many more trivial /
+   small / medium / large runs fit). Twenty small scoped runs beat one large
+   run: split by size, pass `complexity`, and fan out up to what `fits_now`
+   allows. Blocked sessions cost nothing. Nothing is enforced -- this is
+   planning information.
+   If the local backend is offline (the pool hook says so, or a spawn fails to
+   connect), do not retry local delegation: work on the main model or AGY.
 4. Brief one small outcome with exact files/anchors and an executable acceptance
-   check. Ask for a short result and name known dirty/forbidden paths. Split work
-   before delegating if it spans unrelated files or more than about five steps.
+   check. Workers must use Serena for code (the persona makes it mandatory); name
+   the symbol and file so the first Serena lookup hits. For simulator work, ask
+   for launch-in-background -> wait on a readiness marker -> check -> kill; never
+   a fixed sleep or a foreground sim that holds the machine. Ask for a short result and name
+   known dirty/forbidden paths. Split work before delegating if it spans
+   unrelated files or more than about five steps.
 5. Plan every delegation: pass `complexity` (trivial|small|medium|large),
    `est_minutes`, and `blocks` (task keys that cannot start before this one) so
    `python3 contrib/delegate_report.py --schedule` can build the queue and ETA.
@@ -30,11 +47,10 @@ nontrivial delegation whose briefing needs detailed acceptance criteria.
    multi-file change. Default: trivial/small -> fast, medium/large -> think.
    `fast` needs `CLAUDE_LOCAL_DELEGATE_FAST_MODEL` (a thinking-off gateway route);
    without it the run uses thinking and the ledger records `think`.
-6. Normal path: `delegate_to_local(...)`, then exactly one
-   `get_delegate_result(run_id, wait_seconds=<this client's max>)` -- the tool
-   description states that ceiling (900 in both Claude Code and Codex). Half of all
-   runs exceed 10 minutes, so a smaller wait only buys extra paid round-trips.
-   Repeat only after timeout.
+6. Launch scouts with `delegate_to_local` / `fan_out_to_local` and keep working.
+   Collect with `get_delegate_result(run_id, wait_seconds=0)` when you reach the
+   point that needs the answer; block with a long wait (up to 900) only when you
+   genuinely have nothing else to do. Repeat only after timeout.
    `check_delegate_status` and `watch_delegate` are diagnostic tools for blocked,
    drifting, or unusually long work; routine polling spends main-model turns.
 7. Leave `announce_plan=false` unless actively supervising a risky run. Use

@@ -397,10 +397,11 @@ against one local model; an earlier attempt at eight produced the same simultane
 signature. The drops are `The response stopped arriving`, not the output-token cap — raising
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` does nothing for them. Treat the pool size as a tuning knob
 with evidence behind it: when several agents drop within the same minute, that is load, not
-coincidence, and the fix is fewer of them, not a bigger cap. `project_sync` now reports the
-real headroom (`pool.local_running` / `pool.headroom`), counting only delegates recorded as
-running on the local backend — a paid background session no longer occupies a slot it never
-used. `contrib/bench_concurrency.py` measures where the ceiling actually sits (levels 1/2/4/8
+coincidence, and the fix is less context in flight, not a bigger cap. Those were large,
+long-context runs: the pool is bounded by KV-cache tokens (1.7M default), so the same budget
+holds ~20 small scoped runs far more safely than 6 large ones. `project_sync` reports it as
+`pool.context_free_est` / `pool.fits_now` per complexity, counting only working (not blocked)
+delegates recorded on the local backend — a paid background session never uses a slot. `contrib/bench_concurrency.py` measures where the ceiling actually sits (levels 1/2/4/8
 into CSV); run it on an idle GPU before trusting a number.
 - **Split the question.** Two 15-step tasks beat one 40-step task, and their failures are
   independent.
@@ -408,6 +409,37 @@ into CSV); run it on an idle GPU before trusting a number.
 And when one does die mid-run: `watch_delegate` still shows the full narration. Mine it and
 fold the findings into the respawn as established facts — never restart the same investigation
 from zero.
+
+## 15. Never contradict the persona — and enforce with a hook, not with capitals
+
+Observed 2026-09-22: a task said, in capitals, "FORBIDDEN: grep, rg, sed -n,
+head, tail, awk on any .py file". The worker persona says Bash searches are
+allowed (true: this Serena setup has no text search, so `grep -n` is the only
+way to locate an exact flag or topic name). The persona won; the run paged
+`.py` files with `sed -n` windows for 200 turns. A sibling repeated the
+byte-identical `find_symbol "_cla"` 300+ times.
+
+What changed in the harness, so do not restate it as a prompt rule:
+* `scripts/hooks/block_py_paging.py` (PreToolUse, in vllm.delegate.settings.json)
+  refuses the actual loop pattern: `sed -n`, `head`/`tail`/`awk` on a .py file,
+  and grep/rg with -A/-B/-C on a .py file. Plain `grep -n '<exact>' file.py`
+  stays allowed on purpose.
+* A background guard sweep in server.py now enforces the repeat-call cap (4)
+  and a 150-turn ceiling on every live local delegate WITHOUT a supervisor
+  poll. Before, the guard ran only inside check/get calls, and not in
+  watch_delegate at all -- a supervisor who launched a batch and waited saw
+  nothing enforced.
+
+How to write the task now:
+* Say "read the symbol with `find_symbol` (include_body=true) after
+  `get_symbols_overview`"; name the symbols. Do not write "grep is forbidden".
+* When a Serena lookup can fail, give the exact symbol name and file so there is
+  no pattern to retry.
+* A live-sim campaign that blocks on one capture per turn legitimately exceeds
+  40 turns (85 observed). Pass `max_turns` to `delegate_to_local` for it (e.g.
+  150): the cap is stored per run and every poll -- get/check/watch -- and the
+  background sweep honour it. Without it, the 40 cap kills the campaign the
+  moment you look at it. The 4-identical-calls repeat cap applies regardless.
 
 ## A task template that works
 

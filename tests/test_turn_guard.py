@@ -6,7 +6,7 @@ has no `--max-turns` / `--max-tool-calls` flag, so the cap is enforced
 supervisor-side by watching the transcript's model-turn count and SIGTERM-ing a
 run that exceeds it. These tests prove the launch/control path applies the
 ceiling, the env override is validated/used, and the allowed tool set is
-untouched. No model is invoked and no real process is signalled (os.kill is
+untouched. No model is invoked and no real process is signalled (_stop_escalate is
 patched).
 """
 import importlib.util
@@ -107,18 +107,21 @@ class GuardTriggerTest(unittest.TestCase):
         kill = MagicMock()
         with patch.object(self.s, '_resolve_agent', return_value=(self._agent(), None)), \
              patch.object(self.s, '_find_transcript', return_value=self.transcript), \
-             patch.object(self.s.os, 'kill', kill):
+             patch.object(self.s, '_stop_escalate', kill):
             result = self.s.check_status({'run_id': 'aa11bb22'})
         text = result['content'][0]['text']
         self.assertFalse(result['isError'])
         self.assertIn('TURN GUARD', text)
         self.assertIn('SIGTERM', text)
         self.assertIn('NOT a user stop_delegate', text)
-        kill.assert_called_once_with(999999, signal.SIGTERM)
+        # The guard stops through the verified, session-scoped path (re-discovery
+        # by session id + proof liveness is gone), never a lone SIGTERM to the
+        # roster pid -- that once left a 'terminated' run alive for 40 minutes.
+        kill.assert_called_once_with(self._agent(), 'aa11bb22', 'terminate')
         # The guard is reported once, not re-reported on a second poll.
         with patch.object(self.s, '_resolve_agent', return_value=(self._agent(), None)), \
              patch.object(self.s, '_find_transcript', return_value=self.transcript), \
-             patch.object(self.s.os, 'kill', kill):
+             patch.object(self.s, '_stop_escalate', kill):
             result2 = self.s.check_status({'run_id': 'aa11bb22'})
         self.assertNotIn('TURN GUARD', result2['content'][0]['text'])
         self.assertEqual(kill.call_count, 1)  # no second signal
@@ -141,7 +144,7 @@ class GuardTriggerTest(unittest.TestCase):
         kill = MagicMock()
         with patch.object(self.s, '_resolve_agent', return_value=(self._agent(), None)), \
              patch.object(self.s, '_find_transcript', return_value=self.transcript), \
-             patch.object(self.s.os, 'kill', kill):
+             patch.object(self.s, '_stop_escalate', kill):
             result = self.s.check_status({'run_id': 'aa11bb22'})
         self.assertNotIn('TURN GUARD', result['content'][0]['text'])
         kill.assert_not_called()
@@ -151,7 +154,7 @@ class GuardTriggerTest(unittest.TestCase):
         kill = MagicMock()
         with patch.object(self.s, '_resolve_agent', return_value=(self._agent(), None)), \
              patch.object(self.s, '_find_transcript', return_value=self.transcript), \
-             patch.object(self.s.os, 'kill', kill):
+             patch.object(self.s, '_stop_escalate', kill):
             result = self.s.check_status({'run_id': 'aa11bb22'})
         self.assertNotIn('TURN GUARD', result['content'][0]['text'])
         kill.assert_not_called()
@@ -161,7 +164,7 @@ class GuardTriggerTest(unittest.TestCase):
         with patch.object(self.s, '_resolve_agent',
                           return_value=(self._agent(state='completed'), None)), \
              patch.object(self.s, '_find_transcript', return_value=self.transcript), \
-             patch.object(self.s.os, 'kill', kill):
+             patch.object(self.s, '_stop_escalate', kill):
             result = self.s.check_status({'run_id': 'aa11bb22'})
         self.assertNotIn('TURN GUARD', result['content'][0]['text'])
         kill.assert_not_called()
@@ -171,7 +174,7 @@ class GuardTriggerTest(unittest.TestCase):
         kill = MagicMock()
         with patch.object(self.s, '_resolve_agent', return_value=(self._agent(), None)), \
              patch.object(self.s, '_find_transcript', return_value=self.transcript), \
-             patch.object(self.s.os, 'kill', kill):
+             patch.object(self.s, '_stop_escalate', kill):
             result = self.s.check_status({'run_id': 'aa11bb22'})
         self.assertNotIn('TURN GUARD', result['content'][0]['text'])
         kill.assert_not_called()
@@ -180,12 +183,15 @@ class GuardTriggerTest(unittest.TestCase):
         kill = MagicMock()
         with patch.object(self.s, '_resolve_agent', return_value=(self._agent(), None)), \
              patch.object(self.s, '_find_transcript', return_value=self.transcript), \
-             patch.object(self.s.os, 'kill', kill):
+             patch.object(self.s, '_stop_escalate', kill):
             result = self.s.get_result({'run_id': 'aa11bb22'})
         text = result['content'][0]['text']
         self.assertIn('TURN GUARD', text)
         self.assertIn('SIGTERM', text)
-        kill.assert_called_once_with(999999, signal.SIGTERM)
+        # The guard stops through the verified, session-scoped path (re-discovery
+        # by session id + proof liveness is gone), never a lone SIGTERM to the
+        # roster pid -- that once left a 'terminated' run alive for 40 minutes.
+        kill.assert_called_once_with(self._agent(), 'aa11bb22', 'terminate')
 
     def test_custom_env_override_is_used_by_the_guard(self):
         # A run of 51 turns is below the default 40? no -- below a raised 55.
@@ -194,7 +200,7 @@ class GuardTriggerTest(unittest.TestCase):
         # Under the default cap (40) this would be killed...
         with patch.object(self.s, '_resolve_agent', return_value=(self._agent(), None)), \
              patch.object(self.s, '_find_transcript', return_value=self.transcript), \
-             patch.object(self.s.os, 'kill', kill):
+             patch.object(self.s, '_stop_escalate', kill):
             self.s.check_status({'run_id': 'aa11bb22'})
         self.assertEqual(kill.call_count, 1)  # killed under cap 40
         self.s._TURN_GUARD_KILLED.clear()
@@ -203,7 +209,7 @@ class GuardTriggerTest(unittest.TestCase):
         kill2 = MagicMock()
         with patch.object(self.s, '_resolve_agent', return_value=(self._agent(), None)), \
              patch.object(self.s, '_find_transcript', return_value=self.transcript), \
-             patch.object(self.s.os, 'kill', kill2):
+             patch.object(self.s, '_stop_escalate', kill2):
             result = self.s.check_status({'run_id': 'aa11bb22'})
         self.assertNotIn('TURN GUARD', result['content'][0]['text'])
         kill2.assert_not_called()

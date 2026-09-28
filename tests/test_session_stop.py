@@ -331,7 +331,7 @@ class StopEndToEndTest(unittest.TestCase):
 
 
 class ConcurrencyCeilingTest(unittest.TestCase):
-    """LOCAL_SERVER_MAX_CONCURRENCY still exists (default 6, validated
+    """LOCAL_SERVER_MAX_CONCURRENCY still exists (a reported session backstop, validated
     override) for status reporting, but the admission gate that used to
     refuse a spawn/fan-out at/over it was removed (2026-09-16): it counted
     `blocked` sessions -- waiting on a reply, no live vLLM inference -- the
@@ -356,15 +356,15 @@ class ConcurrencyCeilingTest(unittest.TestCase):
         patch.object(self.s, '_spawn_native_agent', side_effect=fake_spawn).start()
         self.addCleanup(patch.stopall)
 
-    def test_default_ceiling_is_six(self):
-        self.assertEqual(self.s.LOCAL_SERVER_MAX_CONCURRENCY, 6)
+    def test_default_session_backstop(self):
+        self.assertEqual(self.s.LOCAL_SERVER_MAX_CONCURRENCY, self.s.DEFAULT_MAX_CONCURRENCY)
 
     def test_override_must_be_positive(self):
         with tempfile.TemporaryDirectory() as tmp2:
             self.assertEqual(load_server(tmp2, '3').LOCAL_SERVER_MAX_CONCURRENCY, 3)
-            self.assertEqual(load_server(tmp2, '0').LOCAL_SERVER_MAX_CONCURRENCY, 6)
-            self.assertEqual(load_server(tmp2, '-2').LOCAL_SERVER_MAX_CONCURRENCY, 6)
-            self.assertEqual(load_server(tmp2, 'garbage').LOCAL_SERVER_MAX_CONCURRENCY, 6)
+            self.assertEqual(load_server(tmp2, '0').LOCAL_SERVER_MAX_CONCURRENCY, self.s.DEFAULT_MAX_CONCURRENCY)
+            self.assertEqual(load_server(tmp2, '-2').LOCAL_SERVER_MAX_CONCURRENCY, self.s.DEFAULT_MAX_CONCURRENCY)
+            self.assertEqual(load_server(tmp2, 'garbage').LOCAL_SERVER_MAX_CONCURRENCY, self.s.DEFAULT_MAX_CONCURRENCY)
 
     def test_seventh_single_start_admitted_gate_removed(self):
         # Admission gate was removed (2026-09-16): a `blocked` session (waiting

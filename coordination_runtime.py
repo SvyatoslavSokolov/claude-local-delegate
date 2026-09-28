@@ -28,7 +28,12 @@ def install(server):
     server._coordination_installed = True
     root = Path(os.environ.get('CLAUDE_LOCAL_DELEGATE_STATE_DIR', '~/.claude-local-delegate')).expanduser()
     board = Board(root / 'coordination.sqlite3')
-    owner = os.environ.get('CLAUDE_LOCAL_DELEGATE_SESSION_ID') or 'session-' + uuid.uuid4().hex
+    # Stable across server restarts: a restarted stdio server of the same Claude Code session
+    # must keep owning that session's delegates and reservations. A random id per process
+    # orphaned them ('Delegate belongs to another supervisor') after every restart.
+    owner = (os.environ.get('CLAUDE_LOCAL_DELEGATE_SESSION_ID')
+             or ('session-cc-' + os.environ['CLAUDE_CODE_SESSION_ID'] if os.environ.get('CLAUDE_CODE_SESSION_ID') else None)
+             or 'session-' + uuid.uuid4().hex)
     current_task = None
     depth = 0
     held = None            # the flock'ed file object while depth > 0
@@ -209,17 +214,29 @@ def install(server):
                        'note': 'Forked native conversation on the local backend. Original transcript retained. Poll check_delegate_status.'})
 
     def pool_snapshot():
-        """How much local capacity is actually free, by the same accounting the
-        spawn admission uses -- so 'retry later' has a number behind it."""
+        """Local capacity as a token budget: what running delegates are expected
+        to hold, what is left, and how many more runs of each size fit. Blocked
+        sessions wait on a reply and run no inference, so they cost nothing."""
         active, roster_ok = server._local_pool_usage()
         if not roster_ok:
             return {'known': False, 'note': 'native roster unavailable'}
+        states = {a.get('id'): (a.get('state') or a.get('status') or '')
+                  for a in (server._agents_json() or [])}
+        recorded = server._load_provenance()
+        working = [r for r in active if states.get(r) not in ('blocked', 'waiting', 'needs_input')]
         pending = len(_tickets())
-        ceiling = server.LOCAL_SERVER_MAX_CONCURRENCY
-        return {'known': True, 'max': ceiling, 'local_running': len(active),
-                'spawning': pending, 'headroom': max(0, ceiling - len(active) - pending),
-                'running_ids': active,
-                'note': 'Only delegates recorded as local count; paid background sessions do not.'}
+        budget = server.LOCAL_CONTEXT_BUDGET
+        used = sum(server._task_context_estimate(recorded.get(r, {}).get('complexity'))
+                   for r in working) + pending * server.UNSIZED_TASK_CONTEXT
+        free = max(0, budget - used)
+        return {'known': True, 'context_budget': budget, 'context_in_use_est': used,
+                'context_free_est': free,
+                'fits_now': {c: free // n for c, n in server.TASK_CONTEXT_ESTIMATE.items()},
+                'local_running': len(working), 'blocked': len(active) - len(working),
+                'spawning': pending, 'session_backstop': server.LOCAL_SERVER_MAX_CONCURRENCY,
+                'running_ids': working,
+                'note': 'Plan by tokens, not by session count: many small scoped runs beat one '
+                        'large run. Pass complexity so the estimate is accurate. Advisory only.'}
 
     def sync(args):
         data = board.sync(owner, args)
@@ -280,6 +297,12 @@ def install(server):
                 'Session identity: ' + owner)
             return response
         if msg.get('method') != 'tools/call':
+            return original_handle(msg)
+        params = msg.get('params')
+        # Reads mutate nothing here, so they neither take the file lock nor touch the
+        # per-request state below: the stdio loop runs slow reads (result waits) on
+        # their own thread, and a read's cleanup must not reset a mutation's task_id.
+        if isinstance(params, dict) and params.get('name') in READ_ONLY_CALLS:
             return original_handle(msg)
         try:
             params = msg.get('params') or {}

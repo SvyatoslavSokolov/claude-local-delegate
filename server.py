@@ -68,6 +68,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -244,15 +245,23 @@ READ_ONLY_PERMISSION_MODE = os.environ.get(
     "CLAUDE_LOCAL_DELEGATE_READONLY_PERMISSION_MODE", "dontAsk",
 )
 
-# Local-delegation concurrency ceiling (--max-num-seqs / shared KV-cache pool).
-# The overload evidence (stream failures once ~6 local runs share the pool) makes
-# 6 the default, matching the requested "up to six parallel local sessions". It is
-# ENFORCED for every new local launch (single and fan-out): a full pool is a clear
-# overload response, never a silent queue and never a kill -- running sessions are
-# never terminated just because the ceiling changed. Override with a validated
-# positive integer via CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY (invalid/0/negative
-# fall back to the default, so the limit can never be disabled or inverted).
-DEFAULT_MAX_CONCURRENCY = 6
+# Local capacity is a shared KV-cache TOKEN budget, not a fixed session count.
+# The old "six sessions" figure came from runs that each carried 20-30k tokens of
+# tool overhead and 67k median / 154k p95 peak context; many small, narrowly
+# scoped runs fit the same pool far better than one large one. The supervisor
+# sizes each run with `complexity` and sees the remaining budget in
+# project_sync.pool, so it can fan out 20 small scouts instead of one big task.
+# Nothing here refuses a spawn (the admission gate was removed 2026-09-16);
+# these numbers are planning information.
+DEFAULT_CONTEXT_BUDGET = 1_700_000
+# Expected peak context per run, by complexity (trivial..large); None = unsized.
+TASK_CONTEXT_ESTIMATE = {"trivial": 25_000, "small": 45_000,
+                         "medium": 90_000, "large": 180_000}
+UNSIZED_TASK_CONTEXT = 67_000  # historical median peak context
+# Session-count sanity backstop (vLLM --max-num-seqs), reported, not enforced.
+# Override with a validated positive integer via
+# CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY (invalid/0/negative -> default).
+DEFAULT_MAX_CONCURRENCY = 24
 
 
 def _parse_max_concurrency(raw, default=DEFAULT_MAX_CONCURRENCY):
@@ -269,6 +278,13 @@ def _parse_max_concurrency(raw, default=DEFAULT_MAX_CONCURRENCY):
 LOCAL_SERVER_MAX_CONCURRENCY = _parse_max_concurrency(
     os.environ.get("CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY"),
 )
+LOCAL_CONTEXT_BUDGET = _parse_max_concurrency(
+    os.environ.get("CLAUDE_LOCAL_DELEGATE_CONTEXT_BUDGET"), DEFAULT_CONTEXT_BUDGET,
+)
+
+
+def _task_context_estimate(complexity):
+    return TASK_CONTEXT_ESTIMATE.get(complexity, UNSIZED_TASK_CONTEXT)
 
 # ---- turn-cap safety ceiling (runaway-turn watchdog) -------------------------
 # A prior forensic audit of long local runs found runaway loops with 41-61 model
@@ -589,17 +605,57 @@ def _admission_error(active_ids):
     return (
         f"Local pool is full: {len(active_ids)} local delegate(s) already running "
         f"at the ceiling of {LOCAL_SERVER_MAX_CONCURRENCY} "
-        "(up to six by default; override CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY). "
+        "(override CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY). "
         "No new local session was started -- this is an overload response, not a "
         "queue. Existing runs are NOT stopped. Retry after one settles "
         "(watch_delegate/check_delegate_status)."
     )
 
 
+# ---- per-run turn cap ---------------------------------------------------------
+# One global ceiling cannot fit every task. A live-sim campaign blocks on one
+# capture per model turn and honestly needs 80+ turns (observed 85 on
+# 2026-09-22), while a code fix that has not converged by 40 is looping. The
+# supervisor states the budget at spawn (`max_turns`); it is persisted here so
+# every MCP server process -- and the background sweep -- enforces the same
+# number. 0 means "no turn ceiling for this run"; the repeat-call cap still
+# applies regardless, because identical consecutive calls are never progress.
+_TURN_CAPS_FILE = os.path.join(STATE_DIR, "turn_caps.json")
+
+
+def _load_turn_caps():
+    try:
+        with open(_TURN_CAPS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _record_turn_cap(run_id, cap):
+    if not run_id or cap is None:
+        return
+    caps = _load_turn_caps()
+    caps[str(run_id)] = int(cap)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = _TURN_CAPS_FILE + f".{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(caps, f)
+        os.replace(tmp, _TURN_CAPS_FILE)
+    except OSError:
+        pass  # bookkeeping must never break a spawn
+
+
+def _run_turn_cap(run_id, default):
+    value = _load_turn_caps().get(str(run_id))
+    return int(value) if isinstance(value, int) and value >= 0 else default
+
+
 _TURN_GUARD_KILLED = set()  # run_ids already reported as guard-terminated
 
 
-def _turn_guard_check(agent, state, session_id):
+def _turn_guard_check(agent, state, session_id, cap=None):
     """Runaway-turn watchdog: if a live delegate's model-turn count exceeds the
     ceiling, SIGTERM it and return a distinct status note; else None.
 
@@ -615,7 +671,8 @@ def _turn_guard_check(agent, state, session_id):
         return None
     if state not in ("working", "busy", "unknown"):
         return None
-    cap = DEFAULT_MAX_TURNS
+    if cap is None:
+        cap = _run_turn_cap(run_id, DEFAULT_MAX_TURNS)
     transcript = _find_transcript(session_id)
     if not transcript:
         return None
@@ -633,12 +690,22 @@ def _turn_guard_check(agent, state, session_id):
     # cap, so this catches the loop far earlier and with a much clearer signal.
     if not turn_capped and repeat_n < REPEAT_CALL_CAP:
         return None
-    pid = agent.get("pid")
-    if pid:
-        try:
-            os.kill(int(pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, ValueError, OSError):
-            pass
+    # Stop through the SAME verified path as stop_delegate. A single SIGTERM to
+    # the roster pid is not a stop: on 2026-09-22 a run this guard reported as
+    # "terminated" at 203 turns kept going and rewrote four plan files forty
+    # minutes later, silently undoing the architect's edits. _stop_escalate
+    # re-discovers the session's processes by exact session id, escalates
+    # SIGTERM -> SIGKILL while any survive, and proves liveness is gone.
+    stop_outcome = None
+    try:
+        stop_outcome = _stop_escalate(agent, run_id, "terminate")
+    except Exception:  # noqa: BLE001 - fall back to the old best-effort signal
+        pid = agent.get("pid")
+        if pid:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, ValueError, OSError):
+                pass
     _TURN_GUARD_KILLED.add(run_id)
     reason = "repeat-call" if not turn_capped else "turn-cap"
     metrics.append_event(STATE_DIR, {
@@ -670,6 +737,97 @@ def _turn_guard_check(agent, state, session_id):
         f"readable via get_delegate_result({run_id!r}); re-delegate a sharper, "
         "smaller task to continue."
     )
+
+
+# ---- proactive guard sweep ----------------------------------------------------
+# _turn_guard_check used to run ONLY when a supervisor polled a delegate
+# (check_delegate_status / get_delegate_result). A supervisor that launches a
+# batch and waits -- or only uses watch_delegate -- never triggered it, so on
+# 2026-09-22 two delegates ran unchecked to 202 and 326 turns; one of them
+# re-issued the byte-identical Serena call `find_symbol "_cla"` 300+ times,
+# which the repeat detector would have caught at the 4th repeat had anything
+# asked. This daemon thread sweeps live local delegates on its own.
+#
+# It enforces the repeat-call cap exactly, but a HIGHER absolute turn ceiling
+# than the on-poll 40: a legitimate live-sim campaign that blocks on one
+# capture per turn crosses 40 honestly, and the background sweep must not kill
+# real work that nobody asked it to judge. The 40 cap still applies on poll.
+GUARD_SWEEP_SECONDS = float(os.environ.get("CLAUDE_LOCAL_DELEGATE_GUARD_SWEEP_S", "20") or 0)
+BACKGROUND_MAX_TURNS = _parse_max_turns(
+    os.environ.get("CLAUDE_LOCAL_DELEGATE_BG_MAX_TURNS"), 150)
+# Only sessions this tool family spawned carry one of these name tags (see
+# _format_agent_name). The architect (Gemini) tag is deliberately excluded:
+# it is a different backend with its own budget. Never touch unrelated sessions.
+_GUARDED_NAME_TAGS = ("\u26a1", "\U0001f6e1", "\U0001f9ea", "\U0001f500")
+
+
+def _is_guarded_delegate(agent):
+    name = str(agent.get("name") or "").lstrip()
+    return any(name.startswith(tag) for tag in _GUARDED_NAME_TAGS)
+
+
+def _guard_sweep_once():
+    """One pass over live local delegates; returns the guard notes it produced."""
+    agents = _agents_json(include_completed=False) or []
+    notes = []
+    for agent in agents:
+        if not _is_guarded_delegate(agent):
+            continue
+        state = agent.get("state") or agent.get("status") or "unknown"
+        note = _turn_guard_check(agent, state, agent.get("sessionId") or "",
+                                 cap=_run_turn_cap(agent.get("id"), BACKGROUND_MAX_TURNS))
+        if note:
+            notes.append(note)
+    return notes
+
+
+_GUARD_SWEEP_LOCK = os.path.join(STATE_DIR, "guard_sweep.lock")
+
+
+def _acquire_sweep_lock():
+    """Become THE sweeper for this machine, or return None.
+
+    Every Claude/Codex session and every delegate loads this server, so a dozen
+    copies run at once; each sweeping would spawn `claude agents --json` (a node
+    CLI) every GUARD_SWEEP_SECONDS -- dozens of launches a minute for nothing.
+    An exclusive non-blocking flock elects one sweeper; its fd is kept open for
+    the life of the process, so when that process exits the kernel releases the
+    lock and another copy takes over on its next attempt.
+    """
+    import fcntl
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        fd = os.open(_GUARD_SWEEP_LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _guard_sweep_loop():
+    lock_fd = None
+    while True:
+        if lock_fd is None:
+            lock_fd = _acquire_sweep_lock()
+        if lock_fd is not None:
+            try:
+                _guard_sweep_once()
+            except Exception:  # noqa: BLE001 - a sweep failure must never kill the server
+                pass
+        time.sleep(GUARD_SWEEP_SECONDS)
+
+
+def _start_guard_sweep():
+    if GUARD_SWEEP_SECONDS <= 0:
+        return None
+    import threading
+    t = threading.Thread(target=_guard_sweep_loop, name="delegate-guard-sweep", daemon=True)
+    t.start()
+    return t
 
 
 def _settings_fingerprint(path):
@@ -765,6 +923,17 @@ def _default_agent():
     return "local-worker" if os.path.isfile(default) else None
 
 
+def _serena_needed(tools) -> bool:
+    """True when the delegate may call Serena; otherwise its session starts without it.
+
+    Every session spawns its own Serena MCP process (~0.65 GB resident plus language servers). A delegate
+    whose allowlist names no ``mcp__serena__*`` tool can never call it, so the ``serena-mcp`` wrapper in
+    ~/.claude.json skips the start when ``CLAUDE_NO_SERENA=1`` is in the environment. Measured 2026-09-24:
+    20 parallel literature delegates exhausted a 31 GB box (NVRM system-memory OOM) mostly on Serena.
+    """
+    return any(str(t).startswith("mcp__serena__") for t in (tools or ()))
+
+
 def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
                         disallowed_tools=None, agent=None, announce_plan=None,
                         report_contract=True,
@@ -801,6 +970,9 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
         )
 
     tools = [t.strip() for t in (allowed_tools or DEFAULT_ALLOWED_TOOLS).split(",") if t.strip()]
+    # Decided on the caller's own allowlist, before the navigation/Serena grants below are appended: an
+    # explicit allowlist without any Serena tool (paper reading, data crunching) starts without Serena.
+    skip_serena = bool(allowed_tools) and not _serena_needed(tools)
     # dontAsk also gates MCP calls. These navigation tools (the code-nav map
     # router + Serena's read-only symbol/memory tools) are read-only and live
     # outside the recursively blocked delegation server.
@@ -890,6 +1062,9 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
                     "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
             backend_env[var] = spawn_model
 
+    if skip_serena:
+        backend_env["CLAUDE_NO_SERENA"] = "1"
+
     if role == "architect":
         backend_env["CLAUDE_LOCAL_DELEGATE_ROLE"] = "architect"
         if token:
@@ -971,6 +1146,7 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
             "read_only": _is_read_only(allowed_tools),
             "cwd": cwd,
             "name": name,
+            "complexity": complexity,
             "profile_requested": profile,
             "profile_effective": profile,
             "max_turns": DEFAULT_MAX_TURNS,
@@ -1391,6 +1567,9 @@ def start_delegate(args):
     )
     if err:
         return _error_result(err)
+    max_turns = args.get("max_turns")
+    if isinstance(max_turns, int) and max_turns >= 0:
+        _record_turn_cap(short_id, max_turns)
 
     return {
         "content": [{
@@ -1824,6 +2003,11 @@ def watch_delegate(args):
 
     state = agent.get("state") or agent.get("status") or "unknown"
     session_id = agent.get("sessionId") or ""
+    # watch_delegate is a supervision poll like any other: it must enforce the
+    # runaway guard too, or watching a loop merely documents it.
+    guard_note = _turn_guard_check(agent, state, session_id)
+    if guard_note:
+        return {"content": [{"type": "text", "text": guard_note}], "isError": False}
     tr = _find_transcript(session_id) if session_id else None
     if not tr:
         return _error_result(
@@ -2732,6 +2916,7 @@ PARENT_TOOLS = [
                 "announce_plan": {"type": "boolean", "description": f"Prepend a plan/step narration preamble for a run you intend to watch. Default {DEFAULT_ANNOUNCE_PLAN}; leave off for the normal summary-only path to avoid extra local turns."},
                 "complexity": {"type": "string", "enum": list(metrics.COMPLEXITIES), "description": "Expected size of the work. Feeds the schedule/ETA report; trivial/small -> fast profile, medium/large -> think (unless profile is set)."},
                 "est_minutes": {"type": "integer", "minimum": 0, "description": "Estimated wall-clock minutes for this run. Feeds the schedule/ETA report."},
+                "max_turns": {"type": "integer", "minimum": 0, "description": "Model-turn ceiling for THIS run, enforced by the watchdog on every poll and in the background (default: 40 on poll, 150 in the background sweep). Raise it for live-sim campaigns that block on one capture per turn; 0 disables the turn ceiling for this run. The 4-identical-calls repeat cap always applies."},
                 "blocks": {"type": "array", "items": {"type": "string"}, "description": "Task keys (from task_claim) that this work blocks. Feeds the schedule/ETA report."},
                 "profile": {"type": "string", "enum": ["fast", "think", "architect"], "description": "Model profile. fast = thinking off (and the cheaper FAST_MODEL if configured); think = default local; architect = Tier 1 Google Gemini in claude --bg. Explicit profile wins over the complexity heuristic."},
             },
@@ -3293,8 +3478,36 @@ def _response(msg_id, result, error=None):
     return resp
 
 
-def main():
-    for line in sys.stdin:
+# Read-only calls that may sleep server-side (get_delegate_result waits up to
+# MAX_RESULT_WAIT_SECONDS). The stdio loop is otherwise serial, so one 900 s wait
+# queued every later call of the session behind it: Claude Code backgrounds a call
+# after 120 s, but the server stayed busy and each queued call timed out at 960 s.
+# These run on their own thread; everything else stays serial.
+CONCURRENT_CALLS = frozenset({"get_delegate_result", "watch_delegate", "get_fanout_result", "get_agy_result"})
+
+
+def _concurrent_call(msg):
+    if not isinstance(msg, dict) or msg.get("method") != "tools/call":
+        return False
+    params = msg.get("params")
+    return isinstance(params, dict) and params.get("name") in CONCURRENT_CALLS
+
+
+def main(stdin=None, stdout=None):
+    stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
+    _start_guard_sweep()
+    write_lock = threading.Lock()
+    workers = []
+
+    def respond(msg):
+        resp = handle_request(msg)
+        if resp is not None:
+            with write_lock:
+                stdout.write(json.dumps(resp) + "\n")
+                stdout.flush()
+
+    for line in stdin:
         line = line.strip()
         if not line:
             continue
@@ -3302,10 +3515,15 @@ def main():
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
-        resp = handle_request(msg)
-        if resp is not None:
-            sys.stdout.write(json.dumps(resp) + "\n")
-            sys.stdout.flush()
+        if _concurrent_call(msg):
+            worker = threading.Thread(target=respond, args=(msg,), name="delegate-wait", daemon=True)
+            worker.start()
+            workers = [w for w in workers if w.is_alive()] + [worker]
+        else:
+            respond(msg)
+    # EOF: answer the waits still in flight before exiting.
+    for worker in workers:
+        worker.join()
 
 
 if __name__ == "__main__":

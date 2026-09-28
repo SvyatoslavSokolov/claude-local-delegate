@@ -1,0 +1,1 @@
+docs/COORDINATION.md

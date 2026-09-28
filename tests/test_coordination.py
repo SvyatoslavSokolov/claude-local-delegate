@@ -1,6 +1,9 @@
 """Unit tests for the coordination.Board reservation API (no model calls, no network)."""
+import json
 import os
 import sys
+import time
+from unittest.mock import patch
 import unittest
 from pathlib import Path
 import tempfile
@@ -108,6 +111,22 @@ class BoardTests(unittest.TestCase):
         self.assertEqual(len(data['tasks'][0]['note']), 240)
         self.assertEqual(len(data['events']), 3)
         self.assertTrue(data['has_more_events'])
+
+    def test_sync_digests_stale_foreign_tasks_keeps_own(self):
+        # Abandoned reservations of dead sessions used to be returned in full
+        # (154 of them pushed the board past 60k chars with nothing running).
+        with patch('coordination.time.time', return_value=time.time() - 3600):
+            for i in range(30):
+                self.board.claim('ghost', {'project': self.project, 'task_key': 'g%d' % i,
+                                           'paths': ['p%d' % j for j in range(40)]})
+            self.board.claim('me', {'project': self.project, 'task_key': 'old-mine'})
+        self.board.claim('other', {'project': self.project, 'task_key': 'fresh'})
+        data = self.board.sync('me', {'project': self.project, 'event_limit': 0})
+        self.assertEqual(sorted(t['task_key'] for t in data['tasks']), ['fresh', 'old-mine'])
+        self.assertEqual(data['stale_foreign']['total'], 30)
+        self.assertEqual(len(data['stale_foreign']['newest']), 5)
+        self.assertEqual(data['task_counts']['active'], 32)
+        self.assertLess(len(json.dumps(data)), 6000)
 
     def test_sync_does_not_leak_parent_or_sibling_repositories(self):
         child = os.path.join(self.project, 'repo')

@@ -12,9 +12,29 @@ import time
 import uuid
 
 
-# sync() flags a task stale at 900s. A takeover is a heavier act, so it needs a longer
+# sync() flags a task stale at STALE_SECONDS. A takeover is a heavier act, so it needs a longer
 # idle period on top of the no-live-children check.
 TAKEOVER_IDLE_SECONDS = 1800
+
+
+STALE_SECONDS = 900
+
+
+def _compact(t):
+    """A board row as a supervisor needs it: long path/run lists and notes are
+    trimmed; the SQLite row keeps everything."""
+    c = {k: t.get(k) for k in ('id', 'task_key', 'owner', 'status', 'mode',
+                                'depends_on', 'stale', 'updated_at')}
+    c['summary'] = (t.get('summary') or '')[:240]
+    c['note'] = (t.get('note') or '')[:240]
+    paths, runs = t.get('paths') or [], t.get('runs') or []
+    c['paths'] = paths[:10]
+    c['runs'] = runs[-5:]
+    if len(paths) > 10:
+        c['paths_total'] = len(paths)
+    if len(runs) > 5:
+        c['runs_total'] = len(runs)
+    return c
 
 
 def overlap(a, b):
@@ -151,11 +171,23 @@ class Board:
         cursor = max(0, int(args.get('after_event', 0)))
         completed_limit = max(0, min(20, int(args.get('completed_limit', 3))))
         event_limit = max(0, min(50, int(args.get('event_limit', 20))))
+        stale_limit = max(0, min(50, int(args.get('stale_limit', 5))))
         with self.transaction() as con:
             relevant = self._by_project(con, project)
+            now = time.time()
             for t in relevant:
-                t['stale'] = time.time() - t['updated_at'] > 900
-            active = [t for t in relevant if t['status'] not in ('done', 'cancelled')]
+                t['stale'] = now - t['updated_at'] > STALE_SECONDS
+            unfinished = [t for t in relevant if t['status'] not in ('done', 'cancelled')]
+            # Abandoned reservations of other sessions pile up (dead supervisors
+            # never close them) and used to be returned in full, pushing the
+            # board past 60k chars while nothing was actually running. They hold
+            # nothing, so they get a one-line digest; own and fresh tasks stay.
+            active = [_compact(t) for t in unfinished if t['owner'] == owner or not t['stale']]
+            abandoned = [t for t in unfinished if t['owner'] != owner and t['stale']]
+            abandoned.sort(key=lambda t: t['updated_at'], reverse=True)
+            stale = [{'id': t['id'], 'task_key': t['task_key'][:80], 'status': t['status'],
+                      'idle_hours': round((now - t['updated_at']) / 3600, 1)}
+                     for t in abandoned[:stale_limit]]
             completed = [t for t in relevant if t['status'] in ('done', 'cancelled')]
             recent = completed[-completed_limit:] if completed_limit else []
             # Completed history can contain thousands of paths/runs and long notes.
@@ -176,11 +208,17 @@ class Board:
                 events.append(event)
             counts = {status: sum(t['status'] == status for t in relevant)
                       for status in ('active', 'paused', 'waiting', 'done', 'cancelled')}
-            return {'session_id': owner, 'tasks': active + recent,
-                    'task_counts': counts, 'completed_returned': len(recent),
-                    'events': events, 'has_more_events': has_more,
-                    'next_event': rows[-1]['id'] if rows else cursor,
-                    'note': 'Reservations are cooperative. Stale does not mean safe to take over. Paused tasks retain their paths.'}
+            result = {'session_id': owner, 'tasks': active + recent,
+                      'task_counts': counts, 'completed_returned': len(recent),
+                      'events': events, 'has_more_events': has_more,
+                      'next_event': rows[-1]['id'] if rows else cursor,
+                      'note': 'Reservations are cooperative. Stale does not mean safe to take over. Paused tasks retain their paths.'}
+            if abandoned:
+                result['stale_foreign'] = {
+                    'total': len(abandoned), 'newest': stale,
+                    'note': 'Idle reservations of other sessions; they never block. Ignore them, '
+                            'or close with task_update(task_id, status="cancelled", takeover=true).'}
+            return result
 
     def note(self, owner, args):
         project = str(Path(args['project']).expanduser().resolve())
@@ -226,10 +264,11 @@ def schema(name, description, properties, required):
 
 STRING = {'type': 'string'}
 TOOLS = [
-    schema('project_sync', 'Compact shared task board: all unfinished tasks, a small recent-completed digest, aggregate counts, and bounded incremental events. Call before work and at checkpoints. Increase limits only when history is actually needed.',
+    schema('project_sync', 'Compact shared task board: your unfinished tasks and fresh ones of other sessions (idle foreign tasks only as a count + short digest), a small recent-completed digest, aggregate counts, and bounded incremental events. Call before work and at checkpoints. Increase limits only when history is actually needed.',
            {'project': STRING, 'after_event': {'type': 'integer', 'minimum': 0},
             'completed_limit': {'type': 'integer', 'minimum': 0, 'maximum': 20, 'description': 'Recent terminal task digests to return; default 3.'},
-            'event_limit': {'type': 'integer', 'minimum': 0, 'maximum': 50, 'description': 'Incremental events to return; default 20.'}}, ['project']),
+            'event_limit': {'type': 'integer', 'minimum': 0, 'maximum': 50, 'description': 'Incremental events to return; default 20.'},
+            'stale_limit': {'type': 'integer', 'minimum': 0, 'maximum': 50, 'description': "Idle (>15 min) tasks of OTHER sessions are only counted plus this many one-line digests; default 5."}}, ['project']),
     schema('task_claim', 'Atomically reserve a unique task and literal file/directory paths for status reporting. A claim is always active: overlapping paths and declared depends_on are recorded but never block, so follow-on work may start immediately.',
            {'project': STRING, 'task_key': STRING, 'summary': STRING, 'paths': {'type': 'array', 'items': STRING},
             'mode': {'type': 'string', 'enum': ['read', 'write']}, 'depends_on': {'type': 'array', 'items': STRING}}, ['project', 'task_key']),
