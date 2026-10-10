@@ -383,29 +383,6 @@ class ConcurrencyCeilingTest(unittest.TestCase):
         self.assertFalse(result['isError'])
         self.assertEqual(len(self.spawn_calls), 1)
 
-    def test_fanout_admitted_over_old_headroom_gate_removed(self):
-        self._active = 4
-        result = self.s.fan_out_to_local({'items': ['a', 'b', 'c'],
-                                          'shared_instruction': 'do x',
-                                          'profile': 'think'})
-        self.assertFalse(result['isError'])
-        self.assertEqual(len(self.spawn_calls), 3)
-
-    def test_fanout_partial_headroom_admitted_gate_removed(self):
-        self._active = 5
-        result = self.s.fan_out_to_local({'items': ['a', 'b'],
-                                          'shared_instruction': 'do x'})
-        self.assertFalse(result['isError'])
-        self.assertEqual(len(self.spawn_calls), 2)
-
-    def test_fanout_exactly_headroom_admitted(self):
-        self._active = 4
-        result = self.s.fan_out_to_local({'items': ['a', 'b'],
-                                          'shared_instruction': 'do x',
-                                          'profile': 'think'})
-        self.assertFalse(result['isError'])
-        self.assertEqual(len(self.spawn_calls), 2)
-
     def test_unreadable_roster_no_longer_refuses_spawn(self):
         patcher = patch.object(self.s, '_local_pool_usage',
                                return_value=([], False))

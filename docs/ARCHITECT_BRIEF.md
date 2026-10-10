@@ -11,23 +11,36 @@ nontrivial delegation whose briefing needs detailed acceptance criteria.
    digests, counts, and at most 20 events by default.
 2. Claim a stable task key with literal paths. Start the task this MCP session
    owns, and pass its `task_id` to every delegate.
-3. Operating mode (2026-09-28): AUGMENT, not offload. The main model (Opus 5.5,
-   large plan) does the deep work itself -- architecture, hard debugging, final
-   code. Local workers run ALONGSIDE it as cheap parallel scouts that make the
-   main model faster and better informed: find where things live in the code,
-   read and summarize modules, collect docs/web facts, run a named test or
-   command, make very small mechanical edits. Start scouts at the beginning of a
-   task, keep working while they run, and fold their answers in when they land;
-   never sit idle waiting for them. AGY (`delegate_to_agy`, subscription) takes
-   self-contained mid-size tasks that need a strong model but not your context;
-   always report `agy --conversation <id>` for it.
-   Local capacity is a TOKEN budget (default 1.7M context across the pool,
-   `CLAUDE_LOCAL_DELEGATE_CONTEXT_BUDGET`), not a session count. `project_sync`
-   returns `pool.context_free_est` and `pool.fits_now` (how many more trivial /
-   small / medium / large runs fit). Twenty small scoped runs beat one large
-   run: split by size, pass `complexity`, and fan out up to what `fits_now`
-   allows. Blocked sessions cost nothing. Nothing is enforced -- this is
-   planning information.
+3. Operating mode (2026-10-10): DEEP HELP, accuracy and speed first; tokens
+   are not the constraint. The local model is Qwen3.8-Flash-Next (125B MoE,
+   IQ3_S) on the Strata engine, 4x RTX 3090 at 192.168.1.109. Delegates talk to
+   the engine DIRECTLY at :8080 (LiteLLM :4000 drops the mid-conversation
+   system messages that carry SendMessage replies); sampling defaults live in
+   Strata `POST /settings`, thinking effort in the profile's `effortLevel: high`.
+   Native SendMessage works both ways with a running delegate (it reads at its
+   next tool round): ask it questions, send corrections, let it ask you. It is a strong
+   model: give it the work you would otherwise do yourself, not only lookups.
+   - `context_pack(task)` at the START of a nontrivial task: files/symbols with
+     path:line, call/data flow, covering tests (run), history, traps, plan.
+   - `deep_dive(question, context)` for any open question you would spend
+     more than a few minutes on: it digs to the bottom, runs experiments,
+     falsifies hypotheses and writes a dossier.
+   - `review_diff(base, focus, test_command)` on EVERY non-trivial change before
+     you call it done: an adversarial second opinion that tries to prove defects.
+   - `project_findings` before a deep run: earlier dossiers may already answer it.
+   `get_delegate_result` returns a deep run's WHOLE dossier (no tail compaction).
+   Keep working while deep runs go; collect with wait_seconds=0 when you need the
+   answer. Verify the claims you act on (the dossier cites path:line and the
+   commands it ran, so spot-checking is cheap). AGY (`delegate_to_agy`) takes
+   self-contained mid-size tasks; always report `agy --conversation <id>`.
+   CAPACITY: the engine decodes ONE request at a time (~140-170 tok/s with MTP
+   speculative decoding; measured 2026-10-10: batching 4 slots gave +4.6% total
+   and 4x slower streams, so it stays off). Delegates share that one stream, so
+   1-2 live deep runs is the sweet spot; more only queue. It keeps 10
+   conversations parked in host RAM; beyond 10 live delegates every switch
+   re-reads the whole context (~20 s per 120k tokens). `project_sync.pool.engine`
+   and `pool.advice` show the live state (serving, queue, cached conversations);
+   the `context_*`/`fits_now` figures are only a KV estimate.
    If the local backend is offline (the pool hook says so, or a spawn fails to
    connect), do not retry local delegation: work on the main model or AGY.
 4. Brief one small outcome with exact files/anchors and an executable acceptance
@@ -40,19 +53,15 @@ nontrivial delegation whose briefing needs detailed acceptance criteria.
 5. Plan every delegation: pass `complexity` (trivial|small|medium|large),
    `est_minutes`, and `blocks` (task keys that cannot start before this one) so
    `python3 contrib/delegate_report.py --schedule` can build the queue and ETA.
-   Decide thinking per task with `profile`: `fast` (thinking off) when the steps
-   are fully specified -- exact files and edits, renames, mechanical refactors,
-   running a named command and reporting, collecting data by a given recipe;
-   `think` when the worker must find a cause, choose between designs, or plan a
-   multi-file change. Default: trivial/small -> fast, medium/large -> think.
-   `fast` needs `CLAUDE_LOCAL_DELEGATE_FAST_MODEL` (a thinking-off gateway route);
-   without it the run uses thinking and the ledger records `think`.
-6. Launch scouts with `delegate_to_local` / `fan_out_to_local` and keep working.
-   Collect with `get_delegate_result(run_id, wait_seconds=0)` when you reach the
-   point that needs the answer; block with a long wait (up to 900) only when you
-   genuinely have nothing else to do. Repeat only after timeout.
-   `check_delegate_status` and `watch_delegate` are diagnostic tools for blocked,
-   drifting, or unusually long work; routine polling spends main-model turns.
+   There is one model route (`default_model`, thinking on); `profile=fast` no
+   longer selects a separate model (the old `local-fast` route does not exist on
+   Strata and was removed from the profile).
+6. Launch deep runs / delegates and keep working. Collect with
+   `get_delegate_result(run_id, wait_seconds=0)` when you reach the point that
+   needs the answer; block with a long wait (up to 900) only when you genuinely
+   have nothing else to do. Native `ListAgents` shows the delegates and native
+   `SendMessage` answers a `blocked` one; `watch_delegate` shows a run's
+   narration when it seems to drift.
 7. Leave `announce_plan=false` unless actively supervising a risky run. Use
    `delegate_verified` only for changes with objective acceptance criteria; its
    checker/revision state machine costs additional local sessions.
@@ -71,10 +80,10 @@ once): median duration 804s, 19 model calls, 25k output tokens (~69% of it
 thinking), 67k peak context; p95 peak context 154k. That history carried ~20-31k
 tokens of fixed system/tool overhead per call; spawns now pass `--tools` with only
 the granted built-ins, which measured ~3.7k. Grant only the tools a task needs. The delegate
-profile is capped at 180,244 tokens context + 98,304 output (the deployment's actual usable
-budget, user-confirmed 2026-09-16 -- not the 262,144 MAX_MODEL_LEN in the vLLM stack's .env,
-which this deployment does not actually deliver), covering 97.2% of the historical run
-distribution before compaction while limiting KV-cache outliers. Every delegated task carries a
+profile allows 237,568 tokens of context + 24,576 output (CLAUDE_CODE_MAX_CONTEXT_TOKENS /
+CLAUDE_CODE_MAX_OUTPUT_TOKENS in vllm.delegate.settings.json; Strata delivers the full 262,144
+window with the KV cache streamed to host RAM -- the old 180k cap was a vLLM limit). Deep runs get
+a 300-turn ceiling; the 4-identical-calls repeat cap always applies. Every delegated task carries a
 report contract asking for a concise final chat message (changes, verification actually run,
 assumptions) with NO fixed line count in the prompt (removed 2026-09-16: a weak local model
 conflated a numeric report-length cap with an unrelated length target inside the task itself,

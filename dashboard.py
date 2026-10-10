@@ -1858,8 +1858,7 @@ function renderCharts(runs) {
 
     const ADAPTER_PRESETS = {
       local: [
-        { label: 'Qwen 3.8 27B (Tier 0 Local vLLM default)', value: 'qwen-3.8-27b' },
-        { label: 'Qwen 3.8 27B (Fast Profile - No Thinking)', value: 'local-fast' }
+        { label: 'Qwen3.8-Flash-Next 125B MoE (Strata, LiteLLM default_model)', value: 'default_model' }
       ],
       claude: [
         { label: 'Sonnet 5 (Efficient for routine tasks)', value: 'sonnet' },
@@ -2036,7 +2035,7 @@ function renderCharts(runs) {
           <label>Runner / Adapter</label>
           <select id="spawnAdapter" class="form-ctrl" onchange="onAdapterChange()">
             <optgroup label="Tier 0: Local GPU Cluster">
-              <option value="local">🖥️ Local Worker (Claude Code + vLLM / Qwen on 4x RTX 3090)</option>
+              <option value="local">🖥️ Local Worker (Claude Code + Strata / Qwen3.8-Flash-Next on 4x RTX 3090)</option>
             </optgroup>
             <optgroup label="Tier 1: Architect Super-Models">
               <option value="claude">⚡ Claude Code (Anthropic Subscription / Sonnet 5)</option>

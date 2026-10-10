@@ -55,3 +55,6 @@ OUTPUT — end your FINAL message with, on its own line, exactly one of:
 then concrete reasons (no fixed line count): the commands you ran and their results,
 what passed, what failed, and for a FAIL the smallest change that would fix it.
 A verdict with no evidence behind it is worthless — show the checks.
+After the reasons, put ONE more line as the very last line of the message, outside any
+code block: `result: checked, verdict PASS` or `result: checked, verdict FAIL` (no colon after
+the word verdict). Claude Code reads that line to mark this session done.

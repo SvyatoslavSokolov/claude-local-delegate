@@ -24,37 +24,33 @@ Parent-side tools:
   delegate_to_local      spawn one native `claude --bg` agent on the local model
   check_delegate_status  read its NATIVE state (+ surface its `blocked` question)
   get_delegate_result    read its NATIVE transcript (last assistant answer)
-  fan_out_to_local       spawn N parallel native agents (map)
-  check_fanout_status    aggregate their native states (reduce)
-  get_fanout_result      aggregate their native transcripts (reduce)
+  deep_dive / context_pack / review_diff
+                         spawn one deep run that writes a dossier, returned
+                         whole by get_delegate_result
+  project_findings       list/read earlier dossiers for a project
 
 Replying to a delegated agent is the NATIVE `SendMessage(<agent>)` tool on the
 parent side (the agent's own ListAgents sees it), not an MCP call -- that is
 what "working on the agents and their requests, natively" means here.
 
-RECOVERING A DRIFTING AGENT (tested behaviour, read before you try to steer one):
-a local `claude --bg` agent does NOT read a mid-run SendMessage -- it finishes
-its current run first, and a fast local model usually finishes before the
-message is ever looked at; once it settles to `done` it is no longer reachable
-by SendMessage at all. So SendMessage is reliable in exactly ONE case: the
-agent is `blocked` (state == blocked), i.e. it stopped and asked its own
-question -- answer that with SendMessage. (If the parent session runs in a
-different permission-mode class than the delegate -- e.g. parent on `auto`,
-delegate on the default `bypassPermissions` -- that one SendMessage is held
-for the user to approve once; approve it. Everything else here, watch_delegate
-/ stop_delegate / delegate_to_local, is MCP-side and never gated.)
-
-For everything else -- the agent is running and going the wrong way -- the loop
-that actually works is:
-  1. watch_delegate  -- confirm from the narration that it is drifting
-  2. stop_delegate   -- SIGINT; it settles to `done` in ~10-15s, before its
-                        next step
-  3. delegate_to_local  -- re-delegate a smaller, sharper task. Nothing is
-                        lost: the stopped run's transcript stays readable with
-                        get_delegate_result, so fold anything useful it already
-                        produced into the new task text.
-Do NOT sit in a watch->SendMessage->watch loop hoping a running agent picks up
-a correction; it will not.
+TALKING TO A RUNNING AGENT (re-tested 2026-10-10, Claude Code 2.1.296):
+native SendMessage works both ways while a delegate runs. A message to a
+running delegate is queued and injected at its NEXT tool round (seconds), and
+the delegate can SendMessage the supervisor back by session name. Three
+conditions, all now set up:
+  - both sides set `crossSessionInbound: "accept"` in their settings; without
+    it a message between different permission-mode classes (supervisor `auto`,
+    delegate `bypassPermissions`) is held for manual approval, and a held
+    message keeps the delegate from settling;
+  - the delegate talks to Strata DIRECTLY, not through LiteLLM: Claude Code
+    injects the message as a mid-conversation role=system message, which
+    LiteLLM silently drops (the model never sees it); Strata's own
+    /v1/messages keeps it;
+  - the delegate's final message ends with a `result:` line (REPORT_CONTRACT),
+    so Claude Code marks it done.
+So steering a drifting run is: SendMessage(<delegate name>, correction). It
+reads it after its current tool call. stop_delegate + a sharper
+delegate_to_local stays the fallback for a run that ignores the correction.
 
 Stdlib-only. Implements the MCP stdio transport directly (newline-delimited
 JSON-RPC 2.0), same as before.
@@ -73,6 +69,7 @@ import time
 import uuid
 
 import metrics
+import deep_tasks
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "claude-local-delegate"
@@ -196,14 +193,6 @@ DEFAULT_READ_ONLY_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch,LSP,NotebookRead"
 # disallow below.
 DELEGATION_BLOCKED_TOOLS = frozenset({"Agent", "Task"})
 
-# Bookkeeping for fan_out batches ONLY -- a map of batch_id -> [agent ids].
-# This is not an "agent entity": the agents themselves are 100% native
-# `claude --bg` sessions; this file just remembers which ones belong to a
-# batch so check_fanout_status/get_fanout_result can aggregate them.
-BATCHES_DIR = os.environ.get(
-    "CLAUDE_LOCAL_DELEGATE_BATCHES_DIR",
-    os.path.expanduser("~/.claude-local-delegate/batches"),
-)
 # Shared state root (same variable coordination_runtime.py uses).
 STATE_DIR = os.environ.get(
     "CLAUDE_LOCAL_DELEGATE_STATE_DIR", os.path.expanduser("~/.claude-local-delegate"),
@@ -372,7 +361,6 @@ def _parse_env_num(key, default, cast_fn=int, min_val=0):
 # Default is a tail plus a sha256 of the full text; `full: true` still returns
 # everything, and the transcript on disk is never truncated.
 DEFAULT_RESULT_LINES = _parse_env_num("CLAUDE_LOCAL_DELEGATE_RESULT_LINES", 60)
-DEFAULT_FANOUT_LINES = _parse_env_num("CLAUDE_LOCAL_DELEGATE_FANOUT_LINES", 15)
 # A result call may wait inside the MCP process instead of making the paid
 # supervisor take one model turn per status poll. The installer gives this call
 # extra headroom with a 1200s client timeout. Callers with a shorter client
@@ -389,7 +377,7 @@ CHECKER_REPORT_LINES = _parse_env_num("CLAUDE_LOCAL_DELEGATE_CHECKER_REPORT_LINE
 # ---- verified-delegation loop ----------------------------------------------
 # delegate_verified runs a CLOSED work->check->revise loop entirely on the local
 # model, so the PARENT session only ever sees an answer a local checker has
-# already signed off on. It is a lazily-advanced state machine (like fan_out's
+# already signed off on. It is a lazily-advanced state machine (like the old fan_out's
 # file-backed batches): the parent just polls check_verified_status, and each
 # poll moves the run forward one step -- nothing blocks the single-threaded MCP
 # stdio loop. State lives in ~/.claude-local-delegate/verified/<vid>.json.
@@ -503,6 +491,10 @@ DEFAULT_ANNOUNCE_PLAN = os.environ.get(
 # truncation (DEFAULT_RESULT_LINES, in _compact) still keeps what the paid
 # supervisor reads bounded -- that is a display concern, not a model
 # instruction, and the full untruncated answer/transcript is never lost.
+STATUS_RULE = (
+    "END your final message with exactly one status line, on its own line, outside any code block, as the LAST line: `result: <one short sentence naming what you delivered>` when the task is done; `failed: <one short reason>` when you could not do it; `needs input: <the one question>` only if you truly cannot continue without an answer. Claude Code reads this line to mark the session done / failed / blocked; without it the session stays 'working' forever. Never write a `next:` line after `result:`."
+)
+
 REPORT_CONTRACT = (
     "\n\n=== HOW TO REPORT (does not change the work) ===\n"
     "This section is ONLY about the one final chat message you send when you are "
@@ -520,7 +512,13 @@ REPORT_CONTRACT = (
     "real result, quoted in one line each; (3) any assumption you made or anything "
     "you could not do. If something failed, say so plainly -- a truthful short "
     "failure report is worth more than a tidy one.\n"
-    "Long output belongs in the files and in your transcript, not in this message."
+    "Long output belongs in the files and in your transcript, not in this message.\n"
+    # Claude Code's agent view derives a background session's state from the
+    # last 800 chars of its final message: a `result:` line -> done, `failed:`
+    # -> failed, `needs input:`/`blocked:` -> blocked; anything else falls back
+    # to a small-model classifier, which on the local backend leaves the
+    # session 'working' (observed 2026-10-10). The marker makes it explicit.
+    + STATUS_RULE
 )
 
 
@@ -883,7 +881,6 @@ def _format_agent_name(name=None, task=None, role="worker", profile=None):
       ⚡ [LOCAL] verify-docs-summary
       ⚡ [FAST] run-unit-tests
       🧠 [ARCH] design-adapter-architecture
-      🔀 [FANOUT 1/5] process-batch-chunk
     """
     if role == "architect":
         tag = "🧠 [ARCH]"
@@ -1583,8 +1580,8 @@ def start_delegate(args):
                 f"Use watch_delegate/check_delegate_status only to diagnose progress or drift.\n"
                 f"To course-correct if it drifts: stop_delegate({short_id!r}), then "
                 f"delegate_to_local again with a sharper task (the stopped run stays "
-                f"readable via get_delegate_result). A running local agent will NOT read a "
-                f"mid-run SendMessage; use SendMessage only to answer it when it is `blocked`.\n"
+                f"readable via get_delegate_result). A running agent reads a native "
+                f"SendMessage at its next tool round, so a correction can also go straight to it.\n"
                 f"After review call rate_delegate(run_id, quality, worth_it)."
             ),
         }],
@@ -1883,6 +1880,7 @@ def get_result(args):
             proven, _result_max_lines(args, DEFAULT_RESULT_LINES),
             "compacted", f"call get_delegate_result({handle!r}, full=true) for the whole text",
         )
+        body = _with_deep_report(handle, body)
         footer = (
             f"\n\n-- native agent id {agent.get('id')}, session {sid}, roster "
             f"state was '{state}' (stale). Final inferred from the transcript: the last "
@@ -1974,7 +1972,7 @@ def get_result(args):
         result_text, _result_max_lines(args, DEFAULT_RESULT_LINES),
         "compacted", f"call get_delegate_result({handle!r}, full=true) for the whole text",
     )
-    result_text = body
+    result_text = _with_deep_report(handle, body)
     footer = (
         f"\n\n-- native agent id {agent.get('id')}, session {session_id}, "
         f"state {state}. This is the agent's own final answer from its transcript; "
@@ -2043,8 +2041,8 @@ def watch_delegate(args):
         body += (
             f"\n\nGoing the wrong way? stop_delegate({handle!r}) to halt it (settles in "
             f"~10-15s), then delegate_to_local again with a sharper task -- its stopped "
-            f"transcript stays readable via get_delegate_result. Do NOT SendMessage a "
-            f"correction to a running agent: it won't read it until the run ends. "
+            f"transcript stays readable via get_delegate_result. A native SendMessage "
+            f"correction reaches a running agent at its next tool round. "
             f"On track? Just call watch_delegate again later."
         )
     return {"content": [{"type": "text", "text": body}], "isError": False}
@@ -2223,145 +2221,6 @@ def stop_delegate(args):
             )}], "isError": False}
     return _stop_escalate(agent, handle, mode)
 
-
-def _batch_path(batch_id):
-    return os.path.join(BATCHES_DIR, f"{batch_id}.json")
-
-
-def fan_out_to_local(args):
-    items = args.get("items")
-    shared_instruction = args.get("shared_instruction")
-    if not items or not isinstance(items, list) or not all(isinstance(i, str) for i in items):
-        return _error_result("`items` is required and must be a non-empty array of strings.")
-    if not shared_instruction or not isinstance(shared_instruction, str):
-        return _error_result("`shared_instruction` is required and must be a non-empty string.")
-
-    # Concurrency-ceiling admission gate REMOVED (2026-09-16, user request) --
-    # same reasoning as delegate_to_local above: `blocked` sessions were
-    # counted as occupying a slot, so an unrelated project's blocked backlog
-    # could refuse a fan-out while the GPU was idle. No longer wired here.
-    allowed_tools = args.get("allowed_tools") or DEFAULT_ALLOWED_TOOLS
-    cwd, cwd_err = _resolve_cwd(args.get("cwd"))
-    if cwd_err:
-        return _error_result(cwd_err)
-    permission_mode = args.get("permission_mode")
-    disallowed_tools = args.get("disallowed_tools")
-    agent = args.get("agent")  # None -> default persona; "" -> no persona; name -> that persona
-    announce_plan = args.get("announce_plan")
-    batch_tag = uuid.uuid4().hex[:4]
-
-    agent_ids = []
-    for i, item in enumerate(items):
-        task = f"{shared_instruction}\n\n--- item {i + 1}/{len(items)} ---\n\n{item}"
-        item_slug = _slug_from_task(item)
-        name = f"🔀 [FANOUT {i + 1}/{len(items)}] {item_slug}"
-        short_id, err = _spawn_native_agent(
-            task, allowed_tools, cwd, name, permission_mode, disallowed_tools, agent,
-            announce_plan,
-        )
-        if err:
-            return _error_result(
-                f"Failed to spawn item {i + 1}/{len(items)}: {err}\n"
-                f"{len(agent_ids)} item(s) already spawned: {agent_ids}"
-            )
-        agent_ids.append(short_id)
-
-    batch_id = uuid.uuid4().hex[:12]
-    os.makedirs(BATCHES_DIR, exist_ok=True)
-    with open(_batch_path(batch_id), "w") as f:
-        json.dump({"batch_id": batch_id, "agent_ids": agent_ids,
-                   "shared_instruction": shared_instruction, "created_at": time.time()}, f)
-
-    return {
-        "content": [{
-            "type": "text",
-            "text": (f"Spawned {len(agent_ids)} parallel native agents. batch_id: {batch_id}\n"
-                     f"agent ids: {agent_ids}\n"
-                     f"Poll check_fanout_status({batch_id!r}), then get_fanout_result({batch_id!r})."),
-        }],
-        "isError": False,
-    }
-
-
-def check_fanout_status(args):
-    batch_id = args.get("batch_id")
-    path = _batch_path(batch_id) if batch_id else None
-    if not path or not os.path.isfile(path):
-        return _error_result(f"Unknown batch_id: {batch_id}")
-    with open(path) as f:
-        batch = json.load(f)
-
-    agents = _agents_json(include_completed=True) or []
-    by_id = {a.get("id"): a for a in agents}
-    counts = {"working": 0, "blocked": 0, "completed": 0, "failed": 0, "stopped": 0, "unknown": 0}
-    lines = []
-    for aid in batch["agent_ids"]:
-        a = by_id.get(aid)
-        st = (a or {}).get("state") or (a or {}).get("status") or "unknown"
-        counts[st] = counts.get(st, 0) + 1
-        lines.append(f"  - {aid}: {st}")
-
-    text = (
-        f"batch_id {batch_id}: "
-        f"{counts.get('working', 0)} working, {counts.get('blocked', 0)} blocked(needs input), "
-        f"{counts.get('completed', 0)} completed, {counts.get('failed', 0)} failed, "
-        f"{counts.get('stopped', 0)} stopped, {counts.get('unknown', 0)} unknown "
-        f"(of {len(batch['agent_ids'])} total).\n"
-        + "\n".join(lines)
-        + "\nWhen none are working/blocked, call get_fanout_result."
-    )
-    return {"content": [{"type": "text", "text": text}], "isError": False}
-
-
-def get_fanout_result(args):
-    batch_id = args.get("batch_id")
-    path = _batch_path(batch_id) if batch_id else None
-    if not path or not os.path.isfile(path):
-        return _error_result(f"Unknown batch_id: {batch_id}")
-    with open(path) as f:
-        batch = json.load(f)
-
-    agents = _agents_json(include_completed=True) or []
-    by_id = {a.get("id"): a for a in agents}
-
-    parts = []
-    incomplete = []
-    for i, aid in enumerate(batch["agent_ids"]):
-        a = by_id.get(aid)
-        st = (a or {}).get("state") or (a or {}).get("status") or "unknown"
-        sid = (a or {}).get("sessionId") or ""
-        if st in ("working", "busy", "blocked", "unknown") or not sid:
-            incomplete.append(f"{aid} ({st})")
-            continue
-        tr = _find_transcript(sid)
-        txt = _last_assistant_text(tr) if tr else "(no transcript found)"
-        txt, _ = _compact(
-            txt, _result_max_lines(args, DEFAULT_FANOUT_LINES), "compacted",
-            f"call get_delegate_result({aid!r}, full=true) for this item's whole text",
-        )
-        parts.append(f"--- item {i + 1}/{len(batch['agent_ids'])} [{aid}] ---\n{txt}")
-
-    if incomplete:
-        return _error_result(
-            f"These agents in batch {batch_id} are not settled yet: {incomplete}. "
-            "Call check_fanout_status first; fetch results only once all are done."
-        )
-    return {"content": [{"type": "text", "text": "\n\n".join(parts)}], "isError": False}
-
-
-# ---- verified-delegation loop (work -> check -> revise, all local) ----------
-#
-# Shape: a lazily-advanced state machine persisted to one JSON file per run.
-#   phase "working"  -> a worker `claude --bg` agent is (re)doing the task
-#   phase "checking" -> a checker `claude --bg` agent is independently verifying
-#   phase "passed"   -> terminal; final_answer holds the signed-off result
-#   phase "failed"   -> terminal; failure_report explains why (cap / stagnation /
-#                        timeout / a crashed sub-agent), last candidate kept
-#
-# _advance_verified() is called on every check_verified_status / get_verified_result
-# and moves the run AT MOST one transition per call by reading the sub-agents'
-# NATIVE state (the same `claude agents --json` the rest of this file uses). No
-# sleeping, no blocking -- the parent's polling cadence drives the loop.
 
 _VERDICT_RE = re.compile(r"VERDICT:\s*(PASS|FAIL)", re.IGNORECASE)
 
@@ -2895,7 +2754,210 @@ def stop_agy(args):
 
 # ---- tool schema (parent side only) ------------------------------------------
 
+# ---- deep delegation -----------------------------------------------------------
+# The local engine is free and serves one decode stream at full speed, so the
+# best use of it is a few DEEP runs that do work the supervisor would otherwise
+# do itself: investigate a question to the bottom, prepare a context pack before
+# a task, or review a diff adversarially. Each writes a dossier under
+# FINDINGS_DIR/<project>/ that get_delegate_result returns in full.
+FINDINGS_DIR = os.environ.get(
+    "CLAUDE_LOCAL_DELEGATE_FINDINGS_DIR", os.path.join(STATE_DIR, "findings"),
+)
+DEEP_PERSONA = os.environ.get("CLAUDE_LOCAL_DELEGATE_DEEP_AGENT", "local-deep")
+# Measured 2026-10-10: a real deep_dive on this repo was still productively
+# verifying at 134 turns (scratch probes, no repeats), so 150 cut it too close.
+DEEP_MAX_TURNS = _parse_max_turns(os.environ.get("CLAUDE_LOCAL_DELEGATE_DEEP_MAX_TURNS"), 300)
+# A dossier is meant to be read whole; this only guards against a runaway file.
+DEEP_REPORT_MAX_CHARS = _parse_env_num("CLAUDE_LOCAL_DELEGATE_DEEP_REPORT_MAX_CHARS", 60_000)
+
+
+def _spawn_deep(kind, title, task_text, cwd, args, allowed_tools=None):
+    """Spawn one deep run with the deep persona and turn budget, and record its
+    report path in provenance so get_delegate_result can return the dossier."""
+    report_path = args["_report_path"]
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    label = {"dive": "DEEP", "pack": "PACK", "review": "REVIEW"}[kind]
+    name = args.get("name") or f"\u26a1 [{label}] {_slug_from_task(title)}"
+    short_id, err = _spawn_native_agent(
+        task_text, allowed_tools or DEFAULT_ALLOWED_TOOLS, cwd, name,
+        agent=DEEP_PERSONA if _persona_exists(DEEP_PERSONA) else None,
+        profile="think", complexity="large", est_minutes=args.get("est_minutes"),
+        task_id=args.get("task_id"),
+    )
+    if err:
+        return _error_result(err)
+    max_turns = args.get("max_turns")
+    _record_turn_cap(short_id, max_turns if isinstance(max_turns, int) and max_turns >= 0
+                     else DEEP_MAX_TURNS)
+    entry = _provenance_for(short_id) or {}
+    entry.update({"deep_kind": kind, "report_path": report_path})
+    _record_provenance(short_id, entry)
+    return {"content": [{"type": "text", "text": (
+        f"Spawned deep {kind} run {short_id} on the local model.\n"
+        f"Dossier: {report_path}\n"
+        "Keep working on your own task meanwhile. When you need the answer call "
+        f"get_delegate_result({short_id!r}, wait_seconds=0) (or a long wait if you have nothing "
+        "else to do): it returns the whole dossier, not a compacted tail. "
+        "Review it, then rate_delegate."
+    )}], "isError": False}
+
+
+def _deep_cwd(args):
+    cwd, err = _resolve_cwd(args.get("cwd"))
+    return cwd, (_error_result(err) if err else None)
+
+
+def deep_dive(args):
+    question = args.get("question")
+    if not isinstance(question, str) or not question.strip():
+        return _error_result("`question` is required.")
+    cwd, err = _deep_cwd(args)
+    if err:
+        return err
+    args["_report_path"] = deep_tasks.new_report_path(FINDINGS_DIR, cwd, "dive", question)
+    text = deep_tasks.dive_task(question, args.get("context"), args["_report_path"],
+                                deep_tasks.findings_dir(FINDINGS_DIR, cwd),
+                                edits_allowed=bool(args.get("allow_edits")))
+    return _spawn_deep("dive", question, text, cwd, args)
+
+
+def context_pack(args):
+    task = args.get("task")
+    if not isinstance(task, str) or not task.strip():
+        return _error_result("`task` is required.")
+    cwd, err = _deep_cwd(args)
+    if err:
+        return err
+    args["_report_path"] = deep_tasks.new_report_path(FINDINGS_DIR, cwd, "pack", task)
+    text = deep_tasks.pack_task(task, args.get("focus"), args["_report_path"],
+                                deep_tasks.findings_dir(FINDINGS_DIR, cwd))
+    return _spawn_deep("pack", task, text, cwd, args)
+
+
+def review_diff(args):
+    cwd, err = _deep_cwd(args)
+    if err:
+        return err
+    base = args.get("base") or "HEAD"
+    if not re.fullmatch(r"[\w./~^@{}-]+", base):
+        return _error_result("`base` must be a git revision (e.g. HEAD, main, HEAD~3).")
+    title = f"review {base} {args.get('focus') or ''}"
+    args["_report_path"] = deep_tasks.new_report_path(FINDINGS_DIR, cwd, "review", title)
+    text = deep_tasks.review_task(base, args.get("focus"), args.get("test_command"),
+                                  args["_report_path"], deep_tasks.findings_dir(FINDINGS_DIR, cwd))
+    return _spawn_deep("review", title, text, cwd, args)
+
+
+def project_findings(args):
+    cwd, err = _deep_cwd(args)
+    if err:
+        return err
+    folder = deep_tasks.findings_dir(FINDINGS_DIR, cwd)
+    if args.get("read"):
+        name = os.path.basename(str(args["read"]))
+        try:
+            with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as f:
+                return {"content": [{"type": "text", "text": f.read(DEEP_REPORT_MAX_CHARS)}],
+                        "isError": False}
+        except OSError as exc:
+            return _error_result(f"Cannot read {name}: {exc}")
+    rows = deep_tasks.list_findings(FINDINGS_DIR, cwd, args.get("query"),
+                                    int(args.get("limit") or 30))
+    return {"content": [{"type": "text", "text": json.dumps(
+        {"folder": folder, "findings": rows}, ensure_ascii=False, indent=1)}], "isError": False}
+
+
+def _deep_report(handle):
+    """The dossier a deep run wrote, or None (not a deep run / not written)."""
+    entry = _provenance_for(handle) or {}
+    path = entry.get("report_path")
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read(DEEP_REPORT_MAX_CHARS + 1)
+    except OSError:
+        return f"[deep run: the dossier {path} was NOT written; only the final message is available]"
+    if not text.strip():
+        return f"[deep run: the dossier {path} is empty]"
+    cut = len(text) > DEEP_REPORT_MAX_CHARS
+    return (f"=== DOSSIER {path} ===\n" + text[:DEEP_REPORT_MAX_CHARS]
+            + (f"\n[... truncated at {DEEP_REPORT_MAX_CHARS} chars; read the file for the rest]" if cut else ""))
+
+
+def _with_deep_report(handle, body):
+    report = _deep_report(handle)
+    return body if report is None else report + "\n\n=== FINAL MESSAGE ===\n" + body
+
+
 PARENT_TOOLS = [
+    {
+        "name": "deep_dive",
+        "description": (
+            "Deep investigation on the local model: one question answered all the way down "
+            "(reads code, runs commands and scratch scripts, tests hypotheses, checks git history "
+            "and docs). Writes an evidence dossier (answer + confidence, cited evidence, ruled-out "
+            "hypotheses, open risks, next steps) that get_delegate_result returns in full. Start it "
+            "early, keep working, collect when needed. The engine serves one stream: prefer 1-2 "
+            "deep runs at a time over many small scouts."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "question": {"type": "string", "description": "What to find out. Name the files/symbols/symptoms you already know."},
+            "context": {"type": "string", "description": "What you already know or suspect, so the run starts past it and can try to falsify it."},
+            "cwd": {"type": "string", "description": "Project root. Defaults to this server's cwd."},
+            "allow_edits": {"type": "boolean", "description": "Let the run modify project files (e.g. to try a fix). Default false: read and experiment in /tmp only."},
+            "task_id": {"type": "string"}, "name": {"type": "string"},
+            "est_minutes": {"type": "integer", "minimum": 0},
+            "max_turns": {"type": "integer", "minimum": 0, "description": f"Turn ceiling (default {DEEP_MAX_TURNS}); 0 disables it. The repeat-call cap always applies."},
+        }, "required": ["question"]},
+    },
+    {
+        "name": "context_pack",
+        "description": (
+            "Before you start a task: a local deep run builds the briefing you would otherwise spend "
+            "your first hour on -- files/symbols with path:line, call and data flow, covering tests "
+            "(run, with results), recent history, conventions, traps, a suggested plan. Does not "
+            "implement anything. Returns the full dossier via get_delegate_result."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "task": {"type": "string", "description": "The task you are about to do, as you would describe it to a colleague."},
+            "focus": {"type": "string", "description": "Optional starting points: paths, symbols, error text."},
+            "cwd": {"type": "string"}, "task_id": {"type": "string"}, "name": {"type": "string"},
+            "est_minutes": {"type": "integer", "minimum": 0},
+            "max_turns": {"type": "integer", "minimum": 0},
+        }, "required": ["task"]},
+    },
+    {
+        "name": "review_diff",
+        "description": (
+            "Adversarial review of your uncommitted change (git diff <base> + untracked files) by a "
+            "local deep run: tries to prove each defect with a failing input or a run, runs the "
+            "covering tests, fixes nothing. Free second opinion -- use it on every non-trivial change "
+            "before you call it done. Returns the full review via get_delegate_result."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "cwd": {"type": "string"},
+            "base": {"type": "string", "description": "Git revision to diff against. Default HEAD."},
+            "focus": {"type": "string", "description": "What the change is meant to do and what worries you."},
+            "test_command": {"type": "string", "description": "Command that runs the relevant tests."},
+            "task_id": {"type": "string"}, "name": {"type": "string"},
+            "est_minutes": {"type": "integer", "minimum": 0},
+            "max_turns": {"type": "integer", "minimum": 0},
+        }},
+    },
+    {
+        "name": "project_findings",
+        "description": (
+            "List (or read one of) the dossiers earlier deep runs wrote for this project, newest "
+            "first. Check it before launching a deep run on something that may already be answered."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "cwd": {"type": "string"},
+            "query": {"type": "string", "description": "Substring filter over file name and title."},
+            "read": {"type": "string", "description": "A file name from the listing: return its content."},
+            "limit": {"type": "integer", "minimum": 1},
+        }},
+    },
     {
         "name": "delegate_to_local",
         "description": (
@@ -3003,47 +3065,6 @@ PARENT_TOOLS = [
             },
             "required": ["run_id"],
         },
-    },
-    {
-        "name": "fan_out_to_local",
-        "description": (
-            "Run independent items in parallel, one local agent each. Put common context "
-            "in shared_instruction first for vLLM prefix-cache reuse; keep items short."
-        ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "items": {"type": "array", "items": {"type": "string"}, "description": "Independent pieces of material, one per parallel agent."},
-                    "shared_instruction": {"type": "string", "description": "The instruction applied to every item."},
-                    "allowed_tools": {"type": "string", "description": f"Same as delegate_to_local, applied to every item. Defaults to the capability-rich WRITER set ('{DEFAULT_ALLOWED_TOOLS}'); for lookup-only fan-outs pass the read-only subset ('{DEFAULT_READ_ONLY_TOOLS}')."},
-                    "cwd": {"type": "string", "description": "Working directory for every agent."},
-                    "permission_mode": {"type": "string", "description": f"Same as delegate_to_local's permission_mode, applied to every agent. Defaults to '{DEFAULT_PERMISSION_MODE}'."},
-                    "disallowed_tools": {"type": "string", "description": "Same as delegate_to_local's disallowed_tools, applied to every agent."},
-                    "agent": {"type": "string", "description": "Same as delegate_to_local's agent persona, applied to every agent. Defaults to 'local-worker'."},
-                    "announce_plan": {"type": "boolean", "description": f"Same as delegate_to_local's announce_plan, applied to every agent. Default {DEFAULT_ANNOUNCE_PLAN}."},
-                },
-                "required": ["items", "shared_instruction"],
-            },
-    },
-    {
-        "name": "check_fanout_status",
-        "description": "Aggregate the native states (working/blocked/completed/failed/stopped) of a fan_out_to_local batch.",
-        "inputSchema": {"type": "object", "properties": {"batch_id": {"type": "string"}}, "required": ["batch_id"]},
-    },
-    {
-        "name": "get_fanout_result",
-        "description": (
-            "Read every agent's final answer from its native transcript for a "
-            "fan_out_to_local batch. Errors until all agents are settled. Each item is "
-            f"compacted to its last {DEFAULT_FANOUT_LINES} lines plus a sha256 by default "
-            "(N full answers in one tool result is the single biggest context cost of a "
-            "fan-out); pass full=true, or fetch one item with get_delegate_result(agent_id, full=true)."
-        ),
-        "inputSchema": {"type": "object", "properties": {
-            "batch_id": {"type": "string"},
-            "full": {"type": "boolean", "description": "Return every item's whole answer. Default false."},
-            "max_lines": {"type": "integer", "description": f"Per-item tail size. Default {DEFAULT_FANOUT_LINES}."},
-        }, "required": ["batch_id"]},
     },
     {
         "name": "delegate_verified",
@@ -3266,7 +3287,7 @@ def show_agent_tree_handler(args):
             st = (live.get("state") or live.get("status") or "settled").upper()
             icon = "🟢" if st in ("WORKING", "RUNNING") else ("🟡" if st == "BLOCKED" else "⚪")
             elapsed = round(now - dw.get("at", now), 1)
-            model = dw.get("model", "Qwen-3.8-27B")
+            model = dw.get("model", "local")
             name = dw.get("name", "worker")
             is_last = (i == len(direct_workers[:8]) - 1 and not architects and not agy_runs)
             prefix = "  └──" if is_last else "  ├──"
@@ -3293,7 +3314,7 @@ def show_agent_tree_handler(args):
                     cst = (clive.get("state") or clive.get("status") or "settled").upper()
                     cicon = "🟢" if cst in ("WORKING", "RUNNING") else ("🟡" if cst == "BLOCKED" else "⚪")
                     celapsed = round(now - ch.get("at", now), 1)
-                    cmodel = ch.get("model", "Qwen-3.8-27B")
+                    cmodel = ch.get("model", "local")
                     cname = ch.get("name", "worker")
                     pipe = "  │      └──" if j == len(children) - 1 else "  │      ├──"
                     lines.append(f"{pipe} {cicon} 🔨 TIER 0: WORKER [{cid}] ({cmodel}) - {cst} ({celapsed:.1f}s)")
@@ -3409,15 +3430,16 @@ def research_status_handler(args):
 
 TOOL_HANDLERS = {
     "delegate_to_local": start_delegate,
+    "deep_dive": deep_dive,
+    "context_pack": context_pack,
+    "review_diff": review_diff,
+    "project_findings": project_findings,
     "delegate_to_architect": start_architect_delegate,
     "check_delegate_status": check_status,
     "get_delegate_result": get_result,
     "rate_delegate": rate_delegate,
     "watch_delegate": watch_delegate,
     "stop_delegate": stop_delegate,
-    "fan_out_to_local": fan_out_to_local,
-    "check_fanout_status": check_fanout_status,
-    "get_fanout_result": get_fanout_result,
     "delegate_verified": delegate_verified,
     "check_verified_status": check_verified_status,
     "get_verified_result": get_verified_result,
@@ -3483,7 +3505,7 @@ def _response(msg_id, result, error=None):
 # queued every later call of the session behind it: Claude Code backgrounds a call
 # after 120 s, but the server stayed busy and each queued call timed out at 960 s.
 # These run on their own thread; everything else stays serial.
-CONCURRENT_CALLS = frozenset({"get_delegate_result", "watch_delegate", "get_fanout_result", "get_agy_result"})
+CONCURRENT_CALLS = frozenset({"get_delegate_result", "watch_delegate", "get_agy_result"})
 
 
 def _concurrent_call(msg):

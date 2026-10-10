@@ -7,7 +7,8 @@ Reads the hook JSON on stdin (for session_id, to exclude self). Calls
 `claude agents --json` (cheap, no model). Emits additionalContext:
   - count of running delegate agents + their names
   - any BLOCKED agents, by name, flagged for an answer
-  - an IDLE hint when running < target (env CLAUDE_DELEGATE_TARGET, default 3)
+  - the engine's real state (requests it serves at once, queue, cached
+    conversations) and how many more deep delegates fit, from engine_status
   - an OFFLINE notice instead when the local backend does not answer, so the
     main session stops trying to delegate locally and routes to itself / AGY
 Never fails the turn: any error -> silent no-op.
@@ -18,10 +19,21 @@ import subprocess
 import sys
 import urllib.request
 
-TARGET = int(os.environ.get("CLAUDE_DELEGATE_TARGET", "3"))
+REPO = os.path.expanduser("~/.claude/claude-local-delegate")
 RUNNING = {"running", "working", "busy", "in_progress"}
 BLOCKED = {"blocked", "waiting", "needs_input"}
 SETTINGS = os.path.expanduser("~/.claude/vllm.delegate.settings.json")
+
+
+def local_run_ids():
+    """Ids this MCP spawned on the local backend (provenance), or None if unreadable."""
+    state = os.environ.get("CLAUDE_LOCAL_DELEGATE_STATE_DIR", os.path.expanduser("~/.claude-local-delegate"))
+    try:
+        with open(os.path.join(state, "runs.json")) as f:
+            runs = json.load(f).get("runs", {})
+    except Exception:
+        return None
+    return {rid for rid, e in runs.items() if isinstance(e, dict) and e.get("backend") == "local"}
 
 
 def backend_online():
@@ -55,8 +67,11 @@ def main():
     except Exception:
         return  # supervisor down / no roster -> say nothing
 
+    local_ids = local_run_ids()
     running, blocked = [], []
     for a in agents:
+        if local_ids is not None and a.get("id") not in local_ids:
+            continue  # paid background sessions do not load the local engine
         sid = str(a.get("sessionId") or a.get("session_id") or "")
         if self_sid and (sid == self_sid or sid.startswith(self_sid) or self_sid.startswith(a.get("id", "\0"))):
             continue
@@ -78,15 +93,21 @@ def main():
     online = backend_online()
     if online is False:
         lines.append("Local backend is OFFLINE (gateway does not answer): do not call "
-                     "delegate_to_local/fan_out_to_local now. Do the work on the main model, "
+                     "delegate_to_local or the deep tools now. Do the work on the main model, "
                      "or send self-contained mid-size tasks to delegate_to_agy.")
-    elif len(running) < TARGET:
-        lines.append(f"Local pool is idle ({len(running)}/{TARGET}). Augment mode: while you work, "
-                     f"fan_out_to_local small scoped scouts (code lookups, doc/web research, "
-                     f"tiny edits, test runs); size each with complexity, check project_sync.pool "
-                     f"for the token budget.")
     else:
-        lines.append(f"Pool busy ({len(running)} running); glance at watch_delegate for any drift.")
+        advice = ""
+        try:
+            sys.path.insert(0, REPO)
+            import engine_status
+            advice = engine_status.advice(engine_status.snapshot(SETTINGS, timeout=2), len(running))
+        except Exception:
+            pass
+        lines.append(advice or "Local engine state unknown.")
+        if not running:
+            lines.append("Deep mode: hand the local model work you would otherwise do yourself -- "
+                         "context_pack before a task, deep_dive on an open question, review_diff on "
+                         "every non-trivial change -- and keep working while it runs.")
 
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",

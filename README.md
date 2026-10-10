@@ -1,7 +1,8 @@
 # claude-local-delegate
 
 An MCP server for Claude Code with tools to hand a task to a locally-hosted
-model (e.g. served by vLLM) while keeping your main session on your regular
+model (here Qwen3.8-Flash-Next 125B MoE on the Strata engine, 4x RTX 3090,
+behind LiteLLM) while keeping your main session on your regular
 subscription/model. Every delegation is a **native Claude Code background
 agent** (`claude --bg` in the agent-view system) pointed at your local
 backend via `--settings` — so the delegated work is a real, first-class,
@@ -11,8 +12,11 @@ server invented on its own.
 Parent-side tools: `delegate_to_local`, `check_delegate_status`,
 `get_delegate_result`, `watch_delegate`, `stop_delegate`, `delegate_verified`
 (work → local-checker → revise loop), `check_verified_status`,
-`get_verified_result`, `fan_out_to_local`,
-`check_fanout_status`, `get_fanout_result`.
+`get_verified_result`, and the deep tools `deep_dive`, `context_pack`,
+`review_diff`, `project_findings` (one deep run that writes a dossier, returned
+whole). `fan_out_to_local` and its status/result tools were removed on
+2026-10-10: the Strata engine decodes one request at a time, so a fan-out only
+queued behind itself.
 
 Repository navigation splits into two separately registered MCP servers. The
 custom `code-nav` MCP (`code_nav_server.py`) is **only a repository-map router**:
@@ -103,9 +107,8 @@ v0.8.0 makes supervision cheaper and the defaults honest. The headline changes:
 - **Result compaction.** `get_delegate_result` returns the first 4 + last 15
   lines of the agent's final answer plus a `sha256` of the full text, instead of
   the whole thing. `full: true` returns everything; `max_lines` sets the tail.
-  `get_fanout_result` compacts **each** item to its last 15 lines the same way,
-  with the same params. Defaults come from `CLAUDE_LOCAL_DELEGATE_RESULT_LINES`
-  (15) and `CLAUDE_LOCAL_DELEGATE_FANOUT_LINES` (15). Nothing on disk is
+  Default from `CLAUDE_LOCAL_DELEGATE_RESULT_LINES` (now 60). A deep run's
+  dossier is never compacted. Nothing on disk is
   truncated — the transcript is intact and `full: true` still returns all of it.
 - **Real least-privilege for read-only delegates.** A delegation whose
   `allowed_tools` are only read-only (Read, Grep, Glob, NotebookRead, TodoWrite,
@@ -133,9 +136,8 @@ v0.8.0 makes supervision cheaper and the defaults honest. The headline changes:
   (path, size, mtime), so polling an idle or finished agent costs nothing.
 - **Lock contention gone.** Read-only MCP calls
   (`project_sync`, `local_backend_info`, `check_delegate_status`,
-  `watch_delegate`, `get_delegate_result`, `check_fanout_status`,
-  `get_fanout_result`) no longer take the cross-process operations flock, and
-  `delegate_to_local` / `fan_out_to_local` / `continue_delegate` release it while
+  `watch_delegate`, `get_delegate_result`) no longer take the cross-process operations flock, and
+  `delegate_to_local` / the deep tools / `continue_delegate` release it while
   the `claude --bg` subprocess starts (up to 120 s), holding their pool slot with
   an in-flight ticket file (`~/.claude-local-delegate/inflight.json`) instead.
   Previously one spawn froze every other supervisor's reads and spawns for up to
@@ -264,7 +266,7 @@ it, including your main model.
 In addition to direct local workers, the harness supports a **3-tier hierarchical architecture**:
 1. **Tier 2 (Claude Supervisor / Opus):** High-level decomposition and review.
 2. **Tier 1 (Google Gemini Architect):** Background `claude --bg` session running on Gemini (via LiteLLM on the vLLM server). Reads repository context, explores codebase topology via `code-nav` and Serena LSP, creates atomic subtask specifications, and delegates mechanical work to local workers.
-3. **Tier 0 (Local Workers on 4x RTX 3090):** High-throughput local Qwen 3.8 27B workers performing bounded edits and running test checks.
+3. **Tier 0 (Local Workers on 4x RTX 3090):** Local Qwen3.8-Flash-Next (125B MoE, Strata) workers: deep investigations, context packs, adversarial reviews, bounded edits and test checks.
 
 ### Spawning an Architect
 - **Via dedicated tool:** `delegate_to_architect(task="Explore module and prepare atomic edits", cwd="...")`
@@ -280,11 +282,11 @@ Inspect the entire multi-agent tree from a single point of entry:
 👑 TIER 2: CLAUDE SUPERVISOR (Opus / Main Session)
   ├── 🧠 TIER 1: GEMINI ARCHITECT [c4d9a1f2] (gemini-3.1-flash-lite) - WORKING (14.2s)
   │      Name: refactor-auth-architecture
-  │      ├── 🔨 TIER 0: WORKER [aa46976f] (Qwen-3.8-27B) - WORKING (8.1s)
+  │      ├── 🔨 TIER 0: WORKER [aa46976f] (default_model) - WORKING (8.1s)
   │      │      Task: write-auth-migration
-  │      └── 🔨 TIER 0: WORKER [bb000002] (Qwen-3.8-27B) - DONE (24.0s)
+  │      └── 🔨 TIER 0: WORKER [bb000002] (default_model) - DONE (24.0s)
   │             Task: test-auth-migration
-  └── 🔨 TIER 0: DIRECT WORKER [d26c0a4c] (Qwen-3.8-27B) - SETTLED
+  └── 🔨 TIER 0: DIRECT WORKER [d26c0a4c] (default_model) - SETTLED
          Task: audit-run-launch
 ```
 
@@ -367,7 +369,7 @@ for answering an agent that is **`blocked`** on its own question.
 
 **Prefer many small delegations over one long run.** A task you can state as a
 single outcome is easy to watch and cheap to redo if it drifts; a sprawling one
-is neither. Split big work and delegate the pieces (or `fan_out_to_local`). The
+is neither. Split big work and delegate the pieces. The
 supervision preamble also tells the agent to flag, in its plan, when a task is
 bigger than ~5 steps instead of silently doing all of it.
 
@@ -573,57 +575,32 @@ Without `wait_seconds`, it errors while the agent is still `working`; use
 before trusting it** — see the A/B test above for why a local-model agent can
 look right while being subtly wrong.
 
-**`fan_out_to_local`** — `{items[], shared_instruction, allowed_tools?, cwd?, permission_mode?}`
-→ map-reduce over the local model: spawns one native background agent per item,
-all sharing `shared_instruction`. Returns a `batch_id` immediately (same async
-pattern as everything else here). Why this beats stuffing everything into one
-giant local context: each item fits comfortably in its own window, chunking
-tends to beat one huge context on accuracy (long-context recall degrades the
-more you cram in — "lost in the middle"), and the *parent* session never reads
-the raw material, only the per-item answers.
+**Deep tools** (2026-10-10) — the local model is a strong 125B MoE, so it gets
+work the supervisor would otherwise do itself. Each spawns one run with the
+`local-deep` persona (dig to the bottom, verify by running things, falsify
+hypotheses) and a 300-turn ceiling, and writes a Markdown dossier to
+`~/.claude-local-delegate/findings/<project>-<hash>/`. `get_delegate_result`
+returns that dossier whole, followed by the run's final message; a run that
+never wrote its dossier is reported as such.
 
-Real ceiling to know about: parallel items share this box's fixed vLLM
-concurrency (`--max-num-seqs`, default assumed 16 here — override via
-`CLAUDE_LOCAL_DELEGATE_MAX_CONCURRENCY`) and, more importantly, its
-VRAM/KV-cache pool. More items than that don't fail, they queue behind the
-first batch — and if each item's context is itself large, several running
-near-simultaneously contend for the same KV-cache, so parallelism doesn't scale
-as cleanly as "more items = more parallel" implies. The tool warns when a batch
-exceeds the configured ceiling; it does not cap batch size itself.
+- **`deep_dive`** — `{question, context?, cwd?, allow_edits?}`: one question
+  answered all the way down. Dossier: answer + confidence, numbered evidence
+  (path:line or URL, and how it was verified), ruled-out hypotheses, open
+  risks, recommended next steps. Read-only on the project unless `allow_edits`.
+- **`context_pack`** — `{task, focus?, cwd?}`: the briefing before a task —
+  files/symbols with path:line, call/data flow, covering tests (run), recent
+  history, conventions, traps, a suggested plan. Implements nothing.
+- **`review_diff`** — `{base?=HEAD, focus?, test_command?, cwd?}`: adversarial
+  review of `git diff <base>` plus untracked files; tries to prove each defect,
+  runs the covering tests, fixes nothing.
+- **`project_findings`** — `{cwd?, query?, read?}`: list (newest first) or read
+  earlier dossiers for the project. Every deep run is told to read the relevant
+  ones first and to say where it confirms or contradicts them.
 
-**`check_fanout_status`** — `{batch_id}` → native-state counts across the
-batch (working / blocked / completed / failed / stopped) plus each agent's
-state.
-
-**`get_fanout_result`** — `{batch_id, full?, max_lines?}` → every item's final
-answer, read from each agent's native transcript, concatenated. Each item is
-compacted to its last 15 lines plus a `sha256` by default
-(`CLAUDE_LOCAL_DELEGATE_FANOUT_LINES`, default 15) — N full answers in one tool
-result is the single biggest context cost of a fan-out; `full: true` returns
-each item whole, and `max_lines` overrides the per-item tail. Errors until all
-agents are settled. Synthesize yourself (or delegate the synthesis to one more
-`delegate_to_local` run if you want it done by the model).
-
-### Verified delegation (`delegate_verified`)
-
-For a task with a **checkable outcome** (code that must build / pass tests /
-meet stated criteria), `delegate_verified` runs a closed **work → independent
-check → revise** loop *entirely on the local model*, and hands the parent back
-only a result a checker has already signed off on — or a failure report with
-the checker's reasons. The point is that the parent session never has to review
-raw local-model output, or remember it has a delegate in flight.
-
-One worker `claude --bg` agent does the task. Then a **checker** agent — the
-`local-checker` persona, with **no Edit/Write tools by design** — re-verifies
-against the real working tree: reads the diff, builds, runs tests/lint, and
-ends its message with `VERDICT: PASS` or `VERDICT: FAIL` plus concrete reasons.
-On `FAIL` those reasons are prepended to a fresh worker round.
-
-It is a lazily-advanced state machine, same pattern as fan-out batches: state
-lives in `~/.claude-local-delegate/verified/<vid>.json`, and each
-`check_verified_status` call moves the run **at most one step** by reading the
-sub-agents' native state. Nothing blocks the single-threaded MCP loop; the
-parent's polling cadence drives it.
+Capacity: `project_sync.pool.engine` reads the engine's own `/v1/status` and
+`/metrics` (`CLAUDE_LOCAL_DELEGATE_ENGINE_URL`): requests served at once, queue,
+parked conversations. With one decode stream, 1-2 live deep runs is the sweet
+spot; beyond the 10 parked conversations each switch re-reads the context.
 
 **`delegate_verified`** — returns a `vid` immediately.
 
@@ -672,10 +649,9 @@ first-class background session owned by Claude Code's agent-view supervisor:
   id, cwd, native `state`.
 - **Transcript (the result)**: `~/.claude/projects/<sanitized-cwd>/<sessionId>.jsonl`
   — the same file `claude attach` / `claude logs` read.
-- **This server's on-disk artifacts** are `~/.claude-local-delegate/batches/<batch_id>.json`,
-  which maps a fan-out `batch_id` to the native agent ids it spawned so
-  `check_fanout_status` / `get_fanout_result` can aggregate them,
-  `~/.claude-local-delegate/verified/<vid>.json`, the state machine for a
+- **This server's on-disk artifacts** are `~/.claude-local-delegate/findings/<project>-<hash>/*.md`,
+  the deep-run dossiers (`batches/` holds only historical fan-out records, still
+  read by the reports), `~/.claude-local-delegate/verified/<vid>.json`, the state machine for a
   `delegate_verified` run (spec, phase, per-iteration worker/checker ids and
   verdicts, final answer), `~/.claude-local-delegate/runs.json`, the per-spawn
   routing provenance (model, base URL, settings sha, permission mode, allowed
@@ -735,9 +711,11 @@ To stop a delegated agent that hangs, runs long, or drifts off task, use
 the native `TaskStop` tool with its name, or `claude attach <id>` then
 interrupt. It settles to `done` in ~10–15 s; to then point it a different way,
 `delegate_to_local` again with a sharper task (re-use its transcript via
-`get_delegate_result`). A running agent won't read a mid-run `SendMessage`, and
-a stopped one is unreachable by it — reserve `SendMessage` for answering a
-`blocked` agent.
+`get_delegate_result`). Since 2026-10-10 a running agent DOES read a native
+`SendMessage` at its next tool round, both ways, provided both sides set
+`crossSessionInbound: "accept"` and the delegate talks to Strata directly
+(LiteLLM drops the mid-conversation system message Claude Code uses to deliver
+it). A correction can therefore go straight to a running agent.
 
 ## Testing manually
 
@@ -768,7 +746,8 @@ sessions with only this server's `--mcp-config` and no other context.
   and correctly distinguished `check_delegate_status` (status + log) from
   `get_delegate_result` (final answer) -- exactly matching each tool's
   description, not something it could have inferred from a hidden default.
-- Task 2 (three independent facts to combine): correctly chose
+- Task 2 (three independent facts to combine; `fan_out_to_local` has since been
+  removed): correctly chose
   `fan_out_to_local` over three manual `delegate_to_local` calls, correctly
   sequenced `fan_out_to_local` → `check_fanout_status` → `get_fanout_result`,
   and cited the "review before trusting" line from `get_delegate_result`'s

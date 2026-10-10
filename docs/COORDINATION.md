@@ -40,7 +40,7 @@ and returns an explicit UNVERIFIED PASS. Pass `always_verify: true` to force it.
    session's reservation touches the same paths, or a dependency is not done,
    that record is visible only -- start your follow-on work anyway and reconcile
    in review. There is no task_update(status="active") gate to retry.
-5. Pass task_id to delegate_to_local, fan_out_to_local or delegate_verified.
+5. Pass task_id to delegate_to_local, deep_dive, context_pack, review_diff or delegate_verified.
    Prefer separate task reservations for separate writing workers. A write
    fan-out under one reservation does NOT isolate siblings from each other.
    Read-only fan-outs are appropriate.

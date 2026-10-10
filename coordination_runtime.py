@@ -7,19 +7,21 @@ from pathlib import Path
 import time
 import uuid
 from coordination import Board, TOOLS, STRING, schema
+import engine_status
 
 # Tools that only read state. They bypass the cross-process operations lock:
 # a status poll must stay cheap even while another supervisor is spawning.
 READ_ONLY_CALLS = frozenset({
     'project_sync', 'local_backend_info', 'check_delegate_status', 'watch_delegate',
-    'get_delegate_result', 'check_fanout_status', 'get_fanout_result', 'rate_delegate',
-    'check_agy_status', 'get_agy_result', 'stop_agy', 'show_agent_tree',
+    'get_delegate_result', 'rate_delegate',
+    'check_agy_status', 'get_agy_result', 'stop_agy', 'show_agent_tree', 'project_findings',
 })
 # Tools whose slow step is a `claude --bg` or `agy` subprocess and which hold no
 # half-written state across it, so the lock may be released while it runs.
 # The verified loop is deliberately NOT here: its state machine advances across
 # the spawn, and two supervisors polling one vid must not both launch a checker.
-SPAWN_CALLS = frozenset({'delegate_to_local', 'delegate_to_architect', 'fan_out_to_local', 'continue_delegate', 'delegate_to_agy'})
+SPAWN_CALLS = frozenset({'delegate_to_local', 'delegate_to_architect', 'continue_delegate', 'delegate_to_agy',
+                         'deep_dive', 'context_pack', 'review_diff'})
 
 
 def install(server):
@@ -229,14 +231,18 @@ def install(server):
         used = sum(server._task_context_estimate(recorded.get(r, {}).get('complexity'))
                    for r in working) + pending * server.UNSIZED_TASK_CONTEXT
         free = max(0, budget - used)
-        return {'known': True, 'context_budget': budget, 'context_in_use_est': used,
+        engine = engine_status.snapshot(server._default_settings_path())
+        return {'known': True, 'engine': engine,
+                'advice': engine_status.advice(engine, len(working)),
+                'context_budget': budget, 'context_in_use_est': used,
                 'context_free_est': free,
                 'fits_now': {c: free // n for c, n in server.TASK_CONTEXT_ESTIMATE.items()},
                 'local_running': len(working), 'blocked': len(active) - len(working),
                 'spawning': pending, 'session_backstop': server.LOCAL_SERVER_MAX_CONCURRENCY,
                 'running_ids': working,
-                'note': 'Plan by tokens, not by session count: many small scoped runs beat one '
-                        'large run. Pass complexity so the estimate is accurate. Advisory only.'}
+                'note': 'engine.serving is how many requests the engine decodes at once; with 1, '
+                        'delegates share one stream, so a few deep runs beat many small scouts. '
+                        'The context_* figures are a KV estimate. Advisory only.'}
 
     def sync(args):
         data = board.sync(owner, args)
@@ -273,7 +279,7 @@ def install(server):
         'continue_delegate': continue_delegate,
     })
     for tool in server.PARENT_TOOLS:
-        if tool['name'] in ('delegate_to_local', 'fan_out_to_local', 'delegate_verified'):
+        if tool['name'] in ('delegate_to_local', 'delegate_verified', 'deep_dive', 'context_pack', 'review_diff'):
             tool['inputSchema']['properties']['task_id'] = {
                 'type': 'string', 'description': 'Active task_claim reservation owned by this MCP session. Pass it for bookkeeping; the task always starts, and overlapping reservations are visible in project_sync but never block it.'}
         if 'SendMessage' in tool['description']:

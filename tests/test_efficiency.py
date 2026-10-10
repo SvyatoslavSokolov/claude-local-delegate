@@ -61,7 +61,9 @@ class EfficiencyTests(unittest.TestCase):
 
     def test_parent_tool_schema_stays_compact(self):
         encoded = json.dumps(self.s.PARENT_TOOLS, separators=(',', ':'))
-        self.assertLess(len(encoded), 14000)
+        # Raised 2026-10-10 for the deep tools: the user prioritises accuracy and speed over
+        # schema tokens. Still a guard against unbounded growth.
+        self.assertLess(len(encoded), 20000)
 
     # ---- compaction ---------------------------------------------------------
     def test_compact_keeps_short_text_whole(self):

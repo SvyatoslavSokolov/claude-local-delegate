@@ -35,6 +35,8 @@ class RuntimeTests(unittest.TestCase):
         self.spawn = patch.object(self.s, '_spawn_native_agent', return_value=('abc12345', None)).start()
         self.addCleanup(patch.stopall)
         self.s._agents_json = lambda *args: []
+        # project_sync must not reach the real engine from a unit test.
+        patch('engine_status.snapshot', return_value={'known': False, 'reason': 'test'}).start()
         install(self.s)
 
     def call(self, name, **args):
@@ -47,7 +49,10 @@ class RuntimeTests(unittest.TestCase):
 
     def test_original_tools_and_portable_tools(self):
         tools = self.s.handle_request({'id': 1, 'method': 'tools/list'})['result']['tools']
-        self.assertEqual(len(tools), 27)
+        self.assertEqual(len(tools), 28)
+        for name in ('deep_dive', 'context_pack', 'review_diff', 'project_findings'):
+            self.assertIn(name, {t['name'] for t in tools})
+        self.assertNotIn('fan_out_to_local', {t['name'] for t in tools})
         self.assertIn('delegate_verified', {t['name'] for t in tools})
         self.assertIn('continue_delegate', {t['name'] for t in tools})
         self.assertIn('delegate_to_architect', {t['name'] for t in tools})
@@ -189,7 +194,7 @@ class RuntimeTests(unittest.TestCase):
         responses = [json.loads(line) for line in p.stdout.splitlines()]
         self.assertEqual([r['id'] for r in responses], [1, 2, 3])
         self.assertTrue(responses[1]['result']['isError'])
-        self.assertEqual(len(responses[2]['result']['tools']), 27)
+        self.assertEqual(len(responses[2]['result']['tools']), 28)
 
     def test_result_wait_does_not_block_later_calls(self):
         # A 900 s get_delegate_result wait used to hold the serial stdio loop, so every

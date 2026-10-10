@@ -29,8 +29,22 @@ def environment(path):
 def inspect(path):
     env = profile(path)
     base = env['ANTHROPIC_BASE_URL'].rstrip('/')
-    req = urllib.request.Request(base + '/model/info',
-                                headers={'Authorization': 'Bearer ' + env['ANTHROPIC_API_KEY']})
+    headers = {'Authorization': 'Bearer ' + env['ANTHROPIC_API_KEY']}
+    # A Strata engine answers /v1/status itself; a LiteLLM gateway answers /model/info.
+    try:
+        with urllib.request.urlopen(urllib.request.Request(base + '/v1/status', headers=headers),
+                                    timeout=15) as response:
+            status = json.load(response)
+    except (urllib.error.URLError, ValueError):
+        status = None
+    if isinstance(status, dict) and status.get('service') == 'strata':
+        return {'settings_path': str(Path(path).expanduser()), 'base_url': base,
+                'requested_model': env['ANTHROPIC_MODEL'], 'backend': 'strata',
+                'engine': status.get('engine'), 'served_model': status.get('model'),
+                'loaded': status.get('loaded'), 'context_max': status.get('cache_max_tokens'),
+                'concurrency': status.get('concurrency'),
+                'note': 'Direct Strata engine (no gateway); Strata serves any requested model name.'}
+    req = urllib.request.Request(base + '/model/info', headers=headers)
     with urllib.request.urlopen(req, timeout=15) as response:
         data = json.load(response)
     routes = []
@@ -39,7 +53,7 @@ def inspect(path):
             params = item.get('litellm_params', {})
             routes.append({'model': params.get('model'), 'api_base': params.get('api_base')})
     return {'settings_path': str(Path(path).expanduser()), 'base_url': base,
-            'requested_model': env['ANTHROPIC_MODEL'], 'routes': routes,
+            'requested_model': env['ANTHROPIC_MODEL'], 'backend': 'litellm', 'routes': routes,
             'vllm_route_confirmed': bool(routes) and all(str(r['model']).startswith('hosted_vllm/') for r in routes),
             'note': 'Gateway configuration evidence; not per-request tracing or proof of the loaded weight files.'}
 

@@ -1,9 +1,9 @@
 # Antigravity Delegation & Local Model Rules
 
 ## Local Multi-Agent Cluster Integration
-You have access to a local GPU cluster (4x RTX 3090 with vLLM / LiteLLM) and Gemini architectures via MCP:
+You have access to a local GPU cluster (4x RTX 3090, Strata engine behind LiteLLM) and Gemini architectures via MCP:
 - `mcp__claude-local-delegate__delegate_to_architect`: Dispatch high-level design and decomposition to Tier 1 Gemini Architect.
-- `mcp__claude-local-delegate__delegate_to_local`: Dispatch atomic coding/testing tasks to Tier 0 local workers (Qwen 3.8 27B).
+- `mcp__claude-local-delegate__delegate_to_local`: Dispatch atomic coding/testing tasks to Tier 0 local workers (Qwen3.8-Flash-Next 125B MoE on Strata); `deep_dive` / `context_pack` / `review_diff` for deep investigation, briefing and adversarial review.
 - `mcp__claude-local-delegate__show_agent_tree`: Monitor hierarchical execution state.
 
 ## Core Rules
@@ -16,6 +16,6 @@ You have access to a local GPU cluster (4x RTX 3090 with vLLM / LiteLLM) and Gem
 5. **Contrastive Chain-of-Thought**: For complex logic changes, explicitly state the naive/wrong approach first, explain why it fails (edge cases, bounds), and then provide the correct solution.
 6. **Executable Verifiers**: Never rely on LLM-as-a-judge to determine if your fix works. Prove correctness via runtime. Write a short Python/Bash test script to explicitly validate your artifact before declaring it done.
 7. **Error Clustering & Delegation Refinement (AgentGrad)**: When local workers fail repeatedly, cluster their errors, extract the root cause, and formulate a specific "Anti-Pattern / Correct Pattern" rule. Inject this specific rule into the next `delegate_to_local` call.
-8. **Cost-Aware Routing (ProgRouter)**: Use the local Qwen 3.8 27B workers for 80-90% of routine coding and searches. Retain complex architectural synthesis for yourself (Tier 1).
-9. **Same-Designer Confound (Cross-Family Verification)**: Qwen 3.8 27B must NEVER evaluate the semantic correctness of its own code. It must use purely execution-based verification. Semantic validation must be performed by Tier 1 (Gemini).
+8. **Cost-Aware Routing (ProgRouter)**: Use the local workers for 80-90% of routine coding and searches. Retain complex architectural synthesis for yourself (Tier 1).
+9. **Same-Designer Confound (Cross-Family Verification)**: The local model must NEVER evaluate the semantic correctness of its own code. It must use purely execution-based verification. Semantic validation must be performed by Tier 1 (Gemini).
 10. **Contagion Recovery (Safe-Kill)**: Local agents can corrupt their context if they veer off course. Do not waste tokens trying to debug a worker stuck in a loop (>3 failures). Kill it and spawn a fresh instance. Do not allow parallel agents to share mutable state.
