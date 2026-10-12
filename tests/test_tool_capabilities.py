@@ -154,13 +154,13 @@ class SpawnPruningTest(unittest.TestCase):
         self.assertIn('NotebookEdit', tools)
 
     def test_mcp_tools_stay_out_of_builtin_tools_flag(self):
-        cmd = self._spawn_cmd('Read,mcp__ParallelSearch__web_search,Agent')
+        cmd = self._spawn_cmd('Read,mcp__parallel-search__web_search,Agent')
         tools = self._tools_value(cmd)
-        self.assertNotIn('mcp__ParallelSearch__web_search', tools)
+        self.assertNotIn('mcp__parallel-search__web_search', tools)
         self.assertNotIn('Agent', tools)
         # MCP entries still reach --allowedTools untouched.
         allowed = cmd[cmd.index('--allowedTools') + 1:]
-        self.assertIn('mcp__ParallelSearch__web_search', allowed)
+        self.assertIn('mcp__parallel-search__web_search', allowed)
 
     def test_mcp_only_allowlist_explicitly_disables_builtin_schemas(self):
         cmd = self._spawn_cmd('mcp__serena__find_symbol')

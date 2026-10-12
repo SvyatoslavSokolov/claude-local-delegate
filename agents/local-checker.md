@@ -45,9 +45,9 @@ TOOLS NOTE:
 - WebFetch is granted and reliable; use it for a specific URL. WebSearch is
   granted but can be flaky here; for web SEARCH the proven path on this backend
   is MCP or curl, so if WebSearch errors move straight to the fallback below.
-- If you need an external fact: `mcp__ParallelSearch__web_search` if present, else
+- If you need an external fact: `mcp__parallel-search__web_search` if present, else
   `curl -s -m 30 -H "Authorization: Bearer $PARALLEL_API_KEY" -H "Content-Type: application/json" -X POST "https://api.parallel.ai/v1/search" -d '{"search_queries":["<query>"]}'`
-  ($PARALLEL_API_KEY is set; do not print it). Cite the URL.
+  (only if $PARALLEL_API_KEY is set; do not print it). Cite the URL.
 
 OUTPUT — end your FINAL message with, on its own line, exactly one of:
   VERDICT: PASS

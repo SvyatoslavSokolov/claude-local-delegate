@@ -413,7 +413,7 @@ CLAUDE_CONFIG_DIR = os.environ.get(
 )
 # MCP servers are NOT passed per-spawn: a fresh `claude --bg "task"` dispatch
 # ignores --mcp-config/--strict-mcp-config (verified by probe). Instead the
-# web-capability MCPs live at USER SCOPE (~/.claude.json: ParallelSearch,
+# web-capability MCPs live at USER SCOPE (~/.claude.json: parallel-search,
 # context7) and every delegated agent loads them automatically. The spawner
 # itself (claude-local-delegate) is also user-scope, so a recursion guard
 # (--disallowedTools mcp__claude-local-delegate) is added at spawn time -- see
@@ -1090,11 +1090,11 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
         cmd += ["--resume", resume_session, "--fork-session"]
     if pagent:
         cmd += ["--agent", pagent]
-    # MCP servers (ParallelSearch, context7, ...) come from USER SCOPE
+    # MCP servers (parallel-search, context7, ...) come from USER SCOPE
     # (~/.claude.json) -- that is the scope a fresh `claude --bg "task"` dispatch
     # actually loads. Verified: --mcp-config/--strict-mcp-config are IGNORED on a
     # fresh --bg (a probe with them got zero MCP tools; one without them, relying
-    # on user scope, called mcp__ParallelSearch__web_search successfully). So no
+    # on user scope, called mcp__parallel-search__web_search successfully). So no
     # --mcp-config is passed here.
     # The task is the positional prompt. It MUST come BEFORE the variadic
     # --allowedTools/--disallowedTools flags, which greedily consume all trailing
