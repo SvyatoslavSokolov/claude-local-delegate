@@ -49,8 +49,8 @@ class RuntimeTests(unittest.TestCase):
 
     def test_original_tools_and_portable_tools(self):
         tools = self.s.handle_request({'id': 1, 'method': 'tools/list'})['result']['tools']
-        self.assertEqual(len(tools), 28)
-        for name in ('deep_dive', 'context_pack', 'review_diff', 'project_findings'):
+        self.assertEqual(len(tools), 29)
+        for name in ('deep_dive', 'context_pack', 'review_diff', 'project_findings', 'start_expert'):
             self.assertIn(name, {t['name'] for t in tools})
         self.assertNotIn('fan_out_to_local', {t['name'] for t in tools})
         self.assertIn('delegate_verified', {t['name'] for t in tools})
@@ -194,7 +194,7 @@ class RuntimeTests(unittest.TestCase):
         responses = [json.loads(line) for line in p.stdout.splitlines()]
         self.assertEqual([r['id'] for r in responses], [1, 2, 3])
         self.assertTrue(responses[1]['result']['isError'])
-        self.assertEqual(len(responses[2]['result']['tools']), 28)
+        self.assertEqual(len(responses[2]['result']['tools']), 29)
 
     def test_result_wait_does_not_block_later_calls(self):
         # A 900 s get_delegate_result wait used to hold the serial stdio loop, so every

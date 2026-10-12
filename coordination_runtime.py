@@ -21,7 +21,7 @@ READ_ONLY_CALLS = frozenset({
 # The verified loop is deliberately NOT here: its state machine advances across
 # the spawn, and two supervisors polling one vid must not both launch a checker.
 SPAWN_CALLS = frozenset({'delegate_to_local', 'delegate_to_architect', 'continue_delegate', 'delegate_to_agy',
-                         'deep_dive', 'context_pack', 'review_diff'})
+                         'deep_dive', 'context_pack', 'review_diff', 'start_expert'})
 
 
 def install(server):
@@ -279,7 +279,7 @@ def install(server):
         'continue_delegate': continue_delegate,
     })
     for tool in server.PARENT_TOOLS:
-        if tool['name'] in ('delegate_to_local', 'delegate_verified', 'deep_dive', 'context_pack', 'review_diff'):
+        if tool['name'] in ('delegate_to_local', 'delegate_verified', 'deep_dive', 'context_pack', 'review_diff', 'start_expert'):
             tool['inputSchema']['properties']['task_id'] = {
                 'type': 'string', 'description': 'Active task_claim reservation owned by this MCP session. Pass it for bookkeeping; the task always starts, and overlapping reservations are visible in project_sync but never block it.'}
         if 'SendMessage' in tool['description']:

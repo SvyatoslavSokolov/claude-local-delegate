@@ -12,7 +12,7 @@ import re
 import time
 import hashlib
 
-KINDS = ("dive", "pack", "review")
+KINDS = ("dive", "pack", "review", "expert")
 
 
 def project_key(cwd):
@@ -151,4 +151,29 @@ def review_task(base, focus, test_cmd, report_path, folder):
         "## Ruled out: suspicions you checked and dismissed, with why.\n"
         "## Not reviewed: anything you could not cover.\n"
         + _footer(report_path, False)
+    )
+
+
+def expert_task(scope, focus, report_path, folder):
+    """A resident module expert: maps `scope` once, then answers questions that arrive as
+    cross-session messages, each turn resumed with its conversation still cached on the engine.
+    Measured 2026-10-12 (vhal_planner): mapping 5 min, then a traced answer in 1-3.5 min."""
+    return (
+        f"RESIDENT EXPERT for `{scope}`. You stay available for the supervising model for as long as "
+        "it works on this project: it will send you questions while it works, and your answers save it "
+        "the time of reading the code itself.\n\n"
+        f"PHASE 1 (now): study `{scope}` until you can answer detailed questions about its flow, failure "
+        "handling, contracts with the rest of the repository and its tests. "
+        + (f"Start from: {focus.strip()}. " if focus else "")
+        + "Do not modify any file. Write a compact map (entry points, key symbols with path:line, data "
+        f"flow, invariants, traps) to {report_path}.\n"
+        + _prior_block(folder)
+        + "End this turn with `result: mapped <scope>, waiting for questions`.\n\n"
+        "PHASE 2 (each later turn): a question arrives as a <cross-session-message from=\"...\"> block. "
+        "Verify the answer against the code (cite path:line; run a quick check when it settles a doubt; "
+        "read sibling repositories if the answer lives there). Then SendMessage the answer to the "
+        "`from=` address of that message, starting with the question's number or first words. Lead with "
+        "the answer, then the evidence, then your confidence; flag anything the question assumed wrongly. "
+        "Never modify files. End every turn with a `result:` line. If the code changed since you mapped "
+        "it (`git status`, `git log -1`), re-read what changed before answering."
     )

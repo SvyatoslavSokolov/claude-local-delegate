@@ -44,6 +44,10 @@ class SerenaSkipTests(unittest.TestCase):
     def test_default_allowlist_keeps_serena(self):
         self.assertNotIn("CLAUDE_NO_SERENA", self._spawn_env(None))
 
+    def test_explicit_default_allowlist_keeps_serena(self):
+        # start_delegate and the deep tools pass the default set explicitly.
+        self.assertNotIn("CLAUDE_NO_SERENA", self._spawn_env(self.s.DEFAULT_ALLOWED_TOOLS))
+
     def test_explicit_allowlist_with_serena_keeps_it(self):
         self.assertNotIn("CLAUDE_NO_SERENA", self._spawn_env("Read,mcp__serena__find_symbol"))
 

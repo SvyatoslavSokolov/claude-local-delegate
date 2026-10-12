@@ -593,6 +593,11 @@ never wrote its dossier is reported as such.
 - **`review_diff`** — `{base?=HEAD, focus?, test_command?, cwd?}`: adversarial
   review of `git diff <base>` plus untracked files; tries to prove each defect,
   runs the covering tests, fixes nothing.
+- **`start_expert`** — `{scope, focus?, cwd?}`: a resident expert for one module
+  (e.g. `external/sensors`). It maps the scope once and settles to done; each native
+  `SendMessage(to=<its name>, "Q1: ...")` resumes it with its conversation still cached on
+  the engine, and the answer comes back as a cross-session message. Measured on
+  `vhal_planner` (2026-10-12): mapping 5 min, then traced, cited answers in 1-3.5 min.
 - **`project_findings`** — `{cwd?, query?, read?}`: list (newest first) or read
   earlier dossiers for the project. Every deep run is told to read the relevant
   ones first and to say where it confirms or contradicts them.

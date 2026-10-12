@@ -969,7 +969,11 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     tools = [t.strip() for t in (allowed_tools or DEFAULT_ALLOWED_TOOLS).split(",") if t.strip()]
     # Decided on the caller's own allowlist, before the navigation/Serena grants below are appended: an
     # explicit allowlist without any Serena tool (paper reading, data crunching) starts without Serena.
-    skip_serena = bool(allowed_tools) and not _serena_needed(tools)
+    # start_delegate and the deep tools pass DEFAULT_ALLOWED_TOOLS explicitly; that is still the default
+    # writer set, which must keep Serena (the personas make it mandatory). Found 2026-10-12: every
+    # default delegate had run with CLAUDE_NO_SERENA=1 and got "No such tool" on activate_project.
+    skip_serena = (bool(allowed_tools) and allowed_tools != DEFAULT_ALLOWED_TOOLS
+                   and not _serena_needed(tools))
     # dontAsk also gates MCP calls. These navigation tools (the code-nav map
     # router + Serena's read-only symbol/memory tools) are read-only and live
     # outside the recursively blocked delegation server.
@@ -1061,6 +1065,10 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
 
     if skip_serena:
         backend_env["CLAUDE_NO_SERENA"] = "1"
+    # Marks the process tree as an unattended delegate, so user-scope hooks meant for an
+    # interactive session can step aside (e.g. serena-hooks remind, which DENIES Grep/Read after a
+    # burst and sent local models into retry loops).
+    backend_env["CLAUDE_LOCAL_DELEGATE_WORKER"] = "1"
 
     if role == "architect":
         backend_env["CLAUDE_LOCAL_DELEGATE_ROLE"] = "architect"
@@ -2776,7 +2784,7 @@ def _spawn_deep(kind, title, task_text, cwd, args, allowed_tools=None):
     report path in provenance so get_delegate_result can return the dossier."""
     report_path = args["_report_path"]
     os.makedirs(os.path.dirname(report_path), exist_ok=True)
-    label = {"dive": "DEEP", "pack": "PACK", "review": "REVIEW"}[kind]
+    label = {"dive": "DEEP", "pack": "PACK", "review": "REVIEW", "expert": "EXPERT"}[kind]
     name = args.get("name") or f"\u26a1 [{label}] {_slug_from_task(title)}"
     short_id, err = _spawn_native_agent(
         task_text, allowed_tools or DEFAULT_ALLOWED_TOOLS, cwd, name,
@@ -2846,6 +2854,32 @@ def review_diff(args):
     text = deep_tasks.review_task(base, args.get("focus"), args.get("test_command"),
                                   args["_report_path"], deep_tasks.findings_dir(FINDINGS_DIR, cwd))
     return _spawn_deep("review", title, text, cwd, args)
+
+
+def start_expert(args):
+    """Spawn a resident module expert that answers native SendMessage questions while you work."""
+    scope = args.get("scope")
+    if not isinstance(scope, str) or not scope.strip():
+        return _error_result("`scope` is required (a path or subsystem, e.g. external/sensors).")
+    cwd, err = _deep_cwd(args)
+    if err:
+        return err
+    scope = scope.strip()
+    name = args.get("name") or f"\u26a1 [EXPERT] {scope}"[:80]
+    args["_report_path"] = deep_tasks.new_report_path(FINDINGS_DIR, cwd, "expert", scope)
+    args["name"] = name
+    args.setdefault("max_turns", 0)  # lives as long as it is asked; the repeat-call cap still applies
+    text = deep_tasks.expert_task(scope, args.get("focus"), args["_report_path"],
+                                  deep_tasks.findings_dir(FINDINGS_DIR, cwd))
+    out = _spawn_deep("expert", scope, text, cwd, args)
+    if not out.get("isError"):
+        out["content"][0]["text"] += (
+            f"\nAsk it with the native tool: SendMessage(to={name!r}, message='Q1: ...'). It maps "
+            "the scope first (minutes) and settles to done; each message resumes it with its "
+            "conversation still cached, and the answer comes back as a cross-session message at "
+            "your next tool round. Number your questions."
+        )
+    return out
 
 
 def project_findings(args):
@@ -2944,6 +2978,22 @@ PARENT_TOOLS = [
             "est_minutes": {"type": "integer", "minimum": 0},
             "max_turns": {"type": "integer", "minimum": 0},
         }},
+    },
+    {
+        "name": "start_expert",
+        "description": (
+            "Spawn a resident local EXPERT for one module/subsystem (e.g. external/sensors): it maps "
+            "the code once, then answers your questions sent with the native SendMessage while you keep "
+            "working, each turn resumed with its conversation cached on the engine (measured: traced, "
+            "cited answers in 1-3.5 min). Use it for 'trace this path / check this hypothesis / where "
+            "does X come from' questions on code you are not reading yourself. Keep a few, not dozens: "
+            "the engine caches 10 conversations and decodes one request at a time."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "scope": {"type": "string", "description": "Path or subsystem the expert owns."},
+            "focus": {"type": "string", "description": "Optional starting points or what you will ask about."},
+            "cwd": {"type": "string"}, "task_id": {"type": "string"}, "name": {"type": "string"},
+        }, "required": ["scope"]},
     },
     {
         "name": "project_findings",
@@ -3434,6 +3484,7 @@ TOOL_HANDLERS = {
     "context_pack": context_pack,
     "review_diff": review_diff,
     "project_findings": project_findings,
+    "start_expert": start_expert,
     "delegate_to_architect": start_architect_delegate,
     "check_delegate_status": check_status,
     "get_delegate_result": get_result,

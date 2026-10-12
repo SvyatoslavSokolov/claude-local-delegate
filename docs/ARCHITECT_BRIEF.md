@@ -20,6 +20,20 @@ nontrivial delegation whose briefing needs detailed acceptance criteria.
    Native SendMessage works both ways with a running delegate (it reads at its
    next tool round): ask it questions, send corrections, let it ask you. It is a strong
    model: give it the work you would otherwise do yourself, not only lookups.
+   ROLE (measured 2026-10-12 on 4 real virtual-hal fixes, blind, graded against
+   the real commits): Opus stays on the critical path and owns decisions and final
+   code; the local model is a parallel SECOND ENGINEER for verification and
+   investigation. Never put it on your critical path and wait for it.
+   | mode | result | wall time | use |
+   | review_diff on a change with a planted bug | proved it (built the vhal image, ran the suite: 69 pass vs 1 fail) + 2 real issues the real commit missed, 0 false alarms | 15 min | ALWAYS, on every non-trivial change, while you go on |
+   | start_expert + SendMessage questions | traced, cited answers; corrected my own reference by reading a sibling repo | map 5 min, then 1-3.5 min per answer | questions about code you are not reading yourself |
+   | deep_dive on a symptom | root cause and the real fix's exact functions, plus a timing model | 15 min | open questions you would spend >10 min on |
+   | delegate_to_local, small blind fix | identical to the real fix, hidden test passes | 15 min (Opus: ~1 min) | only queued work you are not waiting for |
+   The protocol: at the start of a task, launch a deep_dive on each real unknown
+   (and start_expert for a subsystem you will keep asking about); work; ask the
+   experts instead of reading side code; before you call a change done,
+   review_diff it and fold in what it proves. Its runs also read the project's
+   auto-memory and sibling repos -- an asset, so keep that memory current.
    - `context_pack(task)` at the START of a nontrivial task: files/symbols with
      path:line, call/data flow, covering tests (run), history, traps, plan.
    - `deep_dive(question, context)` for any open question you would spend
@@ -27,6 +41,10 @@ nontrivial delegation whose briefing needs detailed acceptance criteria.
      falsifies hypotheses and writes a dossier.
    - `review_diff(base, focus, test_command)` on EVERY non-trivial change before
      you call it done: an adversarial second opinion that tries to prove defects.
+   - `start_expert(scope)`: a resident module expert; ask it with native
+     SendMessage(to=<its name>, "Q1: ..."), the answer comes back as a
+     cross-session message. Keep 2-5 experts, not dozens (10 cached conversations,
+     ~2 GB host RAM each at ~130k tokens, one decode stream).
    - `project_findings` before a deep run: earlier dossiers may already answer it.
    `get_delegate_result` returns a deep run's WHOLE dossier (no tail compaction).
    Keep working while deep runs go; collect with wait_seconds=0 when you need the

@@ -94,6 +94,19 @@ class DeepToolTests(unittest.TestCase):
         out = self.s._with_deep_report('d1', 'final')
         self.assertIn('was NOT written', out)
 
+    def test_start_expert_is_resident_and_named_for_sendmessage(self):
+        self.assertTrue(self.s.start_expert({'cwd': self.project})['isError'])
+        out = self.s.start_expert({'scope': 'external/sensors', 'cwd': self.project, 'focus': 'robot_cameras.py'})
+        self.assertFalse(out['isError'])
+        call = self.spawned[0]
+        self.assertEqual(call['agent'], 'local-deep')
+        self.assertIn('[EXPERT] external/sensors', call['name'])
+        self.assertIn('SendMessage', out['content'][0]['text'])
+        self.assertIn('robot_cameras.py', call['task'])
+        self.assertIn('from=', call['task'])
+        self.assertEqual(self.s._run_turn_cap('d1', 40), 0)  # resident: no turn ceiling
+        self.assertEqual(self.s._provenance_for('d1')['deep_kind'], 'expert')
+
     def test_project_findings_lists_newest_first_filters_and_reads(self):
         folder = deep_tasks.findings_dir(self.s.FINDINGS_DIR, self.project)
         os.makedirs(folder)
