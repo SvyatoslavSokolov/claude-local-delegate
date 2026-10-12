@@ -119,6 +119,11 @@ ls -la agents/local-worker.md agents/local-checker.md
       { "hooks": [ { "type": "command",
         "command": "python3 /home/YOU/.claude/hooks/delegate-pool-status.py",
         "timeout": 25 } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "", "hooks": [ { "type": "command",
+        "command": "python3 /home/YOU/.claude/hooks/idle-engine-nudge.py",
+        "timeout": 5 } ] }
     ]
   }
 }
@@ -131,12 +136,18 @@ ls -la agents/local-worker.md agents/local-checker.md
   одну строку: сколько делегатов работает, кто `blocked`, и напоминание
   вынести механическую работу через `delegate_to_local`, когда активных <
   `CLAUDE_DELEGATE_TARGET` (по умолчанию 3).
+- `PostToolUse`-hook `contrib/idle-engine-nudge.py` работает между ходами
+  пользователя: если движок `idle` с пустой очередью, а сессия сделала 6+
+  вызовов и 10+ минут не трогала локальную модель, он подсказывает одно
+  конкретное действие (`review_diff` на изменённые файлы, иначе `deep_dive` /
+  `context_pack`) — в фоне, не ждать. Не чаще раза в 10 мин на сессию и раза в
+  2 мин на все сессии; внутри делегатов молчит.
 
 Скопируйте скрипт хука:
 
 ```bash
 mkdir -p ~/.claude/hooks
-cp contrib/delegate-pool-status.py ~/.claude/hooks/
+cp contrib/delegate-pool-status.py contrib/idle-engine-nudge.py ~/.claude/hooks/
 ```
 
 Затем один раз откройте `/hooks` (или перезапустите), чтобы watcher подхватил

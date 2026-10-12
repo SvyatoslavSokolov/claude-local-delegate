@@ -438,6 +438,11 @@ session "check what the agents are doing" or remind it the local model exists:
          { "hooks": [ { "type": "command",
            "command": "python3 /home/YOU/.claude/hooks/delegate-pool-status.py",
            "timeout": 25 } ] }
+       ],
+       "PostToolUse": [
+         { "matcher": "", "hooks": [ { "type": "command",
+           "command": "python3 /home/YOU/.claude/hooks/idle-engine-nudge.py",
+           "timeout": 5 } ] }
        ]
      }
    }
@@ -452,12 +457,21 @@ session "check what the agents are doing" or remind it the local model exists:
      are `blocked` (need an answer), and — when fewer than
      `CLAUDE_DELEGATE_TARGET` (default 3) are running — a reminder to split off
      mechanical work and `delegate_to_local` before doing it in-session.
+   - The `PostToolUse` hook (`contrib/idle-engine-nudge.py`) covers the gap
+     between user turns: a session working on its own for an hour never sees
+     the prompt hook. When the engine reports `state=idle`, queue 0, and the
+     session has made 6+ tool calls without touching the local model for 10+
+     min, it injects one concrete suggestion (`review_diff` on the files edited
+     since, else `deep_dive` / `context_pack` on the current question), always
+     "in the background, do not wait". Throttled to one nudge per session per
+     10 min and one per 2 min across all sessions, so parallel sessions do not
+     pile onto the single decode stream. Silent inside delegates. ~0.1 s.
 
 2. **`~/.claude/hooks/delegate-pool-status.py`** — copy it from `contrib/`:
 
    ```bash
    mkdir -p ~/.claude/hooks
-   cp contrib/delegate-pool-status.py ~/.claude/hooks/
+   cp contrib/delegate-pool-status.py contrib/idle-engine-nudge.py ~/.claude/hooks/
    ```
 
    Then open `/hooks` once (or restart) so the settings watcher picks it up.
@@ -472,7 +486,7 @@ The repo carries the MCP code and `contrib/`. Everything else is per-machine:
 1. `git pull` in this repo, then **restart Claude Code** (the MCP subprocess is
    spawned at session start — it does not hot-reload `server.py`).
 2. Re-apply the two `~/.claude/` pieces from the section above (settings block +
-   `contrib/delegate-pool-status.py` -> `~/.claude/hooks/`), fixing the hook
+   `contrib/delegate-pool-status.py` + `contrib/idle-engine-nudge.py` -> `~/.claude/hooks/`), fixing the hook
    path to that machine's home.
 3. Already needed by every version, so likely already present on a machine that
    ran the old one: `~/.claude/vllm.delegate.settings.json` (the local backend
