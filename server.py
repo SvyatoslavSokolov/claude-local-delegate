@@ -406,6 +406,8 @@ DEFAULT_VERIFY_WORKER_TOOLS = DEFAULT_ALLOWED_TOOLS
 VERIFY_CHECKER_TOOLS = DEFAULT_READ_ONLY_TOOLS + ",Bash"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_LOCAL_DELEGATE_BIN", "claude")
+#: Put first on a delegate's PATH: hook shims for unattended sessions (scripts/delegate-bin/).
+DELEGATE_BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "delegate-bin")
 CLAUDE_CONFIG_DIR = os.environ.get(
     "CLAUDE_LOCAL_DELEGATE_CONFIG_DIR", os.path.expanduser("~/.claude")
 )
@@ -1069,6 +1071,9 @@ def _spawn_native_agent(task, allowed_tools, cwd, name, permission_mode=None,
     # interactive session can step aside (e.g. serena-hooks remind, which DENIES Grep/Read after a
     # burst and sent local models into retry loops).
     backend_env["CLAUDE_LOCAL_DELEGATE_WORKER"] = "1"
+    # Same reason, without touching the user's settings.json: delegate processes resolve
+    # `serena-hooks` to a shim that skips `remind` and runs the real tool for everything else.
+    backend_env["PATH"] = DELEGATE_BIN_DIR + os.pathsep + backend_env.get("PATH", "")
 
     if role == "architect":
         backend_env["CLAUDE_LOCAL_DELEGATE_ROLE"] = "architect"

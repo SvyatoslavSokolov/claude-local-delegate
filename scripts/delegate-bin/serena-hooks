@@ -1,0 +1,8 @@
+#!/bin/sh
+# serena-hooks shim, first on PATH for local delegates only (server._spawn_native_agent).
+# `remind` DENIES Grep/Read after a short burst; an unattended local model then retries and
+# loops (measured 2026-10-12). Delegates skip it; every other subcommand runs the real tool.
+[ "$1" = "remind" ] && exit 0
+here=$(cd "$(dirname "$0")" && pwd)
+PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx "$here" | paste -sd: -)
+exec serena-hooks "$@"

@@ -54,3 +54,29 @@ class SerenaSkipTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DelegateHookShimTests(unittest.TestCase):
+    """Delegates resolve `serena-hooks` to a shim that skips `remind` (it denied Grep/Read and
+    looped unattended local models) and runs the real tool for every other subcommand."""
+    setUp = SerenaSkipTests.setUp
+    _spawn_env = SerenaSkipTests._spawn_env
+
+    def test_spawn_env_marks_worker_and_puts_shim_first(self):
+        env = self._spawn_env(None)
+        self.assertEqual(env.get("CLAUDE_LOCAL_DELEGATE_WORKER"), "1")
+        self.assertEqual(env["PATH"].split(os.pathsep)[0], self.s.DELEGATE_BIN_DIR)
+
+    def test_shim_skips_remind_and_forwards_the_rest(self):
+        import subprocess
+        fake = Path(self.tmp.name) / "realbin"
+        fake.mkdir()
+        (fake / "serena-hooks").write_text('#!/bin/sh\necho "real $*"\n')
+        (fake / "serena-hooks").chmod(0o755)
+        env = {"PATH": os.pathsep.join([self.s.DELEGATE_BIN_DIR, str(fake), "/usr/bin", "/bin"])}
+        remind = subprocess.run(["serena-hooks", "remind", "--client=claude-code"], env=env,
+                                input="{}", capture_output=True, text=True)
+        self.assertEqual((remind.returncode, remind.stdout), (0, ""))
+        other = subprocess.run(["serena-hooks", "activate", "--client=claude-code"], env=env,
+                               capture_output=True, text=True, timeout=10)
+        self.assertEqual(other.stdout.strip(), "real activate --client=claude-code")
