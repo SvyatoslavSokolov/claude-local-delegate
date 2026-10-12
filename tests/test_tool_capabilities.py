@@ -196,19 +196,20 @@ def load_navigation_order_text():
 class PersonaNavigationOrderTest(unittest.TestCase):
     def test_map_router_then_direct_anchor(self):
         t = load_navigation_order_text().lower()
-        self.assertRegex(t, r"first for every repository task:.*repository_route",
-                         "FIRST step must route through the repository map")
+        self.assertRegex(t, r"repository_route.*tool is present, call it first",
+                         "the map router, when present, is the first step")
         self.assertIn("mapped exact file path or symbol", t)
         self.assertRegex(t, r"do not search for it",
                          "a mapped anchor must be opened directly, not searched")
 
-    def test_serena_precedes_text_search(self):
+    def test_builtin_tools_are_primary_and_serena_optional(self):
+        # Measured 2026-10-12: delegates pick Glob/Grep/whole-file Read even with Serena available,
+        # and "Serena mandatory" plus a Grep/Read-denying hook sent them into retry loops.
         t = load_navigation_order_text().lower()
-        serena_pos = t.find('activate_project')
-        grep_pos = t.find('built-in grep')
-        self.assertGreater(serena_pos, -1)
-        self.assertGreater(grep_pos, serena_pos,
-                           "Serena semantic navigation must precede text search")
+        self.assertIn("built-in tools are the primary path", t)
+        self.assertIn("serena is optional", t)
+        self.assertIn("read a source file whole, once", t)
+        self.assertLess(t.find("built-in tools are the primary path"), t.find("serena is optional"))
 
     def test_literals_are_not_guessed_as_symbols(self):
         # Exact strings (CLI flags, config keys, error messages) go to a TEXT
@@ -217,7 +218,7 @@ class PersonaNavigationOrderTest(unittest.TestCase):
         # and none is granted), so the persona must say so and point to Grep/rg.
         t = load_navigation_order_text().lower()
         self.assertIn("exact string", t)
-        self.assertIn("serena has no text search", t)
+        self.assertIn("is a grep search, never a symbol search", t)
         self.assertIn("lsp symbol search is not a text search", t)
         self.assertIn("stop when every edge", t)
         # The phantom tool must not be advertised in the persona.
