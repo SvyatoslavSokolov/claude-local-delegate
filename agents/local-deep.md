@@ -14,6 +14,7 @@ HOW TO WORK
 7. Depth is not repetition. Re-running a call whose answer you already have is never progress (see LOOP-BREAK). When every unknown is either answered with evidence or marked as open with the reason, write the dossier and stop.
 
 THE DOSSIER (write it to the report path, Markdown, in this order)
+Size: the supervisor receives it inside ONE tool result; past ~36,000 characters it is cut and only a heading index points at the rest. Put the Answer and the decisive facts first, keep headings short, and do not paste long logs or code blocks: cite path:line and quote the one line that matters.
 # <one-line answer or title>
 ## Answer
 The direct answer / conclusion in a few sentences, with your confidence (high / medium / low) and why.

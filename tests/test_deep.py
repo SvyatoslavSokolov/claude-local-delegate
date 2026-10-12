@@ -89,6 +89,49 @@ class DeepToolTests(unittest.TestCase):
         self.assertTrue(out.endswith('=== FINAL MESSAGE ===\nfinal msg'))
         self.assertEqual(self.s._with_deep_report('plain-run', 'x'), 'x')
 
+    def test_long_dossier_is_cut_with_a_section_index_from_the_file(self):
+        self.s.deep_dive({'question': 'q', 'cwd': self.project})
+        report = self.s._provenance_for('d1')['report_path']
+        filler = 'x' * 200
+        body = '# Answer\n' + '\n'.join(filler for _ in range(400)) + '\n## Risks\nlast fact\n'
+        Path(report).write_text(body)
+        self.assertGreater(len(body), self.s.DEEP_REPORT_MAX_CHARS)
+        out = self.s._with_deep_report('d1', 'final msg')
+        self.assertLess(len(out), self.s.DEEP_REPORT_MAX_CHARS + 2000)
+        self.assertIn('line 1: # Answer', out)
+        self.assertIn('line 402: ## Risks', out)  # past the cut, indexed from the file
+        self.assertNotIn('last fact', out)
+        self.assertTrue(out.endswith('=== FINAL MESSAGE ===\nfinal msg'))
+
+    def _long_dossier(self, body):
+        self.s.deep_dive({'question': 'q', 'cwd': self.project})
+        Path(self.s._provenance_for('d1')['report_path']).write_text(body)
+
+    def test_heading_heavy_dossier_still_fits_the_budget(self):
+        self._long_dossier('\n'.join(f'# heading number {i} ' + 'y' * 30 for i in range(1500)))
+        out = self.s._with_deep_report('d1', 'final msg')
+        self.assertLessEqual(len(out), self.s.DEEP_RESULT_MAX_CHARS)
+        self.assertIn('more headings', out)
+
+    def test_fenced_comments_are_not_sections(self):
+        code = '```python\n' + '\n'.join(f'# comment {i}' for i in range(400)) + '\n```\n'
+        self._long_dossier('# Answer\n' + 'z' * 40_000 + '\n' + code + '## Risks\nr\n')
+        out = self.s._with_deep_report('d1', 'f')
+        self.assertNotIn('# comment', out.split('Sections')[-1])
+        self.assertIn('## Risks', out)
+
+    def test_cut_dossier_without_headings_has_no_empty_section_list(self):
+        self._long_dossier('x' * 50_000)
+        out = self.s._with_deep_report('d1', 'f')
+        self.assertNotIn('Sections', out)
+        self.assertIn('cut at line', out)
+
+    def test_long_final_message_is_cut_to_the_budget(self):
+        self._long_dossier('# A\n' + 'x' * 50_000)
+        out = self.s._with_deep_report('d1', 'v' * 100_000 + 'VERDICT')
+        self.assertLessEqual(len(out), self.s.DEEP_RESULT_MAX_CHARS)
+        self.assertTrue(out.endswith('VERDICT'))
+
     def test_missing_dossier_is_reported_not_hidden(self):
         self.s.deep_dive({'question': 'q', 'cwd': self.project})
         out = self.s._with_deep_report('d1', 'final')

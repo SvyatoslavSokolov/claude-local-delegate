@@ -2772,7 +2772,7 @@ def stop_agy(args):
 # best use of it is a few DEEP runs that do work the supervisor would otherwise
 # do itself: investigate a question to the bottom, prepare a context pack before
 # a task, or review a diff adversarially. Each writes a dossier under
-# FINDINGS_DIR/<project>/ that get_delegate_result returns in full.
+# FINDINGS_DIR/<project>/ that get_delegate_result returns (whole, or cut to fit one tool result with a section index).
 FINDINGS_DIR = os.environ.get(
     "CLAUDE_LOCAL_DELEGATE_FINDINGS_DIR", os.path.join(STATE_DIR, "findings"),
 )
@@ -2780,8 +2780,26 @@ DEEP_PERSONA = os.environ.get("CLAUDE_LOCAL_DELEGATE_DEEP_AGENT", "local-deep")
 # Measured 2026-10-10: a real deep_dive on this repo was still productively
 # verifying at 134 turns (scratch probes, no repeats), so 150 cut it too close.
 DEEP_MAX_TURNS = _parse_max_turns(os.environ.get("CLAUDE_LOCAL_DELEGATE_DEEP_MAX_TURNS"), 300)
-# A dossier is meant to be read whole; this only guards against a runaway file.
-DEEP_REPORT_MAX_CHARS = _parse_env_num("CLAUDE_LOCAL_DELEGATE_DEEP_REPORT_MAX_CHARS", 60_000)
+# A dossier is meant to be read whole, but it travels back inside ONE tool result, and the
+# client refuses a result past its MCP output cap (Claude Code: ~25k tokens): a 55k-char
+# dossier plus its final message came back as "exceeds maximum allowed tokens" and nothing
+# was delivered (2026-10-12). Past this many chars the result carries the head of the dossier
+# and an index of its sections with line numbers, so the rest is read from the file by range.
+DEEP_REPORT_MAX_CHARS = _parse_env_num("CLAUDE_LOCAL_DELEGATE_DEEP_REPORT_MAX_CHARS", 36_000, min_val=4_000)
+# The section index of a cut dossier lives INSIDE that budget (an unbounded index of a code-quote-heavy dossier
+# rebuilt the very overflow the cap exists to prevent): at most this many entries / chars per entry / chars total,
+# scanned from at most this many chars of the file (a runaway dossier is never read whole).
+DEEP_INDEX_MAX_ENTRIES = 200
+DEEP_INDEX_ENTRY_CHARS = 80
+DEEP_INDEX_MAX_CHARS = 4_000
+DEEP_INDEX_SCAN_CHARS = 2_000_000
+# The final message that follows the dossier gets what is left of one tool result: `_compact` bounds lines,
+# not chars, and a 60-line final answer of long lines alone overflowed the client.
+DEEP_RESULT_MAX_CHARS = DEEP_REPORT_MAX_CHARS + 8_000
+# project_findings(read=...) returns one dossier through the same client cap; cut, and say so.
+FINDINGS_READ_MAX_CHARS = DEEP_REPORT_MAX_CHARS
+_HEADING = re.compile(r"^ {0,3}#{1,6} \S")
+_FENCE = re.compile(r"^ {0,3}(```|~~~)")
 
 
 def _spawn_deep(kind, title, task_text, cwd, args, allowed_tools=None):
@@ -2810,7 +2828,7 @@ def _spawn_deep(kind, title, task_text, cwd, args, allowed_tools=None):
         f"Dossier: {report_path}\n"
         "Keep working on your own task meanwhile. When you need the answer call "
         f"get_delegate_result({short_id!r}, wait_seconds=0) (or a long wait if you have nothing "
-        "else to do): it returns the whole dossier, not a compacted tail. "
+        "else to do): it returns the dossier (cut to fit one tool result, with a section index), not a compacted tail. "
         "Review it, then rate_delegate."
     )}], "isError": False}
 
@@ -2896,8 +2914,11 @@ def project_findings(args):
         name = os.path.basename(str(args["read"]))
         try:
             with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as f:
-                return {"content": [{"type": "text", "text": f.read(DEEP_REPORT_MAX_CHARS)}],
-                        "isError": False}
+                text = f.read(FINDINGS_READ_MAX_CHARS + 1)
+            if len(text) > FINDINGS_READ_MAX_CHARS:
+                text = (text[:FINDINGS_READ_MAX_CHARS] + f"\n[... cut at {FINDINGS_READ_MAX_CHARS} chars to fit one "
+                        f"tool result; read {os.path.join(folder, name)} by line range for the rest]")
+            return {"content": [{"type": "text", "text": text}], "isError": False}
         except OSError as exc:
             return _error_result(f"Cannot read {name}: {exc}")
     rows = deep_tasks.list_findings(FINDINGS_DIR, cwd, args.get("query"),
@@ -2919,14 +2940,50 @@ def _deep_report(handle):
         return f"[deep run: the dossier {path} was NOT written; only the final message is available]"
     if not text.strip():
         return f"[deep run: the dossier {path} is empty]"
-    cut = len(text) > DEEP_REPORT_MAX_CHARS
-    return (f"=== DOSSIER {path} ===\n" + text[:DEEP_REPORT_MAX_CHARS]
-            + (f"\n[... truncated at {DEEP_REPORT_MAX_CHARS} chars; read the file for the rest]" if cut else ""))
+    if len(text) <= DEEP_REPORT_MAX_CHARS:
+        return f"=== DOSSIER {path} ===\n" + text
+    # Too long for one tool result: a bounded index of the file's real sections (fence-aware, scanned from the
+    # file, not from the truncated copy), then as much of the head as the rest of the budget allows.
+    index_note = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            scanned = f.read(DEEP_INDEX_SCAN_CHARS + 1)
+    except OSError:
+        scanned, index_note = "", " (index unavailable: re-reading the file failed)"
+    if len(scanned) > DEEP_INDEX_SCAN_CHARS:
+        scanned = scanned[:DEEP_INDEX_SCAN_CHARS]
+        index_note = f" (index covers the first {DEEP_INDEX_SCAN_CHARS:,} chars of the file)"
+    lines = scanned.splitlines()
+    entries, fenced = [], False
+    for i, ln in enumerate(lines):
+        if _FENCE.match(ln):
+            fenced = not fenced
+        elif not fenced and _HEADING.match(ln):
+            entries.append(f"  line {i + 1}: {ln.strip()[:DEEP_INDEX_ENTRY_CHARS]}")
+    more = max(0, len(entries) - DEEP_INDEX_MAX_ENTRIES)
+    index = "\n".join(entries[:DEEP_INDEX_MAX_ENTRIES])[:DEEP_INDEX_MAX_CHARS]
+    if more:
+        index += f"\n  ... {more} more headings"
+    head_budget = max(0, DEEP_REPORT_MAX_CHARS - len(index) - 400)
+    head = text[:head_budget]
+    head_line = head.count("\n") + 1
+    sections = f" Sections{index_note}:\n{index}\n" if index else f"{index_note}\n"
+    return (f"=== DOSSIER {path} ({len(lines)} lines scanned) ===\n" + head
+            + f"\n[... cut at line {head_line} to fit one tool result; read the file by line range for the rest."
+            + sections + "]")
 
 
 def _with_deep_report(handle, body):
     report = _deep_report(handle)
-    return body if report is None else report + "\n\n=== FINAL MESSAGE ===\n" + body
+    if report is None:
+        return body
+    sep = "\n\n=== FINAL MESSAGE ===\n"
+    room = max(0, DEEP_RESULT_MAX_CHARS - len(report) - len(sep))
+    if len(body) > room:  # the final message follows the dossier; keep its end, which carries the verdict
+        note = f"[final message cut to its last {room} chars to fit one tool result]\n"
+        keep = max(0, room - len(note))
+        body = note + (body[len(body) - keep:] if keep else "")
+    return report + sep + body
 
 
 PARENT_TOOLS = [
@@ -2936,7 +2993,7 @@ PARENT_TOOLS = [
             "Deep investigation on the local model: one question answered all the way down "
             "(reads code, runs commands and scratch scripts, tests hypotheses, checks git history "
             "and docs). Writes an evidence dossier (answer + confidence, cited evidence, ruled-out "
-            "hypotheses, open risks, next steps) that get_delegate_result returns in full. Start it "
+            "hypotheses, open risks, next steps) that get_delegate_result returns (cut with a section index past ~36k chars). Start it "
             "early, keep working, collect when needed. The engine serves one stream: prefer 1-2 "
             "deep runs at a time over many small scouts."
         ),
