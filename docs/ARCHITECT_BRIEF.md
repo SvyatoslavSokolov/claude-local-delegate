@@ -43,7 +43,7 @@ nontrivial delegation whose briefing needs detailed acceptance criteria.
      you call it done: an adversarial second opinion that tries to prove defects.
    - `start_expert(scope)`: a resident module expert; ask it with native
      SendMessage(to=<its name>, "Q1: ..."), the answer comes back as a
-     cross-session message. Keep 2-5 experts, not dozens (10 cached conversations,
+     cross-session message. Keep a handful of experts (20 cached conversations,
      ~2 GB host RAM each at ~130k tokens, one decode stream).
    - `project_findings` before a deep run: earlier dossiers may already answer it.
    `get_delegate_result` returns a deep run's WHOLE dossier (no tail compaction).
@@ -54,8 +54,8 @@ nontrivial delegation whose briefing needs detailed acceptance criteria.
    CAPACITY: the engine decodes ONE request at a time (~140-170 tok/s with MTP
    speculative decoding; measured 2026-10-10: batching 4 slots gave +4.6% total
    and 4x slower streams, so it stays off). Delegates share that one stream, so
-   1-2 live deep runs is the sweet spot; more only queue. It keeps 10
-   conversations parked in host RAM; beyond 10 live delegates every switch
+   1-2 live deep runs is the sweet spot; more only queue. It keeps 20
+   conversations parked in host RAM (48 GiB budget, raised 2026-10-12); beyond 20 live delegates every switch
    re-reads the whole context (~20 s per 120k tokens). `project_sync.pool.engine`
    and `pool.advice` show the live state (serving, queue, cached conversations);
    the `context_*`/`fits_now` figures are only a KV estimate.

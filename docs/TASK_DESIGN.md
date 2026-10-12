@@ -399,8 +399,8 @@ signature. The drops are `The response stopped arriving`, not the output-token c
 with evidence behind it: when several agents drop within the same minute, that is load, not
 coincidence, and the fix is less context in flight, not a bigger cap. Those were on
 the old vLLM stack. On Strata (2026-10-10) the engine decodes ONE request at a time with a
-10-conversation host-RAM cache: delegates share one stream, so 1-2 live deep runs is the sweet
-spot, and beyond 10 live delegates every switch re-reads the whole context. `project_sync`
+20-conversation host-RAM cache (48 GiB): delegates share one stream, so 1-2 live deep runs is the sweet
+spot, and beyond 20 live delegates every switch re-reads the whole context. `project_sync`
 reports the live engine state as `pool.engine` / `pool.advice`, counting only working (not
 blocked) delegates recorded on the local backend — a paid background session never uses a slot. `contrib/bench_concurrency.py` measures where the ceiling actually sits (levels 1/2/4/8
 into CSV); run it on an idle GPU before trusting a number.

@@ -2987,7 +2987,7 @@ PARENT_TOOLS = [
             "working, each turn resumed with its conversation cached on the engine (measured: traced, "
             "cited answers in 1-3.5 min). Use it for 'trace this path / check this hypothesis / where "
             "does X come from' questions on code you are not reading yourself. Keep a few, not dozens: "
-            "the engine caches 10 conversations and decodes one request at a time."
+            "the engine caches 20 conversations and decodes one request at a time."
         ),
         "inputSchema": {"type": "object", "properties": {
             "scope": {"type": "string", "description": "Path or subsystem the expert owns."},

@@ -605,7 +605,7 @@ never wrote its dossier is reported as such.
 Capacity: `project_sync.pool.engine` reads the engine's own `/v1/status` and
 `/metrics` (`CLAUDE_LOCAL_DELEGATE_ENGINE_URL`): requests served at once, queue,
 parked conversations. With one decode stream, 1-2 live deep runs is the sweet
-spot; beyond the 10 parked conversations each switch re-reads the context.
+spot; beyond the 20 parked conversations (48 GiB budget) each switch re-reads the context.
 
 **`delegate_verified`** — returns a `vid` immediately.
 
